@@ -6,7 +6,6 @@ from fastapi import HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.enums import NodeType
-from app.models.enums import UserRole
 from app.models.tables import User
 from app.repositories.audit_logs import AuditLogRepository
 from app.repositories.mounts import BucketMountRepository
@@ -39,8 +38,6 @@ class RecycleBinService:
 
     async def list_deleted(self, actor: User) -> list[NodeRead]:
         nodes = await self.nodes.list_deleted_for_owner(actor.id)
-        if actor.role == UserRole.ADMIN:
-            nodes = await self.nodes.list_deleted_for_owner(actor.id)
         return [NodeRead.model_validate(node) for node in nodes]
 
     async def restore_nodes(self, request: Request, actor: User, payload: NodeRestoreRequest) -> list[NodeRead]:
@@ -48,7 +45,7 @@ class RecycleBinService:
             node = await self.nodes.get_by_id(node_id)
             if node is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
-            if actor.role != UserRole.ADMIN and node.owner_id != actor.id:
+            if node.owner_id != actor.id:
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Node access denied")
         restored = await self.nodes.restore(payload.node_ids)
         await self.audits.create(
@@ -69,7 +66,7 @@ class RecycleBinService:
             node = await self.nodes.get_by_id(node_id)
             if node is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
-            if actor.role != UserRole.ADMIN and node.owner_id != actor.id:
+            if node.owner_id != actor.id:
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Node access denied")
         deleted_ids = await self.nodes.collect_descendant_ids(payload.node_ids)
         descendants = await self.nodes.list_by_ids(deleted_ids)

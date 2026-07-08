@@ -45,7 +45,7 @@ def create_app(config: CloudraveConfig) -> FastAPI:
         allow_headers=["*"],
     )
     app.add_middleware(LoggingMiddleware)
-    app.add_middleware(RequestIdMiddleware)
+    app.add_middleware(RequestIdMiddleware, header_name=config.app.request_id_header)
 
     app.include_router(v1_router, prefix="/api/v1")
     return app

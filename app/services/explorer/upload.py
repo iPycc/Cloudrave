@@ -9,7 +9,7 @@ from fastapi import HTTPException, Request, UploadFile, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.enums import NodeType, StoragePolicyType, UploadMode, UploadState, UserRole
+from app.models.enums import NodeType, StoragePolicyType, UploadMode, UploadState
 from app.models.tables import BucketMount, StoragePolicy, User
 from app.repositories.audit_logs import AuditLogRepository
 from app.repositories.mounts import BucketMountRepository
@@ -313,7 +313,7 @@ class CreateUploadSessionService:
         mount = await self.mounts.get_by_id(mount_id)
         if mount is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bucket mount not found")
-        if actor.role != UserRole.ADMIN and mount.owner_id != actor.id:
+        if mount.owner_id != actor.id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Mount access denied")
         policy = await self.policies.get_by_id(mount.policy_id)
         if policy is None:
@@ -345,7 +345,7 @@ class CreateUploadSessionService:
         record = await self.uploads.get_session(session_id)
         if record is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload session not found")
-        if actor.role != UserRole.ADMIN and record.owner_id != actor.id:
+        if record.owner_id != actor.id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Upload session access denied")
         return record
 
@@ -393,7 +393,7 @@ class DeleteUploadSessionService:
         record = await self.uploads.get_session(session_id)
         if record is None:
             return False
-        if actor.role != UserRole.ADMIN and record.owner_id != actor.id:
+        if record.owner_id != actor.id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Upload session access denied")
         record.state = UploadState.ABORTED
         await self.uploads.session.flush()

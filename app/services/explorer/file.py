@@ -9,7 +9,7 @@ from fastapi import HTTPException, Request, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.enums import NodeType, UserRole
+from app.models.enums import NodeType
 from app.models.tables import BucketMount, StoragePolicy, User
 from app.repositories.audit_logs import AuditLogRepository
 from app.repositories.mounts import BucketMountRepository
@@ -45,7 +45,7 @@ class FileExplorerService:
         self.storage_manager = storage_manager
 
     async def list_mounts(self, actor: User) -> list[BucketMountRead]:
-        mounts = await (self.mounts.list_all() if actor.role == UserRole.ADMIN else self.mounts.list_for_owner(actor.id))
+        mounts = await self.mounts.list_for_owner(actor.id)
         return [BucketMountRead.model_validate(mount) for mount in mounts]
 
     async def list_children(self, actor: User, mount_id: int, parent_id: int | None = None) -> list[NodeRead]:
@@ -180,7 +180,7 @@ class FileExplorerService:
         mount = await self.mounts.get_by_id(mount_id)
         if mount is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bucket mount not found")
-        if actor.role != UserRole.ADMIN and mount.owner_id != actor.id:
+        if mount.owner_id != actor.id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Mount access denied")
         policy = await self.policies.get_by_id(mount.policy_id)
         if policy is None:
@@ -191,6 +191,6 @@ class FileExplorerService:
         node = await self.nodes.get_by_id(node_id)
         if node is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
-        if actor.role != UserRole.ADMIN and node.owner_id != actor.id:
+        if node.owner_id != actor.id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Node access denied")
         return node

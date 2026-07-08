@@ -8,6 +8,7 @@ import logging
 from fastapi import HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.enums import UserStatus
 from app.repositories.audit_logs import AuditLogRepository
 from app.repositories.mounts import BucketMountRepository
 from app.repositories.nodes import NodeRepository
@@ -68,6 +69,19 @@ class UserLoginService:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="邮箱或密码错误",
+            )
+
+        if user.status != UserStatus.ACTIVE:
+            await self._record_login_attempt(
+                request,
+                actor_id=user.id,
+                identifier=normalized_email,
+                result="disabled",
+            )
+            await self.session.commit()
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="账号已被禁用",
             )
 
         await UserStorageProvisionService(

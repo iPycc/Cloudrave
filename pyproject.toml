@@ -25,6 +25,7 @@ dependencies = [
   "PyJWT>=2.10.1",
   "sqlalchemy>=2.0.43",
   "uvicorn>=0.35.0",
+  "webauthn>=2.6.0",
 ]
 
 [project.optional-dependencies]

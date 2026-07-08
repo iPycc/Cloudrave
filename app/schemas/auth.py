@@ -39,6 +39,7 @@ class UserResponse(AuthSchema):
     username: str
     role: str
     status: str
+    timezone: str
     avatar: str | None = None
     created_at: datetime
     password_updated_at: datetime | None = None

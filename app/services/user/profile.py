@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import HTTPException, Request, UploadFile, status
 from fastapi.responses import FileResponse
@@ -16,7 +17,13 @@ from app.repositories.audit_logs import AuditLogRepository
 from app.repositories.sessions import SessionRepository
 from app.repositories.users import UserRepository
 from app.schemas.common import MessageResponse
-from app.schemas.user import LoginActivityEntry, PasswordChangeRequest, UserProfileUpdateRequest
+from app.schemas.user import (
+    LoginActivityEntry,
+    PasswordChangeRequest,
+    UserPreferencesResponse,
+    UserPreferencesUpdateRequest,
+    UserProfileUpdateRequest,
+)
 from app.security.password import PasswordService
 from app.services.user.response import build_user_response
 from config import CloudraveConfig
@@ -132,6 +139,26 @@ class UserProfileService:
         )
         return MessageResponse(message="密码已更新，请重新登录。")
 
+    async def update_preferences(
+        self,
+        request: Request,
+        actor: User,
+        payload: UserPreferencesUpdateRequest,
+    ) -> UserPreferencesResponse:
+        user = await self._get_managed_user(actor.uid)
+        timezone = _normalize_timezone(payload.timezone)
+        user = await self.users.update_timezone(user, timezone)
+        await self.audits.create(
+            actor_id=user.id,
+            action="preferences_update",
+            target=f"user:{user.uid}",
+            detail=json.dumps({"timezone": timezone}, ensure_ascii=False),
+            ip=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            request_id=getattr(request.state, "request_id", None),
+        )
+        return UserPreferencesResponse(timezone=user.timezone)
+
     async def list_login_activity(self, actor: User, limit: int = 50) -> list[LoginActivityEntry]:
         logs = await self.audits.list_login_events(actor_id=actor.id, identifier=actor.email, limit=limit)
         activity: list[LoginActivityEntry] = []
@@ -186,3 +213,15 @@ def _parse_detail(detail: str | None) -> dict[str, object]:
     if isinstance(parsed, dict):
         return parsed
     return {}
+
+
+def _normalize_timezone(value: str) -> str:
+    timezone = value.strip()
+    if not timezone:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="时区不能为空")
+
+    try:
+        ZoneInfo(timezone)
+    except ZoneInfoNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="时区无效") from exc
+    return timezone

@@ -7,10 +7,26 @@ from fastapi.responses import FileResponse
 
 from app.middleware.auth_context import get_current_user
 from app.models.tables import User
+from app.schemas.passkey import (
+    PasskeyListResponse,
+    PasskeyOptionsResponse,
+    PasskeyRead,
+    PasskeyRenameRequest,
+    PasskeyRegistrationOptionsRequest,
+    PasskeyRegistrationVerifyRequest,
+    PasskeyVerificationResponse,
+)
 from app.security.auth_cookies import set_auth_cookies
 from app.schemas.auth import LoginResponse, RegisterRequest, UserResponse
 from app.schemas.common import MessageResponse
-from app.schemas.user import LoginActivityEntry, PasswordChangeRequest, UserProfileUpdateRequest
+from app.schemas.user import (
+    LoginActivityEntry,
+    PasswordChangeRequest,
+    UserPreferencesResponse,
+    UserPreferencesUpdateRequest,
+    UserProfileUpdateRequest,
+)
+from app.services.user.passkey import PasskeyService
 from app.services.user.profile import UserProfileService
 from app.services.user.register import UserRegisterService
 from app.services.user.response import build_user_response
@@ -103,6 +119,25 @@ async def change_password(
         return await service.change_password(request, current_user, payload)
 
 
+@router.patch("/me/preferences", response_model=UserPreferencesResponse)
+async def update_preferences(
+    request: Request,
+    payload: UserPreferencesUpdateRequest,
+    current_user: User = Depends(get_current_user),
+) -> UserPreferencesResponse:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = UserProfileService(
+            session=session,
+            users=dep.get_user_repository(session),
+            sessions=dep.get_session_repository(session),
+            audits=dep.get_audit_repository(session),
+            password_service=dep.password_service,
+            config=dep.config,
+        )
+        return await service.update_preferences(request, current_user, payload)
+
+
 @router.get("/me/login-activity", response_model=list[LoginActivityEntry])
 async def get_login_activity(
     request: Request,
@@ -119,6 +154,127 @@ async def get_login_activity(
             config=dep.config,
         )
         return await service.list_login_activity(current_user)
+
+
+@router.get("/me/passkeys", response_model=PasskeyListResponse)
+async def list_passkeys(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+) -> PasskeyListResponse:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = PasskeyService(
+            session=session,
+            users=dep.get_user_repository(session),
+            sessions=dep.get_session_repository(session),
+            audits=dep.get_audit_repository(session),
+            passkeys=dep.get_passkey_repository(session),
+            policies=dep.get_policy_repository(session),
+            mounts=dep.get_mount_repository(session),
+            nodes=dep.get_node_repository(session),
+            token_service=dep.token_service,
+            storage_manager=dep.storage_manager,
+            config=dep.config,
+        )
+        return await service.list_for_user(current_user)
+
+
+@router.post("/me/passkeys/registration/options", response_model=PasskeyOptionsResponse)
+async def begin_passkey_registration(
+    request: Request,
+    payload: PasskeyRegistrationOptionsRequest,
+    current_user: User = Depends(get_current_user),
+) -> PasskeyOptionsResponse:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = PasskeyService(
+            session=session,
+            users=dep.get_user_repository(session),
+            sessions=dep.get_session_repository(session),
+            audits=dep.get_audit_repository(session),
+            passkeys=dep.get_passkey_repository(session),
+            policies=dep.get_policy_repository(session),
+            mounts=dep.get_mount_repository(session),
+            nodes=dep.get_node_repository(session),
+            token_service=dep.token_service,
+            storage_manager=dep.storage_manager,
+            config=dep.config,
+        )
+        return await service.begin_registration(request, current_user, payload)
+
+
+@router.post("/me/passkeys/registration/verify", response_model=PasskeyVerificationResponse)
+async def verify_passkey_registration(
+    request: Request,
+    payload: PasskeyRegistrationVerifyRequest,
+    current_user: User = Depends(get_current_user),
+) -> PasskeyVerificationResponse:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = PasskeyService(
+            session=session,
+            users=dep.get_user_repository(session),
+            sessions=dep.get_session_repository(session),
+            audits=dep.get_audit_repository(session),
+            passkeys=dep.get_passkey_repository(session),
+            policies=dep.get_policy_repository(session),
+            mounts=dep.get_mount_repository(session),
+            nodes=dep.get_node_repository(session),
+            token_service=dep.token_service,
+            storage_manager=dep.storage_manager,
+            config=dep.config,
+        )
+        return await service.finish_registration(request, current_user, payload)
+
+
+@router.delete("/me/passkeys/{passkey_id}", response_model=MessageResponse)
+async def delete_passkey(
+    request: Request,
+    passkey_id: int,
+    current_user: User = Depends(get_current_user),
+) -> MessageResponse:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = PasskeyService(
+            session=session,
+            users=dep.get_user_repository(session),
+            sessions=dep.get_session_repository(session),
+            audits=dep.get_audit_repository(session),
+            passkeys=dep.get_passkey_repository(session),
+            policies=dep.get_policy_repository(session),
+            mounts=dep.get_mount_repository(session),
+            nodes=dep.get_node_repository(session),
+            token_service=dep.token_service,
+            storage_manager=dep.storage_manager,
+            config=dep.config,
+        )
+        await service.delete_for_user(request, current_user, passkey_id)
+        return MessageResponse(message="通行密钥已删除")
+
+
+@router.patch("/me/passkeys/{passkey_id}", response_model=PasskeyRead)
+async def rename_passkey(
+    request: Request,
+    passkey_id: int,
+    payload: PasskeyRenameRequest,
+    current_user: User = Depends(get_current_user),
+) -> PasskeyRead:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = PasskeyService(
+            session=session,
+            users=dep.get_user_repository(session),
+            sessions=dep.get_session_repository(session),
+            audits=dep.get_audit_repository(session),
+            passkeys=dep.get_passkey_repository(session),
+            policies=dep.get_policy_repository(session),
+            mounts=dep.get_mount_repository(session),
+            nodes=dep.get_node_repository(session),
+            token_service=dep.token_service,
+            storage_manager=dep.storage_manager,
+            config=dep.config,
+        )
+        return await service.rename_for_user(request, current_user, passkey_id, payload)
 
 
 @router.get("/avatar/{uid}/{filename}")

@@ -115,11 +115,13 @@ def _migrate_users_table(connection, inspector) -> None:
         connection.execute(text(f"ALTER TABLE users ADD COLUMN uid {_varchar_type(dialect, 16)}"))
     if "avatar_path" not in columns:
         connection.execute(text(f"ALTER TABLE users ADD COLUMN avatar_path {_varchar_type(dialect, 512)}"))
+    if "timezone" not in columns:
+        connection.execute(text(f"ALTER TABLE users ADD COLUMN timezone {_varchar_type(dialect, 64)}"))
     if "password_updated_at" not in columns:
         connection.execute(text(f"ALTER TABLE users ADD COLUMN password_updated_at {_datetime_type(dialect)}"))
 
     rows = connection.execute(
-        text("SELECT id, created_at, uid, password_updated_at FROM users ORDER BY id ASC")
+        text("SELECT id, created_at, uid, timezone, password_updated_at FROM users ORDER BY id ASC")
     ).mappings()
     used_uids: set[str] = set()
 
@@ -136,6 +138,8 @@ def _migrate_users_table(connection, inspector) -> None:
 
         if row.get("password_updated_at") is None:
             updates["password_updated_at"] = row.get("created_at")
+        if not row.get("timezone"):
+            updates["timezone"] = "Asia/Shanghai"
 
         if updates:
             updates["id"] = row["id"]

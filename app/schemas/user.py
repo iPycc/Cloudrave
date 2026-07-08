@@ -20,6 +20,14 @@ class PasswordChangeRequest(AuthSchema):
     confirm_password: str = Field(min_length=8, max_length=128)
 
 
+class UserPreferencesUpdateRequest(AuthSchema):
+    timezone: str = Field(min_length=1, max_length=64)
+
+
+class UserPreferencesResponse(AuthSchema):
+    timezone: str
+
+
 class LoginActivityEntry(AuthSchema):
     id: int
     method: str

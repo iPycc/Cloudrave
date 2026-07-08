@@ -9,6 +9,7 @@ from fastapi import HTTPException, status
 from fastapi.requests import Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.enums import UserStatus
 from app.repositories.audit_logs import AuditLogRepository
 from app.repositories.sessions import SessionRepository
 from app.repositories.users import UserRepository
@@ -60,6 +61,10 @@ class RefreshTokenService:
         user = await self.users.get_by_id(session_record.user_id)
         if user is None:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+        if user.status != UserStatus.ACTIVE:
+            await self.sessions.revoke_all_for_user(user.id)
+            await self.session.commit()
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Account disabled")
 
         next_version = session_record.token_version + 1
         bundle = self.token_service.issue_token_pair(

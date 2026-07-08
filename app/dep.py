@@ -13,6 +13,7 @@ from app.repositories.audit_logs import AuditLogRepository
 from app.repositories.mounts import BucketMountRepository
 from app.repositories.nodes import NodeRepository
 from app.repositories.objects import ObjectRepository
+from app.repositories.passkeys import PasskeyRepository
 from app.repositories.policies import StoragePolicyRepository
 from app.repositories.sessions import SessionRepository
 from app.repositories.uploads import UploadRepository
@@ -98,6 +99,9 @@ class Dep:
 
     def get_object_repository(self, session: AsyncSession) -> ObjectRepository:
         return ObjectRepository(session)
+
+    def get_passkey_repository(self, session: AsyncSession) -> PasskeyRepository:
+        return PasskeyRepository(session)
 
     def get_upload_repository(self, session: AsyncSession) -> UploadRepository:
         return UploadRepository(session)

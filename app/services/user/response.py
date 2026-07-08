@@ -17,6 +17,7 @@ def build_user_response(user: User) -> UserResponse:
         username=user.username,
         role=user.role.value,
         status=user.status.value,
+        timezone=user.timezone or "Asia/Shanghai",
         avatar=build_avatar_url(user),
         created_at=_trim_to_seconds(user.created_at),
         password_updated_at=_trim_to_seconds(user.password_updated_at),

@@ -40,10 +40,13 @@ class User(Base, TimestampMixin):
     avatar_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
     role: Mapped[UserRole] = mapped_column(Enum(UserRole, native_enum=False), default=UserRole.USER)
     status: Mapped[UserStatus] = mapped_column(Enum(UserStatus, native_enum=False), default=UserStatus.ACTIVE)
+    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai")
     password_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     sessions: Mapped[list["Session"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     mounts: Mapped[list["BucketMount"]] = relationship(back_populates="owner")
+    passkeys: Mapped[list["PasskeyCredential"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    passkey_ceremonies: Mapped[list["PasskeyCeremony"]] = relationship(back_populates="user", cascade="all, delete-orphan")
 
 
 class Session(Base):
@@ -62,6 +65,37 @@ class Session(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     user: Mapped[User] = relationship(back_populates="sessions")
+
+
+class PasskeyCredential(Base, TimestampMixin):
+    __tablename__ = "passkey_credentials"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(128))
+    credential_id: Mapped[str] = mapped_column(String(512), unique=True, index=True)
+    public_key: Mapped[str] = mapped_column(Text)
+    sign_count: Mapped[int] = mapped_column(Integer, default=0)
+    aaguid: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    transports: Mapped[list[str]] = mapped_column(JSON, default=list)
+
+    user: Mapped[User] = relationship(back_populates="passkeys")
+
+
+class PasskeyCeremony(Base):
+    __tablename__ = "passkey_ceremonies"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=True)
+    ceremony_type: Mapped[str] = mapped_column(String(32), index=True)
+    challenge: Mapped[str] = mapped_column(String(255))
+    email_hint: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    user: Mapped[User | None] = relationship(back_populates="passkey_ceremonies")
 
 
 class StoragePolicy(Base, TimestampMixin):

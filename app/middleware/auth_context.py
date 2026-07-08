@@ -8,6 +8,7 @@ from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.dep import Dep
+from app.models.enums import UserStatus
 from app.security.auth_cookies import ACCESS_TOKEN_COOKIE
 from app.security.jwt import AuthError
 
@@ -39,6 +40,10 @@ async def get_current_user(
         user = await user_repo.get_by_uid(user_uid)
         if session_record is None or user is None or session_record.user_id != user.id:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session revoked")
+        if user.status != UserStatus.ACTIVE:
+            await session_repo.revoke_all_for_user(user.id)
+            await session.commit()
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Account disabled")
         if session_record.token_version != token_version:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session token rotated")
         await session_repo.touch(session_id)

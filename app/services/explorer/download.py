@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import HTTPException, status
 
-from app.models.enums import NodeType, UserRole
+from app.models.enums import NodeType
 from app.models.tables import User
 from app.repositories.mounts import BucketMountRepository
 from app.repositories.nodes import NodeRepository
@@ -27,7 +27,7 @@ class DownloadFileService:
         node = await self.nodes.get_by_id(node_id)
         if node is None or node.type != NodeType.FILE or not node.blob_path:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File node not found")
-        if actor.role != UserRole.ADMIN and node.owner_id != actor.id:
+        if node.owner_id != actor.id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="File access denied")
         mount = await self.mounts.get_by_id(node.mount_id)
         if mount is None:

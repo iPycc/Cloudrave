@@ -83,6 +83,11 @@ class UserRepository:
         await self.session.flush()
         return user
 
+    async def update_timezone(self, user: User, timezone: str) -> User:
+        user.timezone = timezone
+        await self.session.flush()
+        return user
+
     async def _generate_unique_uid(self) -> str:
         for _ in range(20):
             candidate = "".join(secrets.choice(UID_ALPHABET) for _ in range(UID_LENGTH))

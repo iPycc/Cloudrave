@@ -1,14 +1,22 @@
 """Session routes."""
 
 from __future__ import annotations
-from fastapi import APIRouter, Body, Request, Response
-from fastapi import APIRouter, Request
+
+from fastapi import APIRouter, Body, HTTPException, Request, Response, status
+
 from app.schemas.auth import LoginRequest, LoginResponse, LogoutRequest, RefreshRequest, TokenPairResponse
-from app.schemas.auth import LoginRequest, LoginResponse, RefreshRequest, TokenPairResponse
+from app.schemas.passkey import (
+    PasskeyAuthenticationOptionsRequest,
+    PasskeyAuthenticationResponse,
+    PasskeyAuthenticationVerifyRequest,
+    PasskeyOptionsResponse,
+)
 from app.security.auth_cookies import clear_auth_cookies, resolve_refresh_token, set_auth_cookies
 from app.schemas.common import MessageResponse
 from app.services.session.refresh import RefreshTokenService
 from app.services.session.revoke import RevokeSessionService
+from app.services.user.passkey import PasskeyService
+from app.services.user.login import UserLoginService
 
 
 router = APIRouter(prefix="/session", tags=["session"])
@@ -36,6 +44,56 @@ async def login(request: Request, payload: LoginRequest, response: Response) -> 
         return result
 
 
+@router.post("/passkey/options", response_model=PasskeyOptionsResponse)
+async def passkey_options(
+    request: Request,
+    payload: PasskeyAuthenticationOptionsRequest,
+) -> PasskeyOptionsResponse:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = PasskeyService(
+            session=session,
+            users=dep.get_user_repository(session),
+            sessions=dep.get_session_repository(session),
+            audits=dep.get_audit_repository(session),
+            passkeys=dep.get_passkey_repository(session),
+            policies=dep.get_policy_repository(session),
+            mounts=dep.get_mount_repository(session),
+            nodes=dep.get_node_repository(session),
+            token_service=dep.token_service,
+            storage_manager=dep.storage_manager,
+            config=dep.config,
+        )
+        return await service.begin_authentication(request, payload)
+
+
+@router.post("/passkey/verify", response_model=LoginResponse)
+async def passkey_verify(
+    request: Request,
+    payload: PasskeyAuthenticationVerifyRequest,
+    response: Response,
+) -> LoginResponse:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = PasskeyService(
+            session=session,
+            users=dep.get_user_repository(session),
+            sessions=dep.get_session_repository(session),
+            audits=dep.get_audit_repository(session),
+            passkeys=dep.get_passkey_repository(session),
+            policies=dep.get_policy_repository(session),
+            mounts=dep.get_mount_repository(session),
+            nodes=dep.get_node_repository(session),
+            token_service=dep.token_service,
+            storage_manager=dep.storage_manager,
+            config=dep.config,
+        )
+        result = await service.finish_authentication(request, payload)
+        set_auth_cookies(response, request=request, config=dep.config, token_pair=result.login.token)
+        result.login.token.refresh_token = None
+        return result.login
+
+
 @router.post("/token/refresh", response_model=TokenPairResponse)
 async def refresh_token(
     request: Request,
@@ -46,8 +104,6 @@ async def refresh_token(
     refresh_token_value = resolve_refresh_token(request, payload.refresh_token if payload else None)
     if not refresh_token_value:
         clear_auth_cookies(response, request=request, config=dep.config)
-        from fastapi import HTTPException, status
-
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token missing")
     async with dep.session_scope() as session:
         service = RefreshTokenService(
