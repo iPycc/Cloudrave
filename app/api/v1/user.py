@@ -16,6 +16,15 @@ from app.schemas.passkey import (
     PasskeyRegistrationVerifyRequest,
     PasskeyVerificationResponse,
 )
+from app.schemas.totp import (
+    TwoFactorDisableRequest,
+    TwoFactorSetupConfirmRequest,
+    TwoFactorSetupConfirmResponse,
+    TwoFactorSetupInitiateResponse,
+    TwoFactorSetupPasswordRequest,
+    TwoFactorSetupPasskeyRequest,
+    TwoFactorStatusResponse,
+)
 from app.security.auth_cookies import set_auth_cookies
 from app.schemas.auth import LoginResponse, RegisterRequest, UserResponse
 from app.schemas.common import MessageResponse
@@ -30,6 +39,7 @@ from app.services.user.passkey import PasskeyService
 from app.services.user.profile import UserProfileService
 from app.services.user.register import UserRegisterService
 from app.services.user.response import build_user_response
+from app.services.user.totp import TOTPService
 
 
 router = APIRouter(prefix="/user", tags=["user"])
@@ -117,6 +127,122 @@ async def change_password(
             config=dep.config,
         )
         return await service.change_password(request, current_user, payload)
+
+
+@router.get("/me/2fa", response_model=TwoFactorStatusResponse)
+async def get_two_factor_status(current_user: User = Depends(get_current_user)) -> TwoFactorStatusResponse:
+    return TwoFactorStatusResponse(enabled=bool(current_user.totp_enabled))
+
+
+@router.post("/me/2fa/setup/password", response_model=TwoFactorSetupInitiateResponse)
+async def setup_two_factor_password(
+    request: Request,
+    payload: TwoFactorSetupPasswordRequest,
+    current_user: User = Depends(get_current_user),
+) -> TwoFactorSetupInitiateResponse:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = TOTPService(
+            session=session,
+            users=dep.get_user_repository(session),
+            audits=dep.get_audit_repository(session),
+            passkeys=dep.get_passkey_repository(session),
+            password_service=dep.password_service,
+            token_service=dep.token_service,
+            config=dep.config,
+        )
+        result = await service.setup_totp(
+            request,
+            current_user,
+            password=payload.password,
+            passkey_credential=None,
+            passkey_ceremony_id=None,
+            issuer=dep.config.app.name,
+        )
+        return TwoFactorSetupInitiateResponse(**result)
+
+
+@router.post("/me/2fa/setup/passkey", response_model=TwoFactorSetupInitiateResponse)
+async def setup_two_factor_passkey(
+    request: Request,
+    payload: TwoFactorSetupPasskeyRequest,
+    current_user: User = Depends(get_current_user),
+) -> TwoFactorSetupInitiateResponse:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = TOTPService(
+            session=session,
+            users=dep.get_user_repository(session),
+            audits=dep.get_audit_repository(session),
+            passkeys=dep.get_passkey_repository(session),
+            password_service=dep.password_service,
+            token_service=dep.token_service,
+            config=dep.config,
+        )
+        result = await service.setup_totp(
+            request,
+            current_user,
+            password=None,
+            passkey_credential=payload.credential,
+            passkey_ceremony_id=payload.ceremony_id,
+            issuer=dep.config.app.name,
+        )
+        return TwoFactorSetupInitiateResponse(**result)
+
+
+@router.post("/me/2fa/setup/confirm", response_model=TwoFactorSetupConfirmResponse)
+async def confirm_two_factor_setup(
+    request: Request,
+    payload: TwoFactorSetupConfirmRequest,
+    current_user: User = Depends(get_current_user),
+) -> TwoFactorSetupConfirmResponse:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = TOTPService(
+            session=session,
+            users=dep.get_user_repository(session),
+            audits=dep.get_audit_repository(session),
+            passkeys=dep.get_passkey_repository(session),
+            password_service=dep.password_service,
+            token_service=dep.token_service,
+            config=dep.config,
+        )
+        result = await service.confirm_setup(
+            request,
+            current_user,
+            setup_token=payload.setup_token,
+            secret=payload.secret,
+            code=payload.code,
+        )
+        return TwoFactorSetupConfirmResponse(enabled=result["enabled"], backup_codes=result["backup_codes"])
+
+
+@router.post("/me/2fa/disable", response_model=MessageResponse)
+async def disable_two_factor(
+    request: Request,
+    payload: TwoFactorDisableRequest,
+    current_user: User = Depends(get_current_user),
+) -> MessageResponse:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = TOTPService(
+            session=session,
+            users=dep.get_user_repository(session),
+            audits=dep.get_audit_repository(session),
+            passkeys=dep.get_passkey_repository(session),
+            password_service=dep.password_service,
+            token_service=dep.token_service,
+            config=dep.config,
+        )
+        await service.disable_totp(
+            request,
+            current_user,
+            code=payload.code,
+            password=payload.password,
+            passkey_credential=payload.credential,
+            passkey_ceremony_id=payload.ceremony_id,
+        )
+        return MessageResponse(message="两步验证已关闭")
 
 
 @router.patch("/me/preferences", response_model=UserPreferencesResponse)

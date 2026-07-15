@@ -21,6 +21,7 @@ from app.security.password import PasswordService
 from app.services.session.issue import IssueSessionService
 from app.services.user.response import build_user_response
 from app.services.user.storage import UserStorageProvisionService
+from app.services.user.totp import TOTPService
 from app.storage.manager import StorageManager
 
 
@@ -90,6 +91,24 @@ class UserLoginService:
             nodes=self.nodes,
             storage_manager=self.storage_manager,
         ).ensure_default_local_storage(user)
+
+        if user.totp_enabled and user.totp_secret:
+            two_factor_token = TOTPService(
+                session=self.session,
+                users=self.users,
+                audits=self.audits,
+                passkeys=None,  # type: ignore[arg-type]
+                password_service=self.password_service,
+                token_service=self.token_service,
+                config=None,  # type: ignore[arg-type]
+            ).issue_login_token(user.uid, login_method="password")
+            return LoginResponse(
+                user=build_user_response(user),
+                token=None,  # type: ignore[arg-type]
+                requires_2fa=True,
+                two_factor_token=two_factor_token,
+                message="请输入两步验证码",
+            )
 
         session_record, token_pair = await IssueSessionService(
             session=self.session,

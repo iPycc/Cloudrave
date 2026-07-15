@@ -42,6 +42,9 @@ class User(Base, TimestampMixin):
     status: Mapped[UserStatus] = mapped_column(Enum(UserStatus, native_enum=False), default=UserStatus.ACTIVE)
     timezone: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai")
     password_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    totp_secret: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    totp_backup_codes: Mapped[list[str]] = mapped_column(JSON, default=list)
 
     sessions: Mapped[list["Session"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     mounts: Mapped[list["BucketMount"]] = relationship(back_populates="owner")

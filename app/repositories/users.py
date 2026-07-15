@@ -88,6 +88,14 @@ class UserRepository:
         await self.session.flush()
         return user
 
+    async def update_totp(self, user: User, *, secret: str | None, enabled: bool, backup_codes: list[str] | None = None) -> User:
+        user.totp_secret = secret
+        user.totp_enabled = enabled
+        if backup_codes is not None:
+            user.totp_backup_codes = backup_codes
+        await self.session.flush()
+        return user
+
     async def _generate_unique_uid(self) -> str:
         for _ in range(20):
             candidate = "".join(secrets.choice(UID_ALPHABET) for _ in range(UID_LENGTH))

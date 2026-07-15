@@ -43,6 +43,7 @@ class UserResponse(AuthSchema):
     avatar: str | None = None
     created_at: datetime
     password_updated_at: datetime | None = None
+    two_factor_enabled: bool = False
 
 
 class TokenPairResponse(AuthSchema):
@@ -53,6 +54,21 @@ class TokenPairResponse(AuthSchema):
     session_id: str
 
 
+class TwoFactorChallengeResponse(AuthSchema):
+    requires_2fa: Literal[True] = True
+    two_factor_token: str
+    message: str = "请输入两步验证码"
+
+
+class TwoFactorVerifyRequest(AuthSchema):
+    two_factor_token: str = Field(min_length=20, max_length=512)
+    code: str = Field(min_length=6, max_length=8)
+    method: Literal["password", "passkey"] = "password"
+
+
 class LoginResponse(AuthSchema):
     user: UserResponse
-    token: TokenPairResponse
+    token: TokenPairResponse | None = None
+    requires_2fa: bool = False
+    two_factor_token: str | None = None
+    message: str | None = None

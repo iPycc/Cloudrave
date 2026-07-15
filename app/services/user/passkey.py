@@ -33,6 +33,7 @@ from app.repositories.policies import StoragePolicyRepository
 from app.repositories.sessions import SessionRepository
 from app.repositories.users import UserRepository
 from app.schemas.auth import LoginResponse
+from app.services.user.totp import TOTPService
 from app.schemas.passkey import (
     PasskeyAuthenticationOptionsRequest,
     PasskeyAuthenticationResponse,
@@ -310,6 +311,28 @@ class PasskeyService:
             nodes=self.nodes,
             storage_manager=self.storage_manager,
         ).ensure_default_local_storage(user)
+
+        if user.totp_enabled and user.totp_secret:
+            two_factor_token = TOTPService(
+                session=self.session,
+                users=self.users,
+                audits=self.audits,
+                passkeys=None,  # type: ignore[arg-type]
+                password_service=None,  # type: ignore[arg-type]
+                token_service=self.token_service,
+                config=self.config,
+            ).issue_login_token(user.uid, login_method="passkey")
+            await self.passkeys.update_usage(record, sign_count=verification.new_sign_count)
+            await self.passkeys.mark_ceremony_used(ceremony)
+            return PasskeyAuthenticationResponse(
+                login=LoginResponse(
+                    user=build_user_response(user),
+                    token=None,  # type: ignore[arg-type]
+                    requires_2fa=True,
+                    two_factor_token=two_factor_token,
+                    message="请输入两步验证码",
+                )
+            )
 
         session_record, token_pair = await IssueSessionService(
             session=self.session,

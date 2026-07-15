@@ -77,3 +77,32 @@ class TokenService:
 
     def hash_refresh_token(self, token: str) -> str:
         return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def issue_2fa_token(self, *, sub: str, purpose: str, ttl_seconds: int) -> str:
+        now = datetime.now(UTC)
+        expires_at = now + timedelta(seconds=ttl_seconds)
+        return jwt.encode(
+            {
+                "sub": sub,
+                "purpose": purpose,
+                "iss": self.config.jwt_issuer,
+                "iat": int(now.timestamp()),
+                "exp": int(expires_at.timestamp()),
+            },
+            self.config.jwt_secret,
+            algorithm="HS256",
+        )
+
+    def parse_2fa_token(self, token: str, purpose: str) -> dict:
+        try:
+            payload = jwt.decode(
+                token,
+                self.config.jwt_secret,
+                algorithms=["HS256"],
+                issuer=self.config.jwt_issuer,
+            )
+        except jwt.PyJWTError as exc:
+            raise AuthError("Invalid 2FA token") from exc
+        if payload.get("purpose") != purpose:
+            raise AuthError("Invalid 2FA token purpose")
+        return payload

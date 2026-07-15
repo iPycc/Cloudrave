@@ -119,6 +119,12 @@ def _migrate_users_table(connection, inspector) -> None:
         connection.execute(text(f"ALTER TABLE users ADD COLUMN timezone {_varchar_type(dialect, 64)}"))
     if "password_updated_at" not in columns:
         connection.execute(text(f"ALTER TABLE users ADD COLUMN password_updated_at {_datetime_type(dialect)}"))
+    if "totp_secret" not in columns:
+        connection.execute(text(f"ALTER TABLE users ADD COLUMN totp_secret {_varchar_type(dialect, 255)}"))
+    if "totp_enabled" not in columns:
+        connection.execute(text("ALTER TABLE users ADD COLUMN totp_enabled BOOLEAN DEFAULT 0"))
+    if "totp_backup_codes" not in columns:
+        connection.execute(text("ALTER TABLE users ADD COLUMN totp_backup_codes TEXT DEFAULT '[]'"))
 
     rows = connection.execute(
         text("SELECT id, created_at, uid, timezone, password_updated_at FROM users ORDER BY id ASC")
