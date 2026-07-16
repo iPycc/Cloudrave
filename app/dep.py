@@ -37,6 +37,7 @@ class Dep:
         self.session_factory = make_session_factory(self.engine)
         self.password_service = PasswordService(config.auth.password_salt)
         self.token_service = TokenService(config.auth)
+        self.storage_manager = StorageManager(config=config, local_root=config.local_upload_root_path)
 
     @property
     def share_signing_key(self) -> bytes:
@@ -45,7 +46,6 @@ class Dep:
             raise RuntimeError("Missing [auth].share_signing_key in config.ini")
         return key.encode()
 
-        self.storage_manager = StorageManager(local_root=config.local_upload_root_path)
 
     async def connect(self) -> None:
         schema_path = write_schema_sql(self.config)

@@ -67,6 +67,9 @@ class LoggingConfig:
 
 @dataclass(slots=True)
 class TencentCosConfig:
+    secret_id: str = ""
+    secret_key: str = ""
+    bucket: str = ""
     default_region: str = "ap-guangzhou"
     presign_ttl_seconds: int = 900
 
@@ -126,14 +129,17 @@ def default_config_parser() -> ConfigParser:
         "password_salt": "",
         "totp_secret_key": "",
         "backup_codes_key": "",
+        "share_signing_key": "",
     }
     _ensure_auth_secrets(parser)
     parser["logging"] = {
-        "share_signing_key": "",
         "level": "INFO",
         "use_color": "true",
     }
     parser["tencent_cos"] = {
+        "secret_id": "",
+        "secret_key": "",
+        "bucket": "",
         "default_region": "ap-guangzhou",
         "presign_ttl_seconds": "900",
     }
@@ -199,13 +205,16 @@ def load_config(root_dir: Path) -> CloudraveConfig:
         password_salt=parser.get("auth", "password_salt", fallback=""),
         totp_secret_key=parser.get("auth", "totp_secret_key", fallback=""),
         backup_codes_key=parser.get("auth", "backup_codes_key", fallback=""),
+        share_signing_key=parser.get("auth", "share_signing_key", fallback=""),
     )
     logging = LoggingConfig(
         level=parser.get("logging", "level", fallback="INFO"),
         use_color=parser.getboolean("logging", "use_color", fallback=True),
     )
     tencent_cos = TencentCosConfig(
-        share_signing_key=parser.get("auth", "share_signing_key", fallback=""),
+        secret_id=parser.get("tencent_cos", "secret_id", fallback=""),
+        secret_key=parser.get("tencent_cos", "secret_key", fallback=""),
+        bucket=parser.get("tencent_cos", "bucket", fallback=""),
         default_region=parser.get("tencent_cos", "default_region", fallback="ap-guangzhou"),
         presign_ttl_seconds=parser.getint("tencent_cos", "presign_ttl_seconds", fallback=900),
     )
@@ -291,6 +300,11 @@ def _ensure_auth_secrets(parser: ConfigParser) -> bool:
         parser["auth"]["backup_codes_key"] = _generate_secret(32)
         changed = True
 
+    share_signing_key = parser.get("auth", "share_signing_key", fallback="").strip()
+    if not share_signing_key:
+        parser["auth"]["share_signing_key"] = _generate_secret(48)
+        changed = True
+
     return changed
 
 
@@ -300,11 +314,6 @@ def _generate_secret(length: int) -> str:
 
 def _serialize_config(parser: ConfigParser) -> str:
     lines: list[str] = []
-    share_signing_key = parser.get("auth", "share_signing_key", fallback="").strip()
-    if not share_signing_key:
-        parser["auth"]["share_signing_key"] = _generate_secret(48)
-        changed = True
-
     for section in parser.sections():
         lines.append(f"[{section}]")
         for key, value in parser[section].items():
