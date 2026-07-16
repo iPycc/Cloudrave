@@ -16,6 +16,7 @@ from app.repositories.objects import ObjectRepository
 from app.repositories.passkeys import PasskeyRepository
 from app.repositories.policies import StoragePolicyRepository
 from app.repositories.sessions import SessionRepository
+from app.repositories.shares import ShareRepository
 from app.repositories.uploads import UploadRepository
 from app.repositories.users import UserRepository
 from app.security.jwt import TokenService
@@ -36,6 +37,14 @@ class Dep:
         self.session_factory = make_session_factory(self.engine)
         self.password_service = PasswordService(config.auth.password_salt)
         self.token_service = TokenService(config.auth)
+
+    @property
+    def share_signing_key(self) -> bytes:
+        key = self.config.auth.share_signing_key
+        if not key:
+            raise RuntimeError("Missing [auth].share_signing_key in config.ini")
+        return key.encode()
+
         self.storage_manager = StorageManager(local_root=config.local_upload_root_path)
 
     async def connect(self) -> None:
@@ -105,6 +114,9 @@ class Dep:
 
     def get_upload_repository(self, session: AsyncSession) -> UploadRepository:
         return UploadRepository(session)
+
+    def get_share_repository(self, session: AsyncSession) -> ShareRepository:
+        return ShareRepository(session)
 
     def _mask_database_url(self, value: str) -> str:
         parsed = urlsplit(value)

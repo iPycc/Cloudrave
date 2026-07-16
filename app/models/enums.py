@@ -49,3 +49,8 @@ class UploadState(StrEnum):
     ABORTED = "aborted"
     EXPIRED = "expired"
     FAILED = "failed"
+
+
+class ShareAccess(StrEnum):
+    PUBLIC = "public"
+    PASSWORD = "password"

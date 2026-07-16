@@ -8,7 +8,17 @@ from uuid import uuid4
 from sqlalchemy import Index, JSON, Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.models.enums import NodeStatus, NodeType, SessionStatus, StoragePolicyType, UploadMode, UploadState, UserRole, UserStatus
+from app.models.enums import (
+    NodeStatus,
+    NodeType,
+    SessionStatus,
+    ShareAccess,
+    StoragePolicyType,
+    UploadMode,
+    UploadState,
+    UserRole,
+    UserStatus,
+)
 from database import Base
 
 
@@ -50,6 +60,7 @@ class User(Base, TimestampMixin):
     mounts: Mapped[list["BucketMount"]] = relationship(back_populates="owner")
     passkeys: Mapped[list["PasskeyCredential"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     passkey_ceremonies: Mapped[list["PasskeyCeremony"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    shares: Mapped[list["ShareRecord"]] = relationship(back_populates="owner", cascade="all, delete-orphan")
 
 
 class Session(Base):
@@ -185,6 +196,24 @@ class ObjectRecord(Base, TimestampMixin):
     checksum: Mapped[str | None] = mapped_column(String(128), nullable=True)
     content_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
     extra: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class ShareRecord(Base, TimestampMixin):
+    __tablename__ = "shares"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id", ondelete="CASCADE"), index=True)
+    access: Mapped[ShareAccess] = mapped_column(Enum(ShareAccess, native_enum=False), default=ShareAccess.PUBLIC)
+    password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    max_downloads: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    download_count: Mapped[int] = mapped_column(Integer, default=0)
+    view_count: Mapped[int] = mapped_column(Integer, default=0)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    owner: Mapped[User] = relationship(back_populates="shares")
+    node: Mapped[Node] = relationship()
 
 
 class UploadSessionRecord(Base, TimestampMixin):

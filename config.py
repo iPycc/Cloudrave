@@ -56,6 +56,7 @@ class AuthConfig:
     password_salt: str = ""
     totp_secret_key: str = ""
     backup_codes_key: str = ""
+    share_signing_key: str = ""
 
 
 @dataclass(slots=True)
@@ -128,6 +129,7 @@ def default_config_parser() -> ConfigParser:
     }
     _ensure_auth_secrets(parser)
     parser["logging"] = {
+        "share_signing_key": "",
         "level": "INFO",
         "use_color": "true",
     }
@@ -203,6 +205,7 @@ def load_config(root_dir: Path) -> CloudraveConfig:
         use_color=parser.getboolean("logging", "use_color", fallback=True),
     )
     tencent_cos = TencentCosConfig(
+        share_signing_key=parser.get("auth", "share_signing_key", fallback=""),
         default_region=parser.get("tencent_cos", "default_region", fallback="ap-guangzhou"),
         presign_ttl_seconds=parser.getint("tencent_cos", "presign_ttl_seconds", fallback=900),
     )
@@ -297,6 +300,11 @@ def _generate_secret(length: int) -> str:
 
 def _serialize_config(parser: ConfigParser) -> str:
     lines: list[str] = []
+    share_signing_key = parser.get("auth", "share_signing_key", fallback="").strip()
+    if not share_signing_key:
+        parser["auth"]["share_signing_key"] = _generate_secret(48)
+        changed = True
+
     for section in parser.sections():
         lines.append(f"[{section}]")
         for key, value in parser[section].items():

@@ -112,6 +112,9 @@ def _ensure_sqlite_parent_dir(config: CloudraveConfig) -> None:
 
 
 def _apply_runtime_migrations(connection) -> None:
+    import app.models  # noqa: F401
+
+    Base.metadata.create_all(connection, checkfirst=True)
     inspector = inspect(connection)
     tables = set(inspector.get_table_names())
     if "users" in tables:
