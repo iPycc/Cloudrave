@@ -134,5 +134,21 @@ class ShareService:
         return f"{payload}:{signature}"
 
     def verify_access_token(self, share: ShareRecord, token: str) -> bool:
-        expected = self._issue_access_token(share)
-        return hmac.compare_digest(expected, token)
+        parts = token.split(":")
+        if len(parts) != 4:
+            return False
+        share_id, node_id_str, ts_str, provided_sig = parts
+        if share_id != share.id or node_id_str != str(share.node_id):
+            return False
+        try:
+            ts = int(ts_str)
+        except ValueError:
+            return False
+        issued_at = datetime.fromtimestamp(ts, UTC)
+        if issued_at > datetime.now(UTC) + timedelta(minutes=5):
+            return False
+        if share.expires_at is not None and issued_at > share.expires_at:
+            return False
+        payload = f"{share_id}:{node_id_str}:{ts_str}"
+        expected_sig = hmac.new(self.share_signing_key, payload.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(provided_sig, expected_sig)
