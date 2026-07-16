@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=80.9.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cloudrave-backend"
+version = "0.1.0"
+description = "Cloudrave backend inspired by Cloudrave service boundaries"
+requires-python = ">=3.12"
+dependencies = [
+  "aiomysql>=0.2.0",
+  "aiosqlite>=0.21.0",
+  "alembic>=1.14.1",
+  "argon2-cffi>=23.1.0",
+  "asyncpg>=0.30.0",
+  "email-validator>=2.2.0",
+  "fastapi>=0.116.0",
+  "greenlet>=3.2.0",
+  "httpx>=0.28.1",
+  "pydantic>=2.11.7",
+  "pydantic-settings>=2.10.1",
+  "PyMySQL>=1.1.1",
+  "psycopg[binary]>=3.2.9",
+  "python-multipart>=0.0.20",
+  "PyJWT>=2.10.1",
+  "sqlalchemy>=2.0.43",
+  "uvicorn>=0.35.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.4.2",
+  "pytest-asyncio>=1.1.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]
+
+[tool.setuptools]
+py-modules = ["bootstrap", "config", "database", "logging_config", "main"]
+
+[tool.setuptools.packages.find]
+include = ["app*"]

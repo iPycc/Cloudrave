@@ -1,0 +1,53 @@
+.DS_Store
+Thumbs.db
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+
+# Coverage and test output
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+pytestdebug.log
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# IDE/editor
+.idea/
+
+# Local runtime data
+data/
+upload/
+*.db
+*.sqlite
+*.sqlite3
+db.sql
+
+# Local configuration and secrets
+config.ini
+.env
+.env.*
+
+# Logs
+*.log
