@@ -51,6 +51,7 @@ async def login(
             password_service=dep.password_service,
             token_service=dep.token_service,
             storage_manager=dep.storage_manager,
+            config=dep.config,
         )
         result = await service.login(request, payload)
         if result.token:
@@ -130,6 +131,7 @@ async def verify_two_factor(
             nodes=dep.get_node_repository(session),
             token_service=dep.token_service,
             storage_manager=dep.storage_manager,
+            config=dep.config,
         )
         result = await service.verify(
             request,

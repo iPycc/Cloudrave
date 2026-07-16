@@ -23,6 +23,7 @@ from app.services.user.response import build_user_response
 from app.services.user.storage import UserStorageProvisionService
 from app.services.user.totp import TOTPService
 from app.storage.manager import StorageManager
+from config import CloudraveConfig
 
 
 LOGGER = logging.getLogger("cloudrave.auth")
@@ -42,6 +43,7 @@ class UserLoginService:
         password_service: PasswordService,
         token_service: TokenService,
         storage_manager: StorageManager,
+        config: CloudraveConfig,
     ) -> None:
         self.session = session
         self.users = users
@@ -53,6 +55,7 @@ class UserLoginService:
         self.password_service = password_service
         self.token_service = token_service
         self.storage_manager = storage_manager
+        self.config = config
 
     async def login(self, request: Request, payload: LoginRequest) -> LoginResponse:
         normalized_email = payload.email.lower()
@@ -100,7 +103,7 @@ class UserLoginService:
                 passkeys=None,  # type: ignore[arg-type]
                 password_service=self.password_service,
                 token_service=self.token_service,
-                config=None,  # type: ignore[arg-type]
+                config=self.config,
             ).issue_login_token(user.uid, login_method="password")
             return LoginResponse(
                 user=build_user_response(user),

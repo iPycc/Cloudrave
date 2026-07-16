@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import secrets
 from datetime import UTC, datetime, timedelta
-from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.enums import ShareAccess
 from app.models.tables import ShareRecord
+
+_SHARE_ID_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+_SHARE_ID_LENGTH = 6
+
+
+def _generate_share_id() -> str:
+    return "".join(secrets.choice(_SHARE_ID_CHARS) for _ in range(_SHARE_ID_LENGTH))
 
 
 class ShareRepository:
@@ -37,8 +44,16 @@ class ShareRepository:
         expires_at: datetime | None,
         max_downloads: int | None,
     ) -> ShareRecord:
+        for _ in range(10):
+            share_id = _generate_share_id()
+            existing = await self.session.get(ShareRecord, share_id)
+            if existing is None:
+                break
+        else:
+            share_id = _generate_share_id()
+
         share = ShareRecord(
-            id=str(uuid4()),
+            id=share_id,
             owner_id=owner_id,
             node_id=node_id,
             access=access,

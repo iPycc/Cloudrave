@@ -79,7 +79,6 @@ async def get_share_info(
     async with dep.session_scope() as session:
         service = _build_share_service(request, session)
         share, node = await service.get_share_info(share_id)
-        await service.record_view(share)
         return ShareNodeInfo(
             share_id=share.id,
             access=share.access,

@@ -12,8 +12,9 @@ from fastapi.responses import FileResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.tables import User
+from app.models.tables import PasskeyCeremony, PasskeyCredential, User
 from app.repositories.audit_logs import AuditLogRepository
+from app.repositories.passkeys import PasskeyRepository
 from app.repositories.sessions import SessionRepository
 from app.repositories.users import UserRepository
 from app.schemas.common import MessageResponse
@@ -40,6 +41,7 @@ class UserProfileService:
         users: UserRepository,
         sessions: SessionRepository,
         audits: AuditLogRepository,
+        passkeys: PasskeyRepository,
         password_service: PasswordService,
         config: CloudraveConfig,
     ) -> None:
@@ -47,6 +49,7 @@ class UserProfileService:
         self.users = users
         self.sessions = sessions
         self.audits = audits
+        self.passkeys = passkeys
         self.password_service = password_service
         self.config = config
 
@@ -121,12 +124,31 @@ class UserProfileService:
         user = await self._get_managed_user(actor.uid)
         if payload.new_password != payload.confirm_password:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="两次输入的新密码不一致")
-        if payload.current_password == payload.new_password:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="新密码不能与旧密码相同")
-        if not self.password_service.verify_password(payload.current_password, user.password_hash):
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="旧密码不正确")
+
+        current_password = payload.current_password.strip() if payload.current_password else None
+        reauthenticated = False
+        if current_password is not None:
+            if current_password == payload.new_password:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="新密码不能与旧密码相同")
+            if not user.password_hash or not self.password_service.verify_password(current_password, user.password_hash):
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="旧密码不正确")
+            reauthenticated = True
+        elif payload.ceremony_id is not None and payload.credential is not None:
+            passkey_reauth = await self._verify_passkey_reauth(request, user, payload.ceremony_id, payload.credential)
+            reauthenticated = passkey_reauth is not None
+            if not reauthenticated:
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="通行密钥验证已失效，请重新验证身份")
+        elif payload.ceremony_id is not None or payload.credential is not None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="通行密钥验证信息不完整")
+
+        if not reauthenticated:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="请先验证身份")
 
         await self.users.update_password(user, self.password_service.hash_password(payload.new_password))
+        if passkey_reauth is not None:
+            record, ceremony, new_sign_count = passkey_reauth
+            await self.passkeys.update_usage(record, sign_count=new_sign_count)
+            await self.passkeys.mark_ceremony_used(ceremony)
         revoked = await self.sessions.revoke_all_for_user(user.id)
         await self.audits.create(
             actor_id=user.id,
@@ -183,6 +205,75 @@ class UserProfileService:
         if avatar_root not in avatar_path.parents or not avatar_path.exists():
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="头像不存在")
         return FileResponse(avatar_path)
+
+    async def _verify_passkey_reauth(
+        self,
+        request: Request,
+        user: User,
+        ceremony_id: str,
+        credential: dict,
+    ) -> tuple[PasskeyCredential, PasskeyCeremony, int] | None:
+        from urllib.parse import urlsplit
+
+        from webauthn import verify_authentication_response
+        from webauthn.helpers import base64url_to_bytes
+
+        ceremony = await self.passkeys.get_active_ceremony(ceremony_id, "authentication")
+        if ceremony is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="通行密钥挑战已失效")
+        if ceremony.user_id != user.id:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="通行密钥与当前账号不匹配")
+
+        credential_id = str(credential.get("id") or "").strip()
+        record = await self.passkeys.get_by_credential_id(credential_id)
+        if record is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="未找到对应的通行密钥")
+        if record.user_id != user.id:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="通行密钥与当前账号不匹配")
+
+        try:
+            expected_origin = self._resolve_origin(request)
+            expected_rp_id = self._resolve_rp_id(request)
+            verification = verify_authentication_response(
+                credential=credential,
+                expected_challenge=base64url_to_bytes(ceremony.challenge),
+                expected_rp_id=expected_rp_id,
+                expected_origin=expected_origin,
+                credential_public_key=base64url_to_bytes(record.public_key),
+                credential_current_sign_count=record.sign_count,
+                require_user_verification=True,
+            )
+        except Exception as exc:
+            import logging
+
+            logger = logging.getLogger(__name__)
+            logger.warning("Passkey reauth verification failed: %s", exc)
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="通行密钥校验未通过")
+
+        return record, ceremony, verification.new_sign_count
+
+    def _resolve_origin(self, request: Request) -> str:
+        from urllib.parse import urlsplit
+
+        origin = (request.headers.get("origin") or "").strip()
+        if not origin:
+            referer = (request.headers.get("referer") or "").strip()
+            if referer:
+                parsed = urlsplit(referer)
+                origin = f"{parsed.scheme}://{parsed.netloc}"
+        if not origin:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="无法识别当前 WebAuthn 来源")
+        if self.config.app.cors_origins and origin not in self.config.app.cors_origins:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="当前来源未被允许使用通行密钥")
+        return origin
+
+    def _resolve_rp_id(self, request: Request) -> str:
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(self._resolve_origin(request))
+        if not parsed.hostname:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="无法识别当前 WebAuthn 域名")
+        return parsed.hostname
 
     async def _get_managed_user(self, uid: str) -> User:
         user = await self.users.get_by_uid(uid)

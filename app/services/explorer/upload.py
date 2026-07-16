@@ -359,9 +359,7 @@ class CreateUploadSessionService:
                 checksum = None
                 if policy.provider == StoragePolicyType.LOCAL_FS:
                     adapter = self.storage_manager.get_adapter(policy)
-                    mount_root = adapter.prepare_mount_root(mount)
-                    full_path = Path(mount_root) / record.path
-                    checksum = await asyncio.to_thread(self._compute_sha256, full_path)
+                    checksum = await asyncio.to_thread(self._compute_sha256_from_adapter, adapter, policy, mount, record.path)
 
                 await self.objects.create_or_update(
                     node_id=file_node.id,
@@ -483,9 +481,15 @@ class CreateUploadSessionService:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Upload session access denied")
         return record
 
-    def _compute_sha256(self, file_path: Path) -> str:
+    def _compute_sha256_from_adapter(
+        self,
+        adapter,
+        policy,
+        mount,
+        object_key: str,
+    ) -> str:
         hasher = hashlib.sha256()
-        with open(file_path, "rb") as f:
+        with adapter.open_object(policy, mount, object_key) as f:
             for chunk in iter(lambda: f.read(1024 * 1024), b""):
                 hasher.update(chunk)
         return hasher.hexdigest()

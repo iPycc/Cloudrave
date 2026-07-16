@@ -21,6 +21,7 @@ from app.services.user.response import build_user_response
 from app.services.user.storage import UserStorageProvisionService
 from app.services.user.totp import TOTPService
 from app.storage.manager import StorageManager
+from config import CloudraveConfig
 
 
 class TwoFactorLoginService:
@@ -38,6 +39,7 @@ class TwoFactorLoginService:
         nodes: NodeRepository,
         token_service: TokenService,
         storage_manager: StorageManager,
+        config: CloudraveConfig,
     ) -> None:
         self.session = session
         self.users = users
@@ -48,6 +50,7 @@ class TwoFactorLoginService:
         self.nodes = nodes
         self.token_service = token_service
         self.storage_manager = storage_manager
+        self.config = config
 
     async def verify(
         self,
@@ -63,7 +66,7 @@ class TwoFactorLoginService:
             passkeys=None,  # type: ignore[arg-type]
             password_service=None,  # type: ignore[arg-type]
             token_service=self.token_service,
-            config=None,  # type: ignore[arg-type]
+            config=self.config,
         )
         user = await totp_service.verify_login(request, login_token, code, login_method)
 

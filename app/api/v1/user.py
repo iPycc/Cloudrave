@@ -91,6 +91,7 @@ async def update_me(
             users=dep.get_user_repository(session),
             sessions=dep.get_session_repository(session),
             audits=dep.get_audit_repository(session),
+            passkeys=dep.get_passkey_repository(session),
             password_service=dep.password_service,
             config=dep.config,
         )
@@ -110,6 +111,7 @@ async def upload_avatar(
             users=dep.get_user_repository(session),
             sessions=dep.get_session_repository(session),
             audits=dep.get_audit_repository(session),
+            passkeys=dep.get_passkey_repository(session),
             password_service=dep.password_service,
             config=dep.config,
         )
@@ -129,6 +131,7 @@ async def change_password(
             users=dep.get_user_repository(session),
             sessions=dep.get_session_repository(session),
             audits=dep.get_audit_repository(session),
+            passkeys=dep.get_passkey_repository(session),
             password_service=dep.password_service,
             config=dep.config,
         )
@@ -264,6 +267,7 @@ async def update_preferences(
             users=dep.get_user_repository(session),
             sessions=dep.get_session_repository(session),
             audits=dep.get_audit_repository(session),
+            passkeys=dep.get_passkey_repository(session),
             password_service=dep.password_service,
             config=dep.config,
         )
@@ -282,6 +286,7 @@ async def get_login_activity(
             users=dep.get_user_repository(session),
             sessions=dep.get_session_repository(session),
             audits=dep.get_audit_repository(session),
+            passkeys=dep.get_passkey_repository(session),
             password_service=dep.password_service,
             config=dep.config,
         )
@@ -418,6 +423,7 @@ async def get_avatar(request: Request, uid: str, filename: str) -> FileResponse:
             users=dep.get_user_repository(session),
             sessions=dep.get_session_repository(session),
             audits=dep.get_audit_repository(session),
+            passkeys=dep.get_passkey_repository(session),
             password_service=dep.password_service,
             config=dep.config,
         )
