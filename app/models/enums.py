@@ -44,6 +44,7 @@ class UploadMode(StrEnum):
 class UploadState(StrEnum):
     CREATED = "created"
     UPLOADING = "uploading"
+    COMPLETING = "completing"
     COMPLETED = "completed"
     ABORTED = "aborted"
     EXPIRED = "expired"

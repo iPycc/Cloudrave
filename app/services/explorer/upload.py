@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from math import ceil
 from pathlib import Path
 
@@ -30,6 +31,21 @@ from app.schemas.upload import (
 )
 from app.storage.manager import StorageManager
 from app.storage.types import MultipartPart, MultipartUploadState
+
+
+_upload_completion_locks: dict[str, asyncio.Lock] = {}
+_upload_completion_locks_lock = asyncio.Lock()
+
+
+async def _get_upload_completion_lock(session_id: str) -> asyncio.Lock:
+    lock = _upload_completion_locks.get(session_id)
+    if lock is None:
+        async with _upload_completion_locks_lock:
+            lock = _upload_completion_locks.get(session_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                _upload_completion_locks[session_id] = lock
+    return lock
 
 
 class CreateUploadSessionService:
@@ -193,7 +209,8 @@ class CreateUploadSessionService:
             if file is None:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Local upload requires file content")
             payload = await file.read()
-            part = adapter.upload_part(
+            part = await asyncio.to_thread(
+                adapter.upload_part,
                 policy,
                 mount,
                 self._build_upload_state(record, policy, mount),
@@ -220,69 +237,93 @@ class CreateUploadSessionService:
         payload: UploadSessionCompleteRequest,
     ) -> UploadSessionRead:
         record = await self._require_upload_access(actor, session_id)
-        mount, policy = await self._require_mount_access(actor, record.mount_id)
-        adapter = self.storage_manager.get_adapter(policy)
-        parts = await self.uploads.list_parts(record.id)
-
-        if payload.parts:
-            for part in payload.parts:
-                await self.uploads.upsert_part(
-                    upload_session_id=record.id,
-                    part_number=part.part_number,
-                    etag=part.etag,
-                    size=part.size,
+        lock = await _get_upload_completion_lock(session_id)
+        async with lock:
+            record = await self._require_upload_access(actor, session_id)
+            if record.state == UploadState.COMPLETED:
+                return await self._to_read(record)
+            if record.state in (
+                UploadState.COMPLETING,
+                UploadState.ABORTED,
+                UploadState.EXPIRED,
+                UploadState.FAILED,
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Upload session is not in a completable state",
                 )
-            parts = await self.uploads.list_parts(record.id)
+            await self.uploads.set_state(record.id, UploadState.COMPLETING)
 
-        if policy.provider == StoragePolicyType.LOCAL_FS:
-            upload_state = self._build_upload_state(record, policy, mount)
-            storage_parts = adapter.list_parts(policy, mount, upload_state)
-            adapter.complete_multipart_upload(
-                policy,
-                mount,
-                upload_state,
-                storage_parts,
-                mime_type=record.content_type,
-            )
-        else:
-            adapter.complete_multipart_upload(
-                policy,
-                mount,
-                self._build_upload_state(record, policy, mount),
-                [MultipartPart(part_number=part.part_number, etag=part.etag or "", size=part.size) for part in parts],
-                mime_type=record.content_type,
-            )
+            try:
+                mount, policy = await self._require_mount_access(actor, record.mount_id)
+                adapter = self.storage_manager.get_adapter(policy)
+                parts = await self.uploads.list_parts(record.id)
 
-        try:
-            file_node = await self.nodes.create_file(
-                owner_id=mount.owner_id,
-                mount_id=mount.id,
-                parent_id=record.node_id,
-                name=record.file_name,
-                blob_path=record.path,
-                size=record.size,
-            )
-        except IntegrityError as exc:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A file with the same name already exists") from exc
+                if payload.parts:
+                    for part in payload.parts:
+                        await self.uploads.upsert_part(
+                            upload_session_id=record.id,
+                            part_number=part.part_number,
+                            etag=part.etag,
+                            size=part.size,
+                        )
+                    parts = await self.uploads.list_parts(record.id)
 
-        await self.objects.create_or_update(
-            node_id=file_node.id,
-            policy_id=policy.id,
-            blob_path=record.path,
-            content_type=record.content_type,
-        )
-        await self.uploads.bind_node(record.id, file_node.id)
-        await self.uploads.set_state(record.id, UploadState.COMPLETED)
-        await self.audits.create(
-            actor_id=actor.id,
-            action="upload.complete",
-            target=f"upload:{record.id}",
-            detail=record.path,
-            ip=request.client.host if request.client else None,
-            user_agent=request.headers.get("user-agent"),
-            request_id=getattr(request.state, "request_id", None),
-        )
-        return await self._to_read(record)
+                if policy.provider == StoragePolicyType.LOCAL_FS:
+                    upload_state = self._build_upload_state(record, policy, mount)
+                    storage_parts = await asyncio.to_thread(
+                        adapter.list_parts, policy, mount, upload_state
+                    )
+                    await asyncio.to_thread(
+                        adapter.complete_multipart_upload,
+                        policy,
+                        mount,
+                        upload_state,
+                        storage_parts,
+                        mime_type=record.content_type,
+                    )
+                else:
+                    adapter.complete_multipart_upload(
+                        policy,
+                        mount,
+                        self._build_upload_state(record, policy, mount),
+                        [MultipartPart(part_number=part.part_number, etag=part.etag or "", size=part.size) for part in parts],
+                        mime_type=record.content_type,
+                    )
+
+                try:
+                    file_node = await self.nodes.create_file(
+                        owner_id=mount.owner_id,
+                        mount_id=mount.id,
+                        parent_id=record.node_id,
+                        name=record.file_name,
+                        blob_path=record.path,
+                        size=record.size,
+                    )
+                except IntegrityError as exc:
+                    raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A file with the same name already exists") from exc
+
+                await self.objects.create_or_update(
+                    node_id=file_node.id,
+                    policy_id=policy.id,
+                    blob_path=record.path,
+                    content_type=record.content_type,
+                )
+                await self.uploads.bind_node(record.id, file_node.id)
+                await self.uploads.set_state(record.id, UploadState.COMPLETED)
+                await self.audits.create(
+                    actor_id=actor.id,
+                    action="upload.complete",
+                    target=f"upload:{record.id}",
+                    detail=record.path,
+                    ip=request.client.host if request.client else None,
+                    user_agent=request.headers.get("user-agent"),
+                    request_id=getattr(request.state, "request_id", None),
+                )
+                return await self._to_read(record)
+            except Exception:
+                await self.uploads.set_state(record.id, UploadState.FAILED)
+                raise
 
     async def abort(
         self,
@@ -296,7 +337,12 @@ class CreateUploadSessionService:
         mount, policy = await self._require_mount_access(actor, record.mount_id)
         adapter = self.storage_manager.get_adapter(policy)
         if policy.provider == StoragePolicyType.LOCAL_FS and record.upload_id:
-            adapter.abort_multipart_upload(policy, mount, self._build_upload_state(record, policy, mount))
+            await asyncio.to_thread(
+                adapter.abort_multipart_upload,
+                policy,
+                mount,
+                self._build_upload_state(record, policy, mount),
+            )
         await self.uploads.set_state(record.id, UploadState.ABORTED)
         await self.audits.create(
             actor_id=actor.id,
