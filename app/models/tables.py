@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from sqlalchemy import JSON, Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Index, JSON, Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.enums import NodeStatus, NodeType, SessionStatus, StoragePolicyType, UploadMode, UploadState, UserRole, UserStatus
@@ -68,6 +68,8 @@ class Session(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     user: Mapped[User] = relationship(back_populates="sessions")
+
+    __table_args__ = (Index("ix_sessions_user_status", "user_id", "status"),)
 
 
 class PasskeyCredential(Base, TimestampMixin):
@@ -166,7 +168,11 @@ class Node(Base, TimestampMixin):
 
     mount: Mapped[BucketMount] = relationship(back_populates="nodes")
 
-    __table_args__ = (UniqueConstraint("mount_id", "parent_id", "name", name="uq_nodes_mount_parent_name"),)
+    __table_args__ = (
+        UniqueConstraint("mount_id", "parent_id", "name", name="uq_nodes_mount_parent_name"),
+        Index("ix_nodes_mount_parent_deleted", "mount_id", "parent_id", "deleted_at"),
+        Index("ix_nodes_owner_deleted", "owner_id", "deleted_at"),
+    )
 
 
 class ObjectRecord(Base, TimestampMixin):
@@ -223,3 +229,5 @@ class AuditLog(Base):
     user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
     request_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (Index("ix_audit_logs_actor_created", "actor_id", "created_at"),)
