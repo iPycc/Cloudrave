@@ -1,15 +1,12 @@
-"""Tencent COS storage adapter skeleton."""
+"""Tencent Cloud COS storage adapter using the official qcloud_cos SDK."""
+
 from __future__ import annotations
 
-import base64
-import hashlib
-from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from urllib.parse import urlencode, quote
-from uuid import uuid4
+from typing import Any, BinaryIO
 
-from app.storage_adapters.base import StorageAdapterBase
+from app.models.tables import BucketMount, StoragePolicy
 from app.storage.types import (
     MultipartPart,
     MultipartUploadState,
@@ -19,155 +16,305 @@ from app.storage.types import (
     normalize_object_key,
     utcnow,
 )
+from config import TencentCosConfig
+
+try:
+    from qcloud_cos import CosConfig, CosS3Client
+
+    _COS_SDK_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _COS_SDK_AVAILABLE = False
 
 
-@dataclass(slots=True)
-class TencentCosCredentials:
-    secret_id: str = ""
-    secret_key: str = ""
-    token: str | None = None
-    bucket: str = ""
-    region: str = ""
-    endpoint: str | None = None
-
-
-class TencentCosAdapter(StorageAdapterBase):
+class TencentCosAdapter:
     provider_type = "tencent_cos"
     capabilities = StorageCapability(
         supports_presign=True,
         supports_multipart=True,
-        supports_cors_autoconfig=True,
+        supports_cors_autoconfig=False,
         supports_direct_write=False,
     )
 
-    def __init__(self) -> None:
-        self._stub_prefix = "https://cos.cloudrave.local"
+    def __init__(self, config: TencentCosConfig | None = None) -> None:
+        self.config = config
+        self._client: Any | None = None
 
-    def prepare_mount_root(self, mount) -> Path:  # type: ignore[override]
-        return Path.cwd() / "upload" / "cos" / mount.mount_slug
+    def _ensure_client(self) -> Any:
+        if not _COS_SDK_AVAILABLE:
+            raise RuntimeError(
+                "Tencent Cloud COS SDK is not installed. "
+                "Install it with: pip install cos-python-sdk-v5"
+            )
+        if self._client is not None:
+            return self._client
+        if self.config is None:
+            raise RuntimeError("Tencent COS config is missing")
+        if not self.config.secret_id or not self.config.secret_key or not self.config.bucket:
+            raise RuntimeError(
+                "Tencent COS credentials are incomplete. "
+                "Set secret_id, secret_key and bucket in config.ini [tencent_cos]."
+            )
+        cos_config = CosConfig(
+            Region=self.config.default_region,
+            SecretId=self.config.secret_id,
+            SecretKey=self.config.secret_key,
+            Token=None,
+            Scheme="https",
+        )
+        self._client = CosS3Client(cos_config)
+        return self._client
 
-    def _creds(self, policy) -> TencentCosCredentials:
-        provider_config = getattr(policy, "extra", {}) or {}
-        provider_config = provider_config.get("provider_config", provider_config)
-        return TencentCosCredentials(
-            secret_id=str(getattr(policy, "secret_id", None) or provider_config.get("secret_id", "")),
-            secret_key=str(getattr(policy, "secret_key", None) or provider_config.get("secret_key", "")),
-            token=getattr(policy, "session_token", None) or provider_config.get("token"),
-            bucket=str(getattr(policy, "bucket_name", None) or provider_config.get("bucket", "")),
-            region=str(getattr(policy, "region", None) or provider_config.get("region", "")),
-            endpoint=getattr(policy, "endpoint", None) or provider_config.get("endpoint"),
+    def _bucket(self) -> str:
+        if self.config is None or not self.config.bucket:
+            raise RuntimeError("Tencent COS bucket is not configured")
+        return self.config.bucket
+
+    def _key(self, mount: BucketMount, object_key: str) -> str:
+        root = mount.root_path.strip("/")
+        key = normalize_object_key(f"{root}/{object_key}" if root else object_key)
+        return key
+
+    def prepare_mount_root(self, mount: BucketMount) -> Path:
+        return Path(mount.root_path.strip("/"))
+
+    def put_object(
+        self,
+        policy: StoragePolicy,
+        mount: BucketMount,
+        object_key: str,
+        body: bytes | BinaryIO,
+        *,
+        mime_type: str | None = None,
+        metadata: dict[str, str] | None = None,
+    ) -> StorageObject:
+        client = self._ensure_client()
+        key = self._key(mount, object_key)
+        kwargs: dict[str, Any] = {}
+        if mime_type:
+            kwargs["ContentType"] = mime_type
+        if metadata:
+            kwargs["Metadata"] = metadata
+        response = client.put_object(Bucket=self._bucket(), Key=key, Body=body, **kwargs)
+        etag = response.get("ETag", "") if isinstance(response, dict) else ""
+        size = len(body) if isinstance(body, bytes) else None
+        return StorageObject(
+            provider_type=self.provider_type,
+            mount_id=str(mount.id),
+            object_key=object_key,
+            storage_path=Path(key),
+            size=size,
+            etag=etag,
+            mime_type=mime_type,
+            metadata=metadata or {},
         )
 
-    def _build_stub_signature(self, method: str, bucket: str, key: str, upload_id: str | None = None, part_number: int | None = None) -> str:
-        payload = f"{method}:{bucket}:{key}:{upload_id or ''}:{part_number or ''}".encode("utf-8")
-        return base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).decode("ascii").rstrip("=")
+    def open_object(self, policy: StoragePolicy, mount: BucketMount, object_key: str) -> BinaryIO:
+        client = self._ensure_client()
+        key = self._key(mount, object_key)
+        response = client.get_object(Bucket=self._bucket(), Key=key)
+        return response["Body"]
 
-    def _build_object_url(self, policy, mount, object_key: str) -> str:
-        creds = self._creds(policy)
-        normalized_key = quote(normalize_object_key(object_key))
-        bucket = creds.bucket or mount.mount_slug
-        region = creds.region or "ap-guangzhou"
-        endpoint = creds.endpoint or f"{bucket}.cos.{region}.myqcloud.com"
-        return f"https://{endpoint}/{normalized_key}"
-
-    def put_object(self, policy, mount, object_key: str, body, *, mime_type: str | None = None, metadata: dict[str, str] | None = None) -> StorageObject:  # type: ignore[override]
-        raise NotImplementedError("Tencent COS direct write will be wired through presigned upload URLs.")
-
-    def open_object(self, policy, mount, object_key: str):  # type: ignore[override]
-        raise NotImplementedError("Tencent COS download stream will be handled by a signed URL or proxy later.")
-
-    def delete_object(self, policy, mount, object_key: str, *, hard_delete: bool = False) -> bool:  # type: ignore[override]
+    def delete_object(self, policy: StoragePolicy, mount: BucketMount, object_key: str, *, hard_delete: bool = False) -> bool:
+        client = self._ensure_client()
+        key = self._key(mount, object_key)
+        client.delete_object(Bucket=self._bucket(), Key=key)
         return True
 
-    def presign_put(self, policy, mount, object_key: str) -> PresignedURL:  # type: ignore[override]
-        url = self._build_object_url(policy, mount, object_key)
-        query = urlencode(
-            {
-                "signature": self._build_stub_signature("PUT", mount.mount_slug, object_key),
-                "expires_in": policy.presign_ttl_seconds,
-            }
+    def presign_put(self, policy: StoragePolicy, mount: BucketMount, object_key: str) -> PresignedURL:
+        client = self._ensure_client()
+        key = self._key(mount, object_key)
+        ttl = self.config.presign_ttl_seconds if self.config else 900
+        url = client.get_presigned_url(
+            Method="PUT",
+            Bucket=self._bucket(),
+            Key=key,
+            Expired=ttl,
         )
         return PresignedURL(
             method="PUT",
-            url=f"{url}?{query}",
-            headers={"X-Cloudrave-Provider": "tencent_cos"},
-            expires_at=utcnow() + timedelta(seconds=policy.presign_ttl_seconds),
+            url=url,
+            expires_at=utcnow() + timedelta(seconds=ttl),
         )
 
-    def create_multipart_upload(self, policy, mount, object_key: str, *, total_size: int | None = None, mime_type: str | None = None, metadata: dict[str, str] | None = None) -> MultipartUploadState:  # type: ignore[override]
-        upload_id = uuid4().hex
+    def create_multipart_upload(
+        self,
+        policy: StoragePolicy,
+        mount: BucketMount,
+        object_key: str,
+        *,
+        total_size: int | None = None,
+        mime_type: str | None = None,
+        metadata: dict[str, str] | None = None,
+    ) -> MultipartUploadState:
+        client = self._ensure_client()
+        key = self._key(mount, object_key)
+        kwargs: dict[str, Any] = {}
+        if mime_type:
+            kwargs["ContentType"] = mime_type
+        if metadata:
+            kwargs["Metadata"] = metadata
+        response = client.create_multipart_upload(Bucket=self._bucket(), Key=key, **kwargs)
+        upload_id = response.get("UploadId", "") if isinstance(response, dict) else ""
+        ttl = self.config.presign_ttl_seconds if self.config else 900
         return MultipartUploadState(
             upload_id=upload_id,
             provider_type=self.provider_type,
-            mount_id=mount.id,
-            object_key=normalize_object_key(object_key),
-            upload_root=self.prepare_mount_root(mount),
-            upload_dir=self.prepare_mount_root(mount) / ".multipart" / upload_id,
+            mount_id=str(mount.id),
+            object_key=object_key,
+            upload_root=Path(mount.root_path.strip("/")),
+            upload_dir=Path(mount.root_path.strip("/")) / ".multipart" / upload_id,
             part_size_bytes=policy.part_size_mb * 1024 * 1024,
             total_size=total_size,
-            metadata=dict(metadata or {}),
-            expires_at=utcnow() + timedelta(seconds=policy.presign_ttl_seconds),
+            expires_at=utcnow() + timedelta(seconds=ttl),
             provider_upload_id=upload_id,
         )
 
-    def presign_part(self, policy, mount, upload: MultipartUploadState, part_number: int) -> PresignedURL:  # type: ignore[override]
-        url = self._build_object_url(policy, mount, upload.object_key)
-        query = urlencode(
-            {
-                "uploadId": upload.provider_upload_id or upload.upload_id,
-                "partNumber": part_number,
-                "signature": self._build_stub_signature("PUT", mount.mount_slug, upload.object_key, upload.upload_id, part_number),
-            }
+    def presign_part(
+        self,
+        policy: StoragePolicy,
+        mount: BucketMount,
+        upload: MultipartUploadState,
+        part_number: int,
+    ) -> PresignedURL:
+        client = self._ensure_client()
+        key = self._key(mount, upload.object_key)
+        ttl = self.config.presign_ttl_seconds if self.config else 900
+        params = {
+            "partNumber": str(part_number),
+            "uploadId": upload.upload_id,
+        }
+        url = client.get_presigned_url(
+            Method="PUT",
+            Bucket=self._bucket(),
+            Key=key,
+            Expired=ttl,
+            Params=params,
         )
         return PresignedURL(
             method="PUT",
-            url=f"{url}?{query}",
-            headers={"X-Cloudrave-Provider": "tencent_cos"},
-            expires_at=upload.expires_at,
-            upload_id=upload.upload_id,
+            url=url,
+            expires_at=utcnow() + timedelta(seconds=ttl),
             part_number=part_number,
+            upload_id=upload.upload_id,
         )
 
-    def upload_part(self, policy, mount, upload: MultipartUploadState, part_number: int, body) -> MultipartPart:  # type: ignore[override]
-        raise NotImplementedError("Tencent COS parts should be uploaded directly with presigned URLs.")
+    def upload_part(
+        self,
+        policy: StoragePolicy,
+        mount: BucketMount,
+        upload: MultipartUploadState,
+        part_number: int,
+        body: bytes | BinaryIO,
+    ) -> MultipartPart:
+        client = self._ensure_client()
+        key = self._key(mount, upload.object_key)
+        response = client.upload_part(
+            Bucket=self._bucket(),
+            Key=key,
+            PartNumber=part_number,
+            UploadId=upload.upload_id,
+            Body=body,
+            ContentLength=len(body) if isinstance(body, bytes) else None,
+        )
+        etag = response.get("ETag", "") if isinstance(response, dict) else ""
+        return MultipartPart(
+            part_number=part_number,
+            etag=etag,
+            size=len(body) if isinstance(body, bytes) else None,
+        )
 
-    def list_parts(self, policy, mount, upload: MultipartUploadState) -> list[MultipartPart]:  # type: ignore[override]
-        return []
+    def list_parts(
+        self,
+        policy: StoragePolicy,
+        mount: BucketMount,
+        upload: MultipartUploadState,
+    ) -> list[MultipartPart]:
+        client = self._ensure_client()
+        key = self._key(mount, upload.object_key)
+        response = client.list_parts(
+            Bucket=self._bucket(),
+            Key=key,
+            UploadId=upload.upload_id,
+        )
+        parts = response.get("Part", []) if isinstance(response, dict) else []
+        if isinstance(parts, dict):
+            parts = [parts]
+        return [
+            MultipartPart(
+                part_number=int(part.get("PartNumber", 0)),
+                etag=part.get("ETag", ""),
+                size=int(part.get("Size", 0)) if "Size" in part else None,
+            )
+            for part in parts
+        ]
 
-    def complete_multipart_upload(self, policy, mount, upload: MultipartUploadState, parts: list[MultipartPart], *, mime_type: str | None = None, metadata: dict[str, str] | None = None) -> StorageObject:  # type: ignore[override]
+    def complete_multipart_upload(
+        self,
+        policy: StoragePolicy,
+        mount: BucketMount,
+        upload: MultipartUploadState,
+        parts: list[MultipartPart],
+        *,
+        mime_type: str | None = None,
+        metadata: dict[str, str] | None = None,
+    ) -> StorageObject:
+        client = self._ensure_client()
+        key = self._key(mount, upload.object_key)
+        multipart_upload = {
+            "Part": [
+                {"PartNumber": part.part_number, "ETag": part.etag}
+                for part in sorted(parts, key=lambda p: p.part_number)
+            ]
+        }
+        response = client.complete_multipart_upload(
+            Bucket=self._bucket(),
+            Key=key,
+            UploadId=upload.upload_id,
+            MultipartUpload=multipart_upload,
+        )
+        etag = response.get("ETag", "") if isinstance(response, dict) else ""
         return StorageObject(
             provider_type=self.provider_type,
-            mount_id=mount.id,
+            mount_id=str(mount.id),
             object_key=upload.object_key,
-            storage_path=Path.cwd() / "upload" / "cos" / mount.mount_slug / normalize_object_key(upload.object_key),
-            size=upload.total_size,
-            etag=self._build_stub_signature("POST", mount.mount_slug, upload.object_key, upload.upload_id),
+            storage_path=Path(key),
+            etag=etag,
             mime_type=mime_type,
-            metadata=dict(metadata or {}),
+            metadata=metadata or {},
         )
 
-    def abort_multipart_upload(self, policy, mount, upload: MultipartUploadState) -> bool:  # type: ignore[override]
+    def abort_multipart_upload(self, policy: StoragePolicy, mount: BucketMount, upload: MultipartUploadState) -> bool:
+        client = self._ensure_client()
+        key = self._key(mount, upload.object_key)
+        client.abort_multipart_upload(
+            Bucket=self._bucket(),
+            Key=key,
+            UploadId=upload.upload_id,
+        )
         return True
 
-    def build_download_url(self, policy, mount, object_key: str, *, expires_in: int | None = None) -> PresignedURL:  # type: ignore[override]
-        url = self._build_object_url(policy, mount, object_key)
-        query = urlencode(
-            {
-                "signature": self._build_stub_signature("GET", mount.mount_slug, object_key),
-                "expires_in": expires_in or policy.presign_ttl_seconds,
-            }
+    def build_download_url(
+        self,
+        policy: StoragePolicy,
+        mount: BucketMount,
+        object_key: str,
+        *,
+        expires_in: int | None = None,
+    ) -> PresignedURL:
+        client = self._ensure_client()
+        key = self._key(mount, object_key)
+        ttl = expires_in or (self.config.presign_ttl_seconds if self.config else 900)
+        url = client.get_presigned_url(
+            Method="GET",
+            Bucket=self._bucket(),
+            Key=key,
+            Expired=ttl,
         )
         return PresignedURL(
             method="GET",
-            url=f"{url}?{query}",
-            headers={},
-            expires_at=utcnow() + timedelta(seconds=expires_in or policy.presign_ttl_seconds),
+            url=url,
+            expires_at=utcnow() + timedelta(seconds=ttl),
         )
 
-    def configure_cors(self, policy, mount) -> dict[str, object]:  # type: ignore[override]
-        return {
-            "provider_type": self.provider_type,
-            "mount_id": mount.id,
-            "status": "stub",
-            "message": "Tencent COS CORS signing skeleton is ready; wire SDK/API later.",
-        }
+    def configure_cors(self, policy: StoragePolicy, mount: BucketMount) -> dict[str, Any]:
+        return {}
