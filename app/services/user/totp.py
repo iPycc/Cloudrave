@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import secrets
 from urllib.parse import urlsplit
 
+from cryptography.fernet import Fernet, InvalidToken
 import pyotp
 from fastapi import HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,6 +20,10 @@ from app.repositories.users import UserRepository
 from app.security.jwt import TokenService
 from app.security.password import PasswordService
 from config import CloudraveConfig
+
+
+def _derive_fernet_key(secret: str) -> bytes:
+    return base64.urlsafe_b64encode(hashlib.sha256(secret.encode("utf-8")).digest())
 
 
 class TOTPService:
@@ -44,6 +50,20 @@ class TOTPService:
         self.password_service = password_service
         self.token_service = token_service
         self.config = config
+        self._totp_fernet = Fernet(_derive_fernet_key(config.auth.totp_secret_key))
+
+    def _encrypt_secret(self, secret: str | None) -> str | None:
+        if secret is None:
+            return None
+        return self._totp_fernet.encrypt(secret.encode("utf-8")).decode("utf-8")
+
+    def _decrypt_secret(self, secret: str | None) -> str | None:
+        if secret is None:
+            return None
+        try:
+            return self._totp_fernet.decrypt(secret.encode("utf-8")).decode("utf-8")
+        except InvalidToken:
+            return secret
 
     def generate_secret(self) -> str:
         return pyotp.random_base32()
@@ -54,7 +74,10 @@ class TOTPService:
     def verify_code(self, secret: str, code: str) -> bool:
         if not secret or not code:
             return False
-        return pyotp.totp.TOTP(secret).verify(code, valid_window=1)
+        plaintext_secret = self._decrypt_secret(secret)
+        if not plaintext_secret:
+            return False
+        return pyotp.totp.TOTP(plaintext_secret).verify(code, valid_window=1)
 
     def verify_backup_code(self, user: User, code: str) -> bool:
         codes = user.totp_backup_codes or []
@@ -220,7 +243,7 @@ class TOTPService:
         raw_backup_codes, hashed_backup_codes = self.generate_backup_codes()
         await self.users.update_totp(
             user,
-            secret=secret,
+            secret=self._encrypt_secret(secret),
             enabled=True,
             backup_codes=hashed_backup_codes,
         )
@@ -299,7 +322,7 @@ class TOTPService:
         if user is None or not user.totp_enabled or not user.totp_secret:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="两步验证状态异常")
 
-        if not self.verify_code(user.totp_secret, code):
+        if not self.verify_code(self._decrypt_secret(user.totp_secret), code):
             await self.audits.create(
                 actor_id=user.id,
                 action="login",
@@ -314,4 +337,8 @@ class TOTPService:
         return user
 
     def _hash_backup_code(self, code: str) -> str:
-        return hashlib.sha256(code.encode("utf-8")).hexdigest()
+        return hmac.new(
+            self.config.auth.backup_codes_key.encode("utf-8"),
+            code.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
