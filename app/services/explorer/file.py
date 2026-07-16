@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import re
+import zipfile
+from collections import deque
+from typing import AsyncIterator
 
 from fastapi import HTTPException, Request, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,7 +23,14 @@ from app.repositories.nodes import NodeRepository
 from app.repositories.objects import ObjectRepository
 from app.repositories.policies import StoragePolicyRepository
 from app.schemas.mount import BucketMountRead
-from app.schemas.node import FolderCreateRequest, NodeDeleteRequest, NodeRead, NodeRenameRequest
+from app.schemas.node import (
+    FolderCreateRequest,
+    NodeCopyRequest,
+    NodeDeleteRequest,
+    NodeMoveRequest,
+    NodeRead,
+    NodeRenameRequest,
+)
 from app.storage.manager import StorageManager
 
 
@@ -187,6 +199,147 @@ class FileExplorerService:
             },
         )
         return {"nodes": [NodeRead.model_validate(node) for node in deleted]}
+
+    async def move_nodes(self, request: Request, actor: User, payload: NodeMoveRequest) -> list[NodeRead]:
+        nodes = [await self._require_node_access(actor, node_id) for node_id in payload.node_ids]
+        if not nodes:
+            return []
+        mount_id = nodes[0].mount_id
+        mount, _policy = await self._require_mount_access(actor, mount_id)
+
+        target_parent_id = payload.target_parent_id
+        if target_parent_id is not None:
+            target = await self.nodes.get_by_id(target_parent_id)
+            if target is None or target.mount_id != mount_id or target.type != NodeType.FOLDER:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target folder not found")
+
+        # Prevent moving a folder into its own subtree
+        moved_ids = {node.id for node in nodes}
+        if target_parent_id in moved_ids:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot move a folder into itself")
+        for node in nodes:
+            if node.type == NodeType.FOLDER:
+                descendants = await self.nodes.collect_descendant_ids([node.id])
+                if target_parent_id in descendants:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Cannot move a folder into its own subtree",
+                    )
+
+        moved = await self.nodes.move_nodes(nodes, target_parent_id)
+        await self.audits.create(
+            actor_id=actor.id,
+            action="node.move",
+            target=f"nodes:{','.join(str(node.id) for node in moved)}",
+            detail=f"parent:{target_parent_id}",
+            ip=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            request_id=getattr(request.state, "request_id", None),
+        )
+        return [NodeRead.model_validate(node) for node in moved]
+
+    async def copy_nodes(self, request: Request, actor: User, payload: NodeCopyRequest) -> list[NodeRead]:
+        nodes = [await self._require_node_access(actor, node_id) for node_id in payload.node_ids]
+        if not nodes:
+            return []
+        mount_id = nodes[0].mount_id
+        mount, _policy = await self._require_mount_access(actor, mount_id)
+
+        target_parent_id = payload.target_parent_id
+        if target_parent_id is not None:
+            target = await self.nodes.get_by_id(target_parent_id)
+            if target is None or target.mount_id != mount_id or target.type != NodeType.FOLDER:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target folder not found")
+
+        copied: list[NodeRead] = []
+        id_map: dict[int, int] = {}
+        source_object_ids = [node.id for node in nodes if node.type == NodeType.FILE and node.blob_path]
+        source_objects = {obj.node_id: obj for obj in await self.objects.get_by_node_ids(source_object_ids)}
+
+        for node in nodes:
+            new_node = await self.nodes.copy_subtree(node, target_parent_id, owner_id=actor.id, id_map=id_map)
+            copied.append(NodeRead.model_validate(new_node))
+            if node.type == NodeType.FILE and node.id in source_objects:
+                source_obj = source_objects[node.id]
+                await self.objects.create_or_update(
+                    node_id=new_node.id,
+                    policy_id=source_obj.policy_id,
+                    blob_path=source_obj.blob_path,
+                    checksum=source_obj.checksum,
+                    content_type=source_obj.content_type,
+                    extra=source_obj.extra,
+                )
+
+        await self.audits.create(
+            actor_id=actor.id,
+            action="node.copy",
+            target=f"nodes:{','.join(str(node.id) for node in copied)}",
+            detail=f"parent:{target_parent_id}",
+            ip=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            request_id=getattr(request.state, "request_id", None),
+        )
+        return copied
+
+    async def download_folder(self, request: Request, actor: User, node_id: int) -> StreamingResponse:
+        node = await self._require_node_access(actor, node_id)
+        if node.type != NodeType.FOLDER:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Node is not a folder")
+        mount, policy = await self._require_mount_access(actor, node.mount_id)
+
+        all_ids = await self.nodes.collect_descendant_ids([node_id])
+        descendants = await self.nodes.list_by_ids(all_ids)
+        file_nodes = [n for n in descendants if n.type == NodeType.FILE and n.blob_path]
+        if not file_nodes:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Folder is empty")
+
+        # Build relative archive paths
+        node_map = {n.id: n for n in descendants}
+        node_map[node.id] = node
+        entries: list[tuple[str, Node]] = []
+        for file_node in file_nodes:
+            parts: list[str] = []
+            current: Node | None = file_node
+            while current is not None and current.id != node.id:
+                parts.append(current.name)
+                current = node_map.get(current.parent_id) if current.parent_id is not None else None
+            rel_path = "/".join(reversed(parts))
+            entries.append((rel_path, file_node))
+
+        adapter = self.storage_manager.get_adapter(policy)
+        chunk_size = 64 * 1024
+
+        def _build_zip_in_thread() -> bytes:
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                for rel_path, file_node in entries:
+                    stream = adapter.open_object(policy, mount, file_node.blob_path)
+                    data = stream.read() if hasattr(stream, "read") else b"".join(stream)
+                    if isinstance(data, str):
+                        data = data.encode("utf-8")
+                    zf.writestr(rel_path, data)
+            return buffer.getvalue()
+
+        async def _stream() -> AsyncIterator[bytes]:
+            archive = await asyncio.to_thread(_build_zip_in_thread)
+            for offset in range(0, len(archive), chunk_size):
+                yield archive[offset : offset + chunk_size]
+
+        await self.audits.create(
+            actor_id=actor.id,
+            action="node.download_folder",
+            target=f"node:{node.id}",
+            detail=node.name,
+            ip=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            request_id=getattr(request.state, "request_id", None),
+        )
+        safe_name = node.name.replace('"', "")
+        return StreamingResponse(
+            _stream(),
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{safe_name}.zip"'},
+        )
 
     async def _require_mount_access(self, actor: User, mount_id: int) -> tuple[BucketMount, StoragePolicy]:
         mount = await self.mounts.get_by_id(mount_id)

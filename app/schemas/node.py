@@ -35,6 +35,16 @@ class NodeRenameRequest(CloudraveSchema):
     name: str = Field(min_length=1, max_length=255)
 
 
+class NodeMoveRequest(CloudraveSchema):
+    node_ids: list[int] = Field(min_length=1)
+    target_parent_id: int | None = None
+
+
+class NodeCopyRequest(CloudraveSchema):
+    node_ids: list[int] = Field(min_length=1)
+    target_parent_id: int | None = None
+
+
 class NodeDeleteRequest(CloudraveSchema):
     node_ids: list[int] = Field(min_length=1)
     hard_delete: bool = False

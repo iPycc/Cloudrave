@@ -12,6 +12,22 @@ from app.models.enums import NodeStatus, NodeType
 from app.models.tables import Node
 
 
+def _unique_name(name: str, existing: set[str]) -> str:
+    if name not in existing:
+        return name
+    base, dot, ext = name.rpartition(".")
+    if not dot:
+        base, ext = name, ""
+    else:
+        ext = dot + ext
+    counter = 2
+    while True:
+        candidate = f"{base} ({counter}){ext}"
+        if candidate not in existing:
+            return candidate
+        counter += 1
+
+
 class NodeRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
@@ -148,3 +164,55 @@ class NodeRepository:
             await self.session.delete(node)
         await self.session.flush()
         return all_ids
+
+    async def get_child_names(self, mount_id: int, parent_id: int | None) -> set[str]:
+        result = await self.session.scalars(
+            select(Node.name).where(
+                Node.mount_id == mount_id,
+                Node.parent_id == parent_id,
+                Node.deleted_at.is_(None),
+            )
+        )
+        return set(result.all())
+
+    async def move_nodes(self, nodes: list[Node], target_parent_id: int | None) -> list[Node]:
+        if not nodes:
+            return []
+        mount_id = nodes[0].mount_id
+        existing = await self.get_child_names(mount_id, target_parent_id)
+        for node in nodes:
+            node.parent_id = target_parent_id
+            node.name = _unique_name(node.name, existing)
+            existing.add(node.name)
+        await self.session.flush()
+        return nodes
+
+    async def copy_subtree(
+        self,
+        source_node: Node,
+        target_parent_id: int | None,
+        *,
+        owner_id: int,
+        id_map: dict[int, int] | None = None,
+    ) -> Node:
+        existing = await self.get_child_names(source_node.mount_id, target_parent_id)
+        new_name = _unique_name(source_node.name, existing)
+        new_node = Node(
+            owner_id=owner_id,
+            mount_id=source_node.mount_id,
+            parent_id=target_parent_id,
+            type=source_node.type,
+            status=NodeStatus.ACTIVE,
+            name=new_name,
+            blob_path=source_node.blob_path,
+            size=source_node.size,
+        )
+        self.session.add(new_node)
+        await self.session.flush()
+        if id_map is not None:
+            id_map[source_node.id] = new_node.id
+        if source_node.type == NodeType.FOLDER:
+            children = await self.list_children(source_node.mount_id, source_node.id)
+            for child in children:
+                await self.copy_subtree(child, new_node.id, owner_id=owner_id, id_map=id_map)
+        return new_node

@@ -14,7 +14,15 @@ from app.models.enums import StoragePolicyType
 from app.models.tables import User
 from app.schemas.common import HealthResponse, MessageResponse
 from app.schemas.mount import BucketMountRead
-from app.schemas.node import DownloadLinkResponse, FolderCreateRequest, NodeDeleteRequest, NodeRead, NodeRenameRequest
+from app.schemas.node import (
+    DownloadLinkResponse,
+    FolderCreateRequest,
+    NodeCopyRequest,
+    NodeDeleteRequest,
+    NodeMoveRequest,
+    NodeRead,
+    NodeRenameRequest,
+)
 from app.schemas.upload import (
     UploadPartRead,
     UploadSessionAbortRequest,
@@ -152,6 +160,46 @@ async def delete_nodes(
         return await service.delete_nodes(request, current_user, payload)
 
 
+@router.post("/node/move", response_model=list[NodeRead])
+async def move_nodes(
+    request: Request,
+    payload: NodeMoveRequest = Body(...),
+    current_user: User = Depends(get_current_user),
+) -> list[NodeRead]:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = FileExplorerService(
+            session=session,
+            mounts=dep.get_mount_repository(session),
+            policies=dep.get_policy_repository(session),
+            nodes=dep.get_node_repository(session),
+            objects=dep.get_object_repository(session),
+            audits=dep.get_audit_repository(session),
+            storage_manager=dep.storage_manager,
+        )
+        return await service.move_nodes(request, current_user, payload)
+
+
+@router.post("/node/copy", response_model=list[NodeRead])
+async def copy_nodes(
+    request: Request,
+    payload: NodeCopyRequest = Body(...),
+    current_user: User = Depends(get_current_user),
+) -> list[NodeRead]:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = FileExplorerService(
+            session=session,
+            mounts=dep.get_mount_repository(session),
+            policies=dep.get_policy_repository(session),
+            nodes=dep.get_node_repository(session),
+            objects=dep.get_object_repository(session),
+            audits=dep.get_audit_repository(session),
+            storage_manager=dep.storage_manager,
+        )
+        return await service.copy_nodes(request, current_user, payload)
+
+
 @router.post("/upload", response_model=UploadSessionPlan)
 async def create_upload_session(
     request: Request,
@@ -275,20 +323,31 @@ async def download_file(
             mounts=dep.get_mount_repository(session),
             nodes=dep.get_node_repository(session),
             policies=dep.get_policy_repository(session),
+            objects=dep.get_object_repository(session),
+            storage_manager=dep.storage_manager,
         )
         node, mount, policy = await service.resolve(current_user, node_id)
-        adapter = dep.storage_manager.get_adapter(policy)
-        if policy.provider == StoragePolicyType.LOCAL_FS:
-            content_type = mimetypes.guess_type(node.name)[0] or "application/octet-stream"
-            return _stream_local_object(
-                adapter,
-                policy,
-                mount,
-                node.blob_path,
-                media_type=content_type,
-            )
-        signed = adapter.build_download_url(policy, mount, node.blob_path)
-        return RedirectResponse(signed.url)
+        return service.build_file_stream(node, mount, policy)
+
+
+@router.get("/download/folder/{node_id}")
+async def download_folder(
+    node_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = FileExplorerService(
+            session=session,
+            mounts=dep.get_mount_repository(session),
+            policies=dep.get_policy_repository(session),
+            nodes=dep.get_node_repository(session),
+            objects=dep.get_object_repository(session),
+            audits=dep.get_audit_repository(session),
+            storage_manager=dep.storage_manager,
+        )
+        return await service.download_folder(request, current_user, node_id)
 
 
 @router.get("/preview/{node_id}")
@@ -304,6 +363,8 @@ async def preview_file(
             mounts=dep.get_mount_repository(session),
             nodes=dep.get_node_repository(session),
             policies=dep.get_policy_repository(session),
+            objects=dep.get_object_repository(session),
+            storage_manager=dep.storage_manager,
         )
         node, mount, policy = await service.resolve(current_user, node_id)
         adapter = dep.storage_manager.get_adapter(policy)
