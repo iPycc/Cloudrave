@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.models.enums import NodeStatus, NodeType
 from app.models.tables import Node
@@ -107,15 +108,16 @@ class NodeRepository:
         return node
 
     async def collect_descendant_ids(self, node_ids: list[int]) -> list[int]:
-        all_ids = set(node_ids)
-        queue = list(node_ids)
-        while queue:
-            current_id = queue.pop(0)
-            result = await self.session.scalars(select(Node.id).where(Node.parent_id == current_id))
-            child_ids = [child_id for child_id in result if child_id not in all_ids]
-            all_ids.update(child_ids)
-            queue.extend(child_ids)
-        return list(all_ids)
+        if not node_ids:
+            return []
+
+        node_alias = aliased(Node)
+        tree = select(Node.id).where(Node.id.in_(node_ids)).cte(recursive=True)
+        tree_alias = aliased(tree)
+        recursive_query = select(node_alias.id).where(node_alias.parent_id == tree_alias.c.id)
+        statement = select(tree.union_all(recursive_query).c.id)
+        result = await self.session.scalars(statement)
+        return list(result.all())
 
     async def soft_delete(self, node_ids: list[int]) -> list[Node]:
         all_ids = await self.collect_descendant_ids(node_ids)

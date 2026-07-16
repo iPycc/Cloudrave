@@ -20,6 +20,12 @@ class StoragePolicyRepository:
     async def get_by_id(self, policy_id: int) -> StoragePolicy | None:
         return await self.session.get(StoragePolicy, policy_id)
 
+    async def list_by_ids(self, policy_ids: list[int]) -> list[StoragePolicy]:
+        if not policy_ids:
+            return []
+        result = await self.session.scalars(select(StoragePolicy).where(StoragePolicy.id.in_(policy_ids)))
+        return list(result)
+
     async def get_by_name(self, name: str) -> StoragePolicy | None:
         statement = select(StoragePolicy).where(StoragePolicy.name == name)
         return await self.session.scalar(statement)

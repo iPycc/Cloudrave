@@ -26,6 +26,12 @@ class BucketMountRepository:
     async def get_by_id(self, mount_id: int) -> BucketMount | None:
         return await self.session.get(BucketMount, mount_id)
 
+    async def list_by_ids(self, mount_ids: list[int]) -> list[BucketMount]:
+        if not mount_ids:
+            return []
+        result = await self.session.scalars(select(BucketMount).where(BucketMount.id.in_(mount_ids)))
+        return list(result)
+
     async def get_by_owner_and_slug(self, owner_id: int, mount_slug: str) -> BucketMount | None:
         statement = select(BucketMount).where(
             BucketMount.owner_id == owner_id,

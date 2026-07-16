@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 
@@ -123,16 +124,27 @@ class FileExplorerService:
         if payload.hard_delete:
             all_ids = await self.nodes.collect_descendant_ids(payload.node_ids)
             descendants = await self.nodes.list_by_ids(all_ids)
-            for node in descendants:
-                if node.type != NodeType.FILE or not node.blob_path:
-                    continue
-                mount = await self.mounts.get_by_id(node.mount_id)
+
+            file_nodes = [node for node in descendants if node.type == NodeType.FILE and node.blob_path]
+            mount_ids = {node.mount_id for node in file_nodes}
+            mounts = {mount.id: mount for mount in await self.mounts.list_by_ids(list(mount_ids))}
+            policy_ids = {mount.policy_id for mount in mounts.values()}
+            policies = {policy.id: policy for policy in await self.policies.list_by_ids(list(policy_ids))}
+
+            async def _delete_one(node: Node) -> None:
+                mount = mounts.get(node.mount_id)
                 if mount is None:
-                    continue
-                policy = await self.policies.get_by_id(mount.policy_id)
+                    return
+                policy = policies.get(mount.policy_id)
                 if policy is None:
-                    continue
-                self.storage_manager.get_adapter(policy).delete_object(policy, mount, node.blob_path, hard_delete=True)
+                    return
+                adapter = self.storage_manager.get_adapter(policy)
+                # Local filesystem IO can block the event loop; run it in a thread.
+                await asyncio.to_thread(adapter.delete_object, policy, mount, node.blob_path, hard_delete=True)
+
+            if file_nodes:
+                await asyncio.gather(*(_delete_one(node) for node in file_nodes))
+
             await self.objects.delete_by_node_ids(all_ids)
             await self.nodes.hard_delete(payload.node_ids)
             await self.audits.create(
