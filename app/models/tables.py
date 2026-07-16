@@ -193,7 +193,7 @@ class ObjectRecord(Base, TimestampMixin):
     node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id", ondelete="CASCADE"), unique=True)
     policy_id: Mapped[int] = mapped_column(ForeignKey("storage_policies.id", ondelete="CASCADE"))
     blob_path: Mapped[str] = mapped_column(String(1024))
-    checksum: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    checksum: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     content_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
     extra: Mapped[dict] = mapped_column(JSON, default=dict)
 

@@ -16,6 +16,16 @@ class ObjectRepository:
         statement = select(ObjectRecord).where(ObjectRecord.node_id == node_id)
         return await self.session.scalar(statement)
 
+    async def get_by_node_ids(self, node_ids: list[int]) -> list[ObjectRecord]:
+        if not node_ids:
+            return []
+        result = await self.session.scalars(select(ObjectRecord).where(ObjectRecord.node_id.in_(node_ids)))
+        return list(result)
+
+    async def get_by_checksum(self, checksum: str) -> ObjectRecord | None:
+        statement = select(ObjectRecord).where(ObjectRecord.checksum == checksum)
+        return await self.session.scalar(statement)
+
     async def create_or_update(
         self,
         *,

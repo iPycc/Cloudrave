@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from math import ceil
 from pathlib import Path
 
@@ -72,10 +73,62 @@ class CreateUploadSessionService:
 
     async def create(self, request: Request, actor: User, payload: UploadSessionCreate) -> UploadSessionPlan:
         mount, policy = await self._require_mount_access(actor, payload.mount_id)
-        parent = await self._resolve_parent_folder(mount, payload.parent_id)
+        parent, file_name = await self._resolve_target_folder_and_name(mount, payload.parent_id, payload.file_name, payload.relative_path)
+
+        if payload.checksum:
+            existing_object = await self.objects.get_by_checksum(payload.checksum)
+            if existing_object is not None:
+                file_node = await self.nodes.create_file(
+                    owner_id=mount.owner_id,
+                    mount_id=mount.id,
+                    parent_id=parent.id,
+                    name=file_name,
+                    blob_path=existing_object.blob_path,
+                    size=payload.size,
+                )
+                await self.objects.create_or_update(
+                    node_id=file_node.id,
+                    policy_id=existing_object.policy_id,
+                    blob_path=existing_object.blob_path,
+                    checksum=payload.checksum,
+                    content_type=payload.content_type,
+                )
+                session_record = await self.uploads.create_session(
+                    owner_id=mount.owner_id,
+                    mount_id=mount.id,
+                    node_id=parent.id if parent else None,
+                    path=existing_object.blob_path,
+                    mode=UploadMode.SINGLE,
+                    upload_id=None,
+                    file_name=file_name,
+                    content_type=payload.content_type,
+                    size=payload.size,
+                    part_size=payload.size or 1,
+                    state=UploadState.COMPLETED,
+                )
+                await self.uploads.bind_node(session_record.id, file_node.id)
+                await self.audits.create(
+                    actor_id=actor.id,
+                    action="upload.dedup",
+                    target=f"upload:{session_record.id}",
+                    detail=existing_object.blob_path,
+                    ip=request.client.host if request.client else None,
+                    user_agent=request.headers.get("user-agent"),
+                    request_id=getattr(request.state, "request_id", None),
+                )
+                return UploadSessionPlan(
+                    session_id=session_record.id,
+                    upload_mode=UploadMode.SINGLE,
+                    object_key=existing_object.blob_path,
+                    part_size=payload.size or 1,
+                    upload_urls=[],
+                    is_duplicate=True,
+                    node_id=file_node.id,
+                )
+
         object_key = payload.object_key or self.storage_manager.build_object_key(
             mount,
-            payload.file_name,
+            file_name,
             await self._build_parent_relative_path(mount, parent),
         )
         part_size = payload.part_size or policy.part_size_mb * 1024 * 1024
@@ -94,7 +147,7 @@ class CreateUploadSessionService:
                 path=object_key,
                 mode=upload_mode,
                 upload_id=None,
-                file_name=payload.file_name,
+                file_name=file_name,
                 content_type=payload.content_type,
                 size=payload.size,
                 part_size=part_size,
@@ -139,7 +192,7 @@ class CreateUploadSessionService:
             path=object_key,
             mode=UploadMode.MULTIPART,
             upload_id=upload_state.upload_id,
-            file_name=payload.file_name,
+            file_name=file_name,
             content_type=payload.content_type,
             size=payload.size,
             part_size=part_size,
@@ -303,10 +356,18 @@ class CreateUploadSessionService:
                 except IntegrityError as exc:
                     raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A file with the same name already exists") from exc
 
+                checksum = None
+                if policy.provider == StoragePolicyType.LOCAL_FS:
+                    adapter = self.storage_manager.get_adapter(policy)
+                    mount_root = adapter.prepare_mount_root(mount)
+                    full_path = Path(mount_root) / record.path
+                    checksum = await asyncio.to_thread(self._compute_sha256, full_path)
+
                 await self.objects.create_or_update(
                     node_id=file_node.id,
                     policy_id=policy.id,
                     blob_path=record.path,
+                    checksum=checksum,
                     content_type=record.content_type,
                 )
                 await self.uploads.bind_node(record.id, file_node.id)
@@ -366,6 +427,33 @@ class CreateUploadSessionService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Storage policy not found")
         return mount, policy
 
+    async def _resolve_target_folder_and_name(
+        self,
+        mount: BucketMount,
+        parent_id: int | None,
+        file_name: str,
+        relative_path: str | None,
+    ) -> tuple:
+        parent = await self._resolve_parent_folder(mount, parent_id)
+        if not relative_path:
+            return parent, file_name
+
+        segments = relative_path.split("/")
+        if len(segments) > 1:
+            for folder_name in segments[:-1]:
+                existing = await self.nodes.list_children(mount.id, parent.id, include_deleted=False)
+                existing_names = {n.name: n for n in existing if n.type == NodeType.FOLDER}
+                if folder_name in existing_names:
+                    parent = existing_names[folder_name]
+                else:
+                    parent = await self.nodes.create_folder(
+                        owner_id=mount.owner_id,
+                        mount_id=mount.id,
+                        parent_id=parent.id,
+                        name=folder_name,
+                    )
+        return parent, segments[-1]
+
     async def _resolve_parent_folder(self, mount: BucketMount, parent_id: int | None):
         if parent_id is None:
             return await self.nodes.ensure_mount_root(owner_id=mount.owner_id, mount_id=mount.id, name=mount.name)
@@ -394,6 +482,13 @@ class CreateUploadSessionService:
         if record.owner_id != actor.id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Upload session access denied")
         return record
+
+    def _compute_sha256(self, file_path: Path) -> str:
+        hasher = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
 
     def _build_upload_state(self, record, policy, mount) -> MultipartUploadState:
         adapter = self.storage_manager.get_adapter(policy)

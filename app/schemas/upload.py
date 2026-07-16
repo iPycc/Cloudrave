@@ -15,6 +15,8 @@ class UploadSessionCreate(CloudraveSchema):
     mount_id: int
     parent_id: int | None = None
     file_name: str = Field(min_length=1, max_length=255)
+    relative_path: str | None = Field(default=None, max_length=2048)
+    checksum: str | None = Field(default=None, max_length=128)
     object_key: str | None = None
     mode: UploadMode = UploadMode.MULTIPART
     size: int = Field(ge=0)
@@ -27,6 +29,18 @@ class UploadSessionCreate(CloudraveSchema):
         if value is None:
             return None
         return normalize_object_key(value)
+
+    @field_validator("relative_path")
+    @classmethod
+    def normalize_relative_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.replace("\\", "/").strip("/")
+        # Reject path traversal attempts
+        for segment in normalized.split("/"):
+            if segment in {"..", "."}:
+                raise ValueError("Invalid relative path segment")
+        return normalized or None
 
 
 class UploadPartPlan(CloudraveSchema):
@@ -45,6 +59,8 @@ class UploadSessionPlan(CloudraveSchema):
     part_size: int
     upload_urls: list[UploadPartPlan] = Field(default_factory=list)
     expires_at: datetime | None = None
+    is_duplicate: bool = False
+    node_id: int | None = None
 
 
 class UploadPartComplete(CloudraveSchema):

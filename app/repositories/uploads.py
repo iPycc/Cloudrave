@@ -26,6 +26,7 @@ class UploadRepository:
         content_type: str | None,
         size: int,
         part_size: int,
+        state: UploadState = UploadState.CREATED,
     ) -> UploadSessionRecord:
         record = UploadSessionRecord(
             owner_id=owner_id,
@@ -33,7 +34,7 @@ class UploadRepository:
             node_id=node_id,
             path=path,
             mode=mode,
-            state=UploadState.CREATED,
+            state=state,
             upload_id=upload_id,
             file_name=file_name,
             content_type=content_type,
