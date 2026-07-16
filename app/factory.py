@@ -10,7 +10,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.v1 import router as v1_router
 from app.dep import Dep
 from app.middleware.logging import LoggingMiddleware
+from app.middleware.rate_limit import RateLimitMiddleware
 from app.middleware.request_id import RequestIdMiddleware
+from app.middleware.security_headers import SecurityHeadersMiddleware
 from config import CloudraveConfig
 from logging_config import configure_logging
 
@@ -30,7 +32,8 @@ def create_app(config: CloudraveConfig) -> FastAPI:
     app = FastAPI(
         title=config.app.name,
         version="0.1.0",
-        docs_url="/api/docs",
+        docs_url=None if config.app.env == "production" else "/api/docs",
+        redoc_url=None if config.app.env == "production" else "/api/redoc",
         lifespan=lifespan,
     )
 
@@ -41,11 +44,19 @@ def create_app(config: CloudraveConfig) -> FastAPI:
         CORSMiddleware,
         allow_origins=list(config.app.cors_origins),
         allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=[
+            "Authorization",
+            "Content-Type",
+            "X-Request-ID",
+            "X-Cloudrave-Local-Write",
+            "X-Cloudrave-Local-Part",
+        ],
     )
+    app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(LoggingMiddleware)
     app.add_middleware(RequestIdMiddleware, header_name=config.app.request_id_header)
+    app.add_middleware(RateLimitMiddleware)
 
     app.include_router(v1_router, prefix="/api/v1")
     return app

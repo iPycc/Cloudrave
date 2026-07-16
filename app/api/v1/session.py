@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Body, HTTPException, Request, Response, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response, status
 
+from app.middleware.rate_limit import login_rate_limit
 from app.schemas.auth import (
     LoginRequest,
     LoginResponse,
@@ -31,7 +32,12 @@ router = APIRouter(prefix="/session", tags=["session"])
 
 
 @router.post("/token", response_model=LoginResponse)
-async def login(request: Request, payload: LoginRequest, response: Response) -> LoginResponse:
+async def login(
+    request: Request,
+    payload: LoginRequest,
+    response: Response,
+    _rate_limit: None = Depends(login_rate_limit),
+) -> LoginResponse:
     dep = request.app.state.dep
     async with dep.session_scope() as session:
         service = UserLoginService(
@@ -81,6 +87,7 @@ async def passkey_verify(
     request: Request,
     payload: PasskeyAuthenticationVerifyRequest,
     response: Response,
+    _rate_limit: None = Depends(login_rate_limit),
 ) -> LoginResponse:
     dep = request.app.state.dep
     async with dep.session_scope() as session:
@@ -109,6 +116,7 @@ async def verify_two_factor(
     request: Request,
     payload: TwoFactorVerifyRequest,
     response: Response,
+    _rate_limit: None = Depends(login_rate_limit),
 ) -> LoginResponse:
     dep = request.app.state.dep
     async with dep.session_scope() as session:

@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, File, Request, Response, UploadFile
 from fastapi.responses import FileResponse
 
 from app.middleware.auth_context import get_current_user
+from app.middleware.rate_limit import login_rate_limit
 from app.models.tables import User
 from app.schemas.passkey import (
     PasskeyListResponse,
@@ -46,7 +47,12 @@ router = APIRouter(prefix="/user", tags=["user"])
 
 
 @router.post("", response_model=LoginResponse)
-async def register_user(request: Request, payload: RegisterRequest, response: Response) -> LoginResponse:
+async def register_user(
+    request: Request,
+    payload: RegisterRequest,
+    response: Response,
+    _rate_limit: None = Depends(login_rate_limit),
+) -> LoginResponse:
     dep = request.app.state.dep
     async with dep.session_scope() as session:
         service = UserRegisterService(
