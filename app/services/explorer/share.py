@@ -119,7 +119,7 @@ class ShareService:
     def _hash_password(self, password: str) -> str:
         salt = secrets.token_hex(16)
         digest = hmac.new(self.share_signing_key, f"{salt}:{password}".encode(), hashlib.sha256).hexdigest()
-        return f"{salt}:${digest}"
+        return f"{salt}${digest}"
 
     def _verify_password(self, password: str, password_hash: str | None) -> bool:
         if password_hash is None:
