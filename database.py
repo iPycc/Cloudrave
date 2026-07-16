@@ -12,6 +12,7 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.pool import NullPool
 from sqlalchemy.schema import CreateIndex, CreateTable
 from sqlalchemy.dialects import mysql, postgresql, sqlite
 
@@ -24,7 +25,17 @@ class Base(DeclarativeBase):
 
 def make_async_engine(config: CloudraveConfig) -> AsyncEngine:
     _ensure_sqlite_parent_dir(config)
-    return create_async_engine(config.database.url, echo=config.database.echo, future=True)
+    engine_kwargs: dict = {"echo": config.database.echo, "future": True}
+    if config.database.backend == "sqlite":
+        engine_kwargs["poolclass"] = NullPool
+    else:
+        engine_kwargs.update(
+            pool_size=config.database.pool_size,
+            max_overflow=config.database.max_overflow,
+            pool_pre_ping=config.database.pool_pre_ping,
+            pool_recycle=config.database.pool_recycle,
+        )
+    return create_async_engine(config.database.url, **engine_kwargs)
 
 
 def make_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:

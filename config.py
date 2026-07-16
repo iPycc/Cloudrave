@@ -30,6 +30,10 @@ class DatabaseConfig:
     backend: str = "sqlite"
     url: str = "sqlite+aiosqlite:///cloudrave.db"
     echo: bool = False
+    pool_size: int = 10
+    max_overflow: int = 20
+    pool_pre_ping: bool = True
+    pool_recycle: int = 3600
     postgresql_host: str = "127.0.0.1"
     postgresql_port: int = 5432
     postgresql_user: str = "postgres"
@@ -50,6 +54,8 @@ class AuthConfig:
     jwt_secret: str = "change-me-cloudrave-jwt-secret-at-least-32-bytes"
     jwt_issuer: str = "cloudrave"
     password_salt: str = ""
+    totp_secret_key: str = ""
+    backup_codes_key: str = ""
 
 
 @dataclass(slots=True)
@@ -95,6 +101,10 @@ def default_config_parser() -> ConfigParser:
         "database": "sqlite",
         "url": "",
         "echo": "false",
+        "pool_size": "10",
+        "max_overflow": "20",
+        "pool_pre_ping": "true",
+        "pool_recycle": "3600",
         "postgresql_host": "127.0.0.1",
         "postgresql_port": "5432",
         "postgresql_user": "postgres",
@@ -113,6 +123,8 @@ def default_config_parser() -> ConfigParser:
         "jwt_secret": "",
         "jwt_issuer": "cloudrave",
         "password_salt": "",
+        "totp_secret_key": "",
+        "backup_codes_key": "",
     }
     _ensure_auth_secrets(parser)
     parser["logging"] = {
@@ -161,6 +173,10 @@ def load_config(root_dir: Path) -> CloudraveConfig:
         backend=_detect_database_backend(database_url, database_backend),
         url=database_url,
         echo=parser.getboolean("database", "echo", fallback=False),
+        pool_size=parser.getint("database", "pool_size", fallback=10),
+        max_overflow=parser.getint("database", "max_overflow", fallback=20),
+        pool_pre_ping=parser.getboolean("database", "pool_pre_ping", fallback=True),
+        pool_recycle=parser.getint("database", "pool_recycle", fallback=3600),
         postgresql_host=parser.get("database", "postgresql_host", fallback="127.0.0.1"),
         postgresql_port=parser.getint("database", "postgresql_port", fallback=5432),
         postgresql_user=parser.get("database", "postgresql_user", fallback="postgres"),
@@ -179,6 +195,8 @@ def load_config(root_dir: Path) -> CloudraveConfig:
         jwt_secret=parser.get("auth", "jwt_secret", fallback="change-me-cloudrave-jwt-secret-at-least-32-bytes"),
         jwt_issuer=parser.get("auth", "jwt_issuer", fallback="cloudrave"),
         password_salt=parser.get("auth", "password_salt", fallback=""),
+        totp_secret_key=parser.get("auth", "totp_secret_key", fallback=""),
+        backup_codes_key=parser.get("auth", "backup_codes_key", fallback=""),
     )
     logging = LoggingConfig(
         level=parser.get("logging", "level", fallback="INFO"),
@@ -258,6 +276,16 @@ def _ensure_auth_secrets(parser: ConfigParser) -> bool:
     password_salt = parser.get("auth", "password_salt", fallback="").strip()
     if not password_salt:
         parser["auth"]["password_salt"] = _generate_secret(32)
+        changed = True
+
+    totp_secret_key = parser.get("auth", "totp_secret_key", fallback="").strip()
+    if not totp_secret_key:
+        parser["auth"]["totp_secret_key"] = _generate_secret(32)
+        changed = True
+
+    backup_codes_key = parser.get("auth", "backup_codes_key", fallback="").strip()
+    if not backup_codes_key:
+        parser["auth"]["backup_codes_key"] = _generate_secret(32)
         changed = True
 
     return changed
