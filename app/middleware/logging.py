@@ -16,14 +16,38 @@ LOGGER = get_logger("cloudrave.http")
 class LoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         started = time.perf_counter()
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            reason = _single_line(f"{type(exc).__name__}: {exc}")
+            LOGGER.exception(
+                f'{request.method} {request.url.path} -> 500 {elapsed_ms:.2f}ms reason="{reason}"',
+                extra=_log_context(request),
+            )
+            raise
+
         elapsed_ms = (time.perf_counter() - started) * 1000
-        LOGGER.info(
-            f'{request.method} {request.url.path} -> {response.status_code} {elapsed_ms:.2f}ms',
-            extra={
-                "request_id": getattr(request.state, "request_id", "-"),
-                "ip": request.client.host if request.client else "-",
-                "actor": getattr(request.state, "actor", "-"),
-            },
-        )
+        reason = getattr(request.state, "failure_reason", None)
+        message = f'{request.method} {request.url.path} -> {response.status_code} {elapsed_ms:.2f}ms'
+        if reason:
+            message = f'{message} reason="{_single_line(reason)}"'
+
+        log_method = LOGGER.warning if response.status_code >= 400 else LOGGER.info
+        log_method(message, extra=_log_context(request))
         return response
+
+
+def _single_line(value: object, *, limit: int = 500) -> str:
+    text = " ".join(str(value).split())
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit - 3]}..."
+
+
+def _log_context(request: Request) -> dict[str, str]:
+    return {
+        "request_id": getattr(request.state, "request_id", "-"),
+        "ip": request.client.host if request.client else "-",
+        "actor": getattr(request.state, "actor", "-"),
+    }

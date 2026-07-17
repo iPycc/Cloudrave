@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import io
 import logging
 import re
@@ -16,7 +18,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.enums import NodeType
-from app.models.tables import BucketMount, StoragePolicy, User
+from app.models.tables import BucketMount, Node, StoragePolicy, User
 from app.repositories.audit_logs import AuditLogRepository
 from app.repositories.mounts import BucketMountRepository
 from app.repositories.nodes import NodeRepository
@@ -28,13 +30,32 @@ from app.schemas.node import (
     NodeCopyRequest,
     NodeDeleteRequest,
     NodeMoveRequest,
+    NodePageRead,
     NodeRead,
     NodeRenameRequest,
+    NodeSearchResult,
 )
 from app.storage.manager import StorageManager
 
 
 LOGGER = logging.getLogger("cloudrave.explorer")
+
+
+def _decode_page_cursor(cursor: str | None) -> int:
+    if not cursor:
+        return 0
+    try:
+        padding = "=" * (-len(cursor) % 4)
+        value = int(base64.urlsafe_b64decode(f"{cursor}{padding}").decode("ascii"))
+    except (ValueError, UnicodeDecodeError, binascii.Error) as error:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid page cursor") from error
+    if value < 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid page cursor")
+    return value
+
+
+def _encode_page_cursor(offset: int) -> str:
+    return base64.urlsafe_b64encode(str(offset).encode("ascii")).decode("ascii").rstrip("=")
 
 
 class FileExplorerService:
@@ -68,6 +89,96 @@ class FileExplorerService:
             parent_id = root.id
         nodes = await self.nodes.list_children(mount.id, parent_id, include_deleted=False)
         return [NodeRead.model_validate(node) for node in nodes]
+
+    async def list_children_page(
+        self,
+        actor: User,
+        mount_id: int,
+        parent_id: int | None,
+        *,
+        limit: int,
+        cursor: str | None,
+        sort: str,
+        folders_only: bool,
+    ) -> NodePageRead:
+        mount, _policy = await self._require_mount_access(actor, mount_id)
+        if parent_id is None:
+            root = await self.nodes.ensure_mount_root(owner_id=mount.owner_id, mount_id=mount.id, name=mount.name)
+            parent_id = root.id
+        offset = _decode_page_cursor(cursor)
+        nodes, has_more = await self.nodes.list_children_page(
+            mount.id,
+            parent_id,
+            limit=limit,
+            offset=offset,
+            sort=sort,
+            folders_only=folders_only,
+        )
+        return NodePageRead(
+            items=[NodeRead.model_validate(node) for node in nodes],
+            next_cursor=_encode_page_cursor(offset + limit) if has_more else None,
+        )
+
+    async def list_category_page(
+        self,
+        actor: User,
+        mount_id: int,
+        category: str,
+        *,
+        limit: int,
+        cursor: str | None,
+        sort: str,
+    ) -> NodePageRead:
+        mount, _policy = await self._require_mount_access(actor, mount_id)
+        offset = _decode_page_cursor(cursor)
+        nodes, has_more = await self.nodes.list_category_page(
+            mount.id,
+            category,
+            limit=limit,
+            offset=offset,
+            sort=sort,
+        )
+        return NodePageRead(
+            items=[NodeRead.model_validate(node) for node in nodes],
+            next_cursor=_encode_page_cursor(offset + limit) if has_more else None,
+        )
+
+    async def search_nodes(
+        self,
+        actor: User,
+        mount_id: int,
+        query: str,
+        *,
+        limit: int,
+    ) -> list[NodeSearchResult]:
+        mount, _policy = await self._require_mount_access(actor, mount_id)
+        nodes = await self.nodes.search(mount.id, query, limit=limit)
+        parent_cache: dict[int, Node] = {}
+        results: list[NodeSearchResult] = []
+
+        for node in nodes:
+            names: deque[str] = deque()
+            parent_id = node.parent_id
+            while parent_id is not None:
+                parent = parent_cache.get(parent_id)
+                if parent is None:
+                    parent = await self.nodes.get_by_id(parent_id)
+                    if parent is not None:
+                        parent_cache[parent_id] = parent
+                if parent is None or parent.parent_id is None:
+                    break
+                names.appendleft(parent.name)
+                parent_id = parent.parent_id
+
+            parent_path = f"/{'/'.join(names)}" if names else ""
+            results.append(
+                NodeSearchResult(
+                    node=NodeRead.model_validate(node),
+                    parent_path=parent_path,
+                )
+            )
+
+        return results
 
     async def create_folder(self, request: Request, actor: User, payload: FolderCreateRequest) -> NodeRead:
         mount, _policy = await self._require_mount_access(actor, payload.mount_id)

@@ -28,6 +28,9 @@ class ShareRead(CloudraveSchema):
     view_count: int
     is_active: bool
     created_at: datetime
+    node_name: str | None = None
+    node_type: str | None = None
+    node_size: int | None = None
 
 
 class ShareVerifyRequest(CloudraveSchema):

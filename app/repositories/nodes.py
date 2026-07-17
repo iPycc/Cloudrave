@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import Select, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -47,6 +47,91 @@ class NodeRepository:
             statement = statement.where(Node.deleted_at.is_(None))
         result = await self.session.scalars(statement.order_by(Node.type.desc(), Node.name.asc()))
         return list(result)
+
+    async def list_children_page(
+        self,
+        mount_id: int,
+        parent_id: int,
+        *,
+        limit: int,
+        offset: int,
+        sort: str,
+        folders_only: bool = False,
+    ) -> tuple[list[Node], bool]:
+        statement = select(Node).where(
+            Node.mount_id == mount_id,
+            Node.parent_id == parent_id,
+            Node.deleted_at.is_(None),
+        )
+        if folders_only:
+            statement = statement.where(Node.type == NodeType.FOLDER)
+        return await self._list_page(statement, limit=limit, offset=offset, sort=sort)
+
+    async def list_category_page(
+        self,
+        mount_id: int,
+        category: str,
+        *,
+        limit: int,
+        offset: int,
+        sort: str,
+    ) -> tuple[list[Node], bool]:
+        extensions = {
+            "image": ("png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif", "ico", "heic"),
+            "video": ("mp4", "mov", "mkv", "avi", "webm", "flv", "m4v", "wmv"),
+            "audio": ("mp3", "wav", "flac", "ogg", "m4a", "aac"),
+            "document": ("pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "csv", "txt"),
+        }[category]
+        lowered_name = func.lower(Node.name)
+        statement = select(Node).where(
+            Node.mount_id == mount_id,
+            Node.type == NodeType.FILE,
+            Node.deleted_at.is_(None),
+            or_(*(lowered_name.like(f"%.{extension}") for extension in extensions)),
+        )
+        return await self._list_page(statement, limit=limit, offset=offset, sort=sort)
+
+    async def search(self, mount_id: int, query: str, *, limit: int) -> list[Node]:
+        lowered_query = query.strip().lower()
+        result = await self.session.scalars(
+            select(Node)
+            .where(
+                Node.mount_id == mount_id,
+                Node.deleted_at.is_(None),
+                func.lower(Node.name).contains(lowered_query, autoescape=True),
+            )
+            .order_by(Node.type.desc(), Node.name.asc(), Node.id.asc())
+            .limit(limit)
+        )
+        return list(result)
+
+    async def _list_page(
+        self,
+        statement: Select,
+        *,
+        limit: int,
+        offset: int,
+        sort: str,
+    ) -> tuple[list[Node], bool]:
+        if sort == "updated-desc":
+            value_order = Node.updated_at.desc()
+        elif sort == "updated-asc":
+            value_order = Node.updated_at.asc()
+        elif sort == "name-desc":
+            value_order = Node.name.desc()
+        elif sort == "size-desc":
+            value_order = Node.size.desc()
+        else:
+            value_order = Node.name.asc()
+
+        result = await self.session.scalars(
+            statement
+            .order_by(Node.type.desc(), value_order, Node.id.asc())
+            .offset(offset)
+            .limit(limit + 1)
+        )
+        nodes = list(result)
+        return nodes[:limit], len(nodes) > limit
 
     async def list_deleted_for_owner(self, owner_id: int) -> list[Node]:
         result = await self.session.scalars(

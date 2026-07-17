@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import Field
 
@@ -23,6 +24,20 @@ class NodeRead(CloudraveSchema):
     deleted_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
+
+
+NodeCategory = Literal["image", "video", "audio", "document"]
+NodeSort = Literal["updated-desc", "updated-asc", "name-asc", "name-desc", "size-desc"]
+
+
+class NodePageRead(CloudraveSchema):
+    items: list[NodeRead]
+    next_cursor: str | None = None
+
+
+class NodeSearchResult(CloudraveSchema):
+    node: NodeRead
+    parent_path: str
 
 
 class FolderCreateRequest(CloudraveSchema):

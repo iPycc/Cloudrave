@@ -34,6 +34,16 @@ class ShareService:
         self.audits = audits
         self.share_signing_key = share_signing_key
 
+    @staticmethod
+    def _serialize_share(share: ShareRecord, node: Node | None) -> ShareRead:
+        return ShareRead.model_validate(share).model_copy(
+            update={
+                "node_name": node.name if node else None,
+                "node_type": node.type.value if node else None,
+                "node_size": node.size if node else None,
+            }
+        )
+
     async def create_share(self, request: Request, actor: User, payload: ShareCreateRequest) -> ShareRead:
         node = await self.nodes.get_by_id(payload.node_id)
         if node is None or node.owner_id != actor.id or node.deleted_at is not None:
@@ -64,11 +74,11 @@ class ShareService:
             user_agent=request.headers.get("user-agent"),
             request_id=getattr(request.state, "request_id", None),
         )
-        return ShareRead.model_validate(share)
+        return self._serialize_share(share, node)
 
     async def list_shares(self, actor: User) -> list[ShareRead]:
         shares = await self.shares.list_for_owner(actor.id)
-        return [ShareRead.model_validate(share) for share in shares]
+        return [self._serialize_share(share, share.node) for share in shares]
 
     async def revoke_share(self, request: Request, actor: User, share_id: str) -> None:
         share = await self.shares.get_by_id(share_id)

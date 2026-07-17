@@ -5,7 +5,7 @@ from __future__ import annotations
 import mimetypes
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Body, Depends, File, Form, Request, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, Query, Request, UploadFile
 from fastapi.responses import RedirectResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
@@ -20,8 +20,12 @@ from app.schemas.node import (
     NodeCopyRequest,
     NodeDeleteRequest,
     NodeMoveRequest,
+    NodeCategory,
+    NodePageRead,
     NodeRead,
     NodeRenameRequest,
+    NodeSearchResult,
+    NodeSort,
 )
 from app.schemas.upload import (
     UploadPartRead,
@@ -97,6 +101,92 @@ async def list_nodes(
             storage_manager=dep.storage_manager,
         )
         return await service.list_children(current_user, mount_id, parent_id)
+
+
+@router.get("/node/page", response_model=NodePageRead)
+async def list_node_page(
+    request: Request,
+    mount_id: int,
+    parent_id: int | None = None,
+    limit: int = Query(200, ge=1, le=2000),
+    cursor: str | None = None,
+    sort: NodeSort = "name-asc",
+    folders_only: bool = False,
+    current_user: User = Depends(get_current_user),
+) -> NodePageRead:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = FileExplorerService(
+            session=session,
+            mounts=dep.get_mount_repository(session),
+            policies=dep.get_policy_repository(session),
+            nodes=dep.get_node_repository(session),
+            objects=dep.get_object_repository(session),
+            audits=dep.get_audit_repository(session),
+            storage_manager=dep.storage_manager,
+        )
+        return await service.list_children_page(
+            current_user,
+            mount_id,
+            parent_id,
+            limit=limit,
+            cursor=cursor,
+            sort=sort,
+            folders_only=folders_only,
+        )
+
+
+@router.get("/node/category", response_model=NodePageRead)
+async def list_node_category(
+    request: Request,
+    mount_id: int,
+    category: NodeCategory,
+    limit: int = Query(200, ge=1, le=2000),
+    cursor: str | None = None,
+    sort: NodeSort = "name-asc",
+    current_user: User = Depends(get_current_user),
+) -> NodePageRead:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = FileExplorerService(
+            session=session,
+            mounts=dep.get_mount_repository(session),
+            policies=dep.get_policy_repository(session),
+            nodes=dep.get_node_repository(session),
+            objects=dep.get_object_repository(session),
+            audits=dep.get_audit_repository(session),
+            storage_manager=dep.storage_manager,
+        )
+        return await service.list_category_page(
+            current_user,
+            mount_id,
+            category,
+            limit=limit,
+            cursor=cursor,
+            sort=sort,
+        )
+
+
+@router.get("/node/search", response_model=list[NodeSearchResult])
+async def search_nodes(
+    request: Request,
+    mount_id: int,
+    q: str = Query(min_length=1, max_length=255),
+    limit: int = Query(20, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+) -> list[NodeSearchResult]:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = FileExplorerService(
+            session=session,
+            mounts=dep.get_mount_repository(session),
+            policies=dep.get_policy_repository(session),
+            nodes=dep.get_node_repository(session),
+            objects=dep.get_object_repository(session),
+            audits=dep.get_audit_repository(session),
+            storage_manager=dep.storage_manager,
+        )
+        return await service.search_nodes(current_user, mount_id, q, limit=limit)
 
 
 @router.post("/node/folder", response_model=NodeRead)

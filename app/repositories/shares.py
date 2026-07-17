@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.models.enums import ShareAccess
 from app.models.tables import ShareRecord
@@ -30,6 +31,7 @@ class ShareRepository:
         result = await self.session.scalars(
             select(ShareRecord)
             .where(ShareRecord.owner_id == owner_id)
+            .options(selectinload(ShareRecord.node))
             .order_by(ShareRecord.created_at.desc())
         )
         return list(result)

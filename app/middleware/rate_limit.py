@@ -29,6 +29,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             window.popleft()
 
         if len(window) >= self.requests_per_window:
+            request.state.failure_reason = "Rate limit exceeded"
             return JSONResponse(
                 {"detail": "Rate limit exceeded"},
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
