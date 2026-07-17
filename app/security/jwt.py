@@ -79,21 +79,36 @@ class TokenService:
         return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
     def issue_2fa_token(self, *, sub: str, purpose: str, ttl_seconds: int) -> str:
+        return self.issue_scoped_token(sub=sub, purpose=purpose, ttl_seconds=ttl_seconds)
+
+    def issue_scoped_token(
+        self,
+        *,
+        sub: str,
+        purpose: str,
+        ttl_seconds: int,
+        claims: dict[str, object] | None = None,
+    ) -> str:
         now = datetime.now(UTC)
         expires_at = now + timedelta(seconds=ttl_seconds)
+        payload: dict[str, object] = {
+            "sub": sub,
+            "purpose": purpose,
+            "iss": self.config.jwt_issuer,
+            "iat": int(now.timestamp()),
+            "exp": int(expires_at.timestamp()),
+        }
+        payload.update(claims or {})
         return jwt.encode(
-            {
-                "sub": sub,
-                "purpose": purpose,
-                "iss": self.config.jwt_issuer,
-                "iat": int(now.timestamp()),
-                "exp": int(expires_at.timestamp()),
-            },
+            payload,
             self.config.jwt_secret,
             algorithm="HS256",
         )
 
     def parse_2fa_token(self, token: str, purpose: str) -> dict:
+        return self.parse_scoped_token(token, purpose)
+
+    def parse_scoped_token(self, token: str, purpose: str) -> dict:
         try:
             payload = jwt.decode(
                 token,
@@ -102,7 +117,7 @@ class TokenService:
                 issuer=self.config.jwt_issuer,
             )
         except jwt.PyJWTError as exc:
-            raise AuthError("Invalid 2FA token") from exc
+            raise AuthError("Invalid scoped token") from exc
         if payload.get("purpose") != purpose:
-            raise AuthError("Invalid 2FA token purpose")
+            raise AuthError("Invalid scoped token purpose")
         return payload

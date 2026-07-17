@@ -38,7 +38,7 @@ class DownloadFileService:
 
     async def resolve(self, actor: User, node_id: int) -> tuple["Node", "BucketMount", "StoragePolicy"]:
         node = await self.nodes.get_by_id(node_id)
-        if node is None or node.type != NodeType.FILE or not node.blob_path:
+        if node is None or node.deleted_at is not None or node.type != NodeType.FILE or not node.blob_path:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File node not found")
         if node.owner_id != actor.id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="File access denied")
@@ -46,7 +46,7 @@ class DownloadFileService:
 
     async def resolve_shared(self, node_id: int) -> tuple["Node", "BucketMount", "StoragePolicy"]:
         node = await self.nodes.get_by_id(node_id)
-        if node is None or node.type != NodeType.FILE or not node.blob_path:
+        if node is None or node.deleted_at is not None or node.type != NodeType.FILE or not node.blob_path:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File node not found")
         return await self._resolve_mount_policy(node)
 

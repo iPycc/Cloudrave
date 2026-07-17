@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.enums import ShareAccess
-from app.models.tables import ShareRecord
+from app.models.tables import ShareItem, ShareRecord
 
 _SHARE_ID_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
 _SHARE_ID_LENGTH = 6
@@ -31,7 +31,7 @@ class ShareRepository:
         result = await self.session.scalars(
             select(ShareRecord)
             .where(ShareRecord.owner_id == owner_id)
-            .options(selectinload(ShareRecord.node))
+            .options(selectinload(ShareRecord.node), selectinload(ShareRecord.items))
             .order_by(ShareRecord.created_at.desc())
         )
         return list(result)
@@ -40,7 +40,7 @@ class ShareRepository:
         self,
         *,
         owner_id: int,
-        node_id: int,
+        node_ids: list[int],
         access: ShareAccess,
         password_hash: str | None,
         expires_at: datetime | None,
@@ -57,7 +57,7 @@ class ShareRepository:
         share = ShareRecord(
             id=share_id,
             owner_id=owner_id,
-            node_id=node_id,
+            node_id=node_ids[0],
             access=access,
             password_hash=password_hash,
             expires_at=expires_at,
@@ -68,7 +68,21 @@ class ShareRepository:
         )
         self.session.add(share)
         await self.session.flush()
+        self.session.add_all(
+            ShareItem(share_id=share.id, node_id=node_id, position=position)
+            for position, node_id in enumerate(node_ids)
+        )
+        await self.session.flush()
         return share
+
+    async def list_root_node_ids(self, share: ShareRecord) -> list[int]:
+        result = await self.session.scalars(
+            select(ShareItem.node_id)
+            .where(ShareItem.share_id == share.id)
+            .order_by(ShareItem.position.asc(), ShareItem.id.asc())
+        )
+        node_ids = list(result)
+        return node_ids or [share.node_id]
 
     async def increment_view(self, share: ShareRecord) -> None:
         share.view_count += 1

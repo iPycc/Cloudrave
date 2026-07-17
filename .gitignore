@@ -52,4 +52,4 @@ config.ini
 # Logs
 *.log
 
-tests
+tests/

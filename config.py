@@ -21,6 +21,10 @@ class AppConfig:
     port: int = 1309
     cors_origins: tuple[str, ...] = ("http://localhost:9130", "http://127.0.0.1:9130")
     local_upload_root: str = "upload"
+    preview_cache_root: str = "data/preview-cache"
+    public_base_url: str = ""
+    office_source_ttl_seconds: int = 900
+    text_preview_max_bytes: int = 5 * 1024 * 1024
     request_id_header: str = "X-Request-ID"
     default_timezone: str = "Asia/Shanghai"
 
@@ -88,6 +92,10 @@ class CloudraveConfig:
     def local_upload_root_path(self) -> Path:
         return (self.root_dir / self.app.local_upload_root).resolve()
 
+    @property
+    def preview_cache_root_path(self) -> Path:
+        return (self.root_dir / self.app.preview_cache_root).resolve()
+
 
 def default_config_parser() -> ConfigParser:
     parser = ConfigParser()
@@ -98,6 +106,10 @@ def default_config_parser() -> ConfigParser:
         "port": "1309",
         "cors_origins": "http://localhost:9130,http://127.0.0.1:9130",
         "local_upload_root": "upload",
+        "preview_cache_root": "data/preview-cache",
+        "public_base_url": "",
+        "office_source_ttl_seconds": "900",
+        "text_preview_max_bytes": str(5 * 1024 * 1024),
         "request_id_header": "X-Request-ID",
         "default_timezone": "Asia/Shanghai",
     }
@@ -172,6 +184,10 @@ def load_config(root_dir: Path) -> CloudraveConfig:
             parser.get("app", "cors_origins", fallback="http://localhost:9130,http://127.0.0.1:9130")
         ),
         local_upload_root=parser.get("app", "local_upload_root", fallback="upload"),
+        preview_cache_root=parser.get("app", "preview_cache_root", fallback="data/preview-cache"),
+        public_base_url=(getenv("CLOUDRAVE_PUBLIC_BASE_URL") or parser.get("app", "public_base_url", fallback="")).strip().rstrip("/"),
+        office_source_ttl_seconds=parser.getint("app", "office_source_ttl_seconds", fallback=900),
+        text_preview_max_bytes=parser.getint("app", "text_preview_max_bytes", fallback=5 * 1024 * 1024),
         request_id_header=parser.get("app", "request_id_header", fallback="X-Request-ID"),
         default_timezone=parser.get("app", "default_timezone", fallback="Asia/Shanghai"),
     )

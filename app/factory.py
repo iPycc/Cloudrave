@@ -66,6 +66,7 @@ async def lifespan(app: FastAPI):
 def create_app(config: CloudraveConfig) -> FastAPI:
     configure_logging(config)
     config.local_upload_root_path.mkdir(parents=True, exist_ok=True)
+    config.preview_cache_root_path.mkdir(parents=True, exist_ok=True)
 
     app = FastAPI(
         title=config.app.name,
@@ -85,14 +86,19 @@ def create_app(config: CloudraveConfig) -> FastAPI:
         CORSMiddleware,
         allow_origins=list(config.app.cors_origins),
         allow_credentials=True,
-        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=[
             "Authorization",
             "Content-Type",
             "X-Request-ID",
             "X-Cloudrave-Local-Write",
             "X-Cloudrave-Local-Part",
+            "If-Match",
+            "If-None-Match",
+            "If-Range",
+            "Range",
         ],
+        expose_headers=["Accept-Ranges", "Content-Length", "Content-Range", "ETag", "Last-Modified"],
     )
     app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(LoggingMiddleware)

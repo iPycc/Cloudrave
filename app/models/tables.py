@@ -214,6 +214,31 @@ class ShareRecord(Base, TimestampMixin):
 
     owner: Mapped[User] = relationship(back_populates="shares")
     node: Mapped[Node] = relationship()
+    items: Mapped[list["ShareItem"]] = relationship(
+        back_populates="share",
+        cascade="all, delete-orphan",
+        order_by="ShareItem.position",
+    )
+
+
+class ShareItem(Base):
+    """A root node exposed by one share link.
+
+    ``ShareRecord.node_id`` remains the primary item for backwards compatibility;
+    new multi-selection shares keep every selected root in this table.
+    """
+
+    __tablename__ = "share_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    share_id: Mapped[str] = mapped_column(ForeignKey("shares.id", ondelete="CASCADE"), index=True)
+    node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id", ondelete="CASCADE"), index=True)
+    position: Mapped[int] = mapped_column(Integer, default=0)
+
+    share: Mapped[ShareRecord] = relationship(back_populates="items")
+    node: Mapped[Node] = relationship()
+
+    __table_args__ = (UniqueConstraint("share_id", "node_id", name="uq_share_items_share_node"),)
 
 
 class UploadSessionRecord(Base, TimestampMixin):

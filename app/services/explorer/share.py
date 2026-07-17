@@ -45,9 +45,17 @@ class ShareService:
         )
 
     async def create_share(self, request: Request, actor: User, payload: ShareCreateRequest) -> ShareRead:
-        node = await self.nodes.get_by_id(payload.node_id)
-        if node is None or node.owner_id != actor.id or node.deleted_at is not None:
+        requested_ids = list(dict.fromkeys(payload.node_ids or ([payload.node_id] if payload.node_id is not None else [])))
+        if not requested_ids:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="At least one node is required")
+        nodes = await self.nodes.list_by_ids(requested_ids)
+        nodes_by_id = {node.id: node for node in nodes}
+        if len(nodes) != len(requested_ids) or any(
+            node.owner_id != actor.id or node.deleted_at is not None for node in nodes
+        ):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
+        nodes = [nodes_by_id[node_id] for node_id in requested_ids]
+        node = nodes[0]
 
         password_hash = None
         if payload.access == ShareAccess.PASSWORD and payload.password:
@@ -59,7 +67,7 @@ class ShareService:
 
         share = await self.shares.create(
             owner_id=actor.id,
-            node_id=node.id,
+            node_ids=[item.id for item in nodes],
             access=payload.access,
             password_hash=password_hash,
             expires_at=expires_at,
@@ -69,16 +77,19 @@ class ShareService:
             actor_id=actor.id,
             action="share.create",
             target=f"share:{share.id}",
-            detail=f"node:{node.id}",
+            detail=f"nodes:{','.join(str(item.id) for item in nodes)}",
             ip=request.client.host if request.client else None,
             user_agent=request.headers.get("user-agent"),
             request_id=getattr(request.state, "request_id", None),
         )
-        return self._serialize_share(share, node)
+        return self._serialize_share(share, node).model_copy(update={"item_count": len(nodes)})
 
     async def list_shares(self, actor: User) -> list[ShareRead]:
         shares = await self.shares.list_for_owner(actor.id)
-        return [self._serialize_share(share, share.node) for share in shares]
+        return [
+            self._serialize_share(share, share.node).model_copy(update={"item_count": len(share.items) or 1})
+            for share in shares
+        ]
 
     async def revoke_share(self, request: Request, actor: User, share_id: str) -> None:
         share = await self.shares.get_by_id(share_id)
@@ -95,12 +106,41 @@ class ShareService:
             request_id=getattr(request.state, "request_id", None),
         )
 
-    async def get_share_info(self, share_id: str) -> tuple[ShareRecord, Node]:
+    async def get_share_info(self, share_id: str) -> tuple[ShareRecord, list[Node]]:
         share = await self._require_valid_share(share_id)
-        node = await self.nodes.get_by_id(share.node_id)
-        if node is None or node.deleted_at is not None:
+        node_ids = await self.shares.list_root_node_ids(share)
+        nodes = await self.nodes.list_by_ids(node_ids)
+        nodes_by_id = {node.id: node for node in nodes if node.deleted_at is None}
+        ordered = [nodes_by_id[node_id] for node_id in node_ids if node_id in nodes_by_id]
+        if not ordered:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Share not found")
-        return share, node
+        return share, ordered
+
+    async def list_shared_nodes(self, share: ShareRecord, parent_id: int | None) -> list[Node]:
+        roots = (await self.get_share_info(share.id))[1]
+        if parent_id is None:
+            return roots
+        parent = await self.resolve_shared_node(share, parent_id)
+        if parent.type != NodeType.FOLDER:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Node is not a folder")
+        return await self.nodes.list_children(parent.mount_id, parent.id)
+
+    async def resolve_shared_node(self, share: ShareRecord, node_id: int | None) -> Node:
+        roots = (await self.get_share_info(share.id))[1]
+        target_id = node_id if node_id is not None else roots[0].id
+        node = await self.nodes.get_by_id(target_id)
+        if node is None or node.deleted_at is not None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Shared node not found")
+
+        root_ids = {root.id for root in roots}
+        cursor: Node | None = node
+        visited: set[int] = set()
+        while cursor is not None and cursor.id not in visited:
+            if cursor.id in root_ids:
+                return node
+            visited.add(cursor.id)
+            cursor = await self.nodes.get_by_id(cursor.parent_id) if cursor.parent_id is not None else None
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Shared node not found")
 
     async def verify_password(self, share_id: str, payload: ShareVerifyRequest) -> str:
         share = await self._require_valid_share(share_id)

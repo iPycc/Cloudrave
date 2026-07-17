@@ -35,6 +35,9 @@ class NodeRepository:
     async def get_by_id(self, node_id: int) -> Node | None:
         return await self.session.get(Node, node_id)
 
+    async def get_by_id_for_update(self, node_id: int) -> Node | None:
+        return await self.session.scalar(select(Node).where(Node.id == node_id).with_for_update())
+
     async def list_by_ids(self, node_ids: list[int]) -> list[Node]:
         if not node_ids:
             return []
@@ -77,10 +80,13 @@ class NodeRepository:
         sort: str,
     ) -> tuple[list[Node], bool]:
         extensions = {
-            "image": ("png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif", "ico", "heic"),
+            "image": ("png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif", "ico", "heic", "tif", "tiff"),
             "video": ("mp4", "mov", "mkv", "avi", "webm", "flv", "m4v", "wmv"),
-            "audio": ("mp3", "wav", "flac", "ogg", "m4a", "aac"),
-            "document": ("pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "csv", "txt"),
+            "audio": ("mp3", "wav", "flac", "ogg", "m4a", "aac", "opus"),
+            "document": (
+                "pdf", "doc", "docx", "docm", "dot", "dotx", "xls", "xlsx", "xlsm", "xlsb", "xltx",
+                "ppt", "pptx", "pptm", "pps", "ppsx", "csv", "txt",
+            ),
         }[category]
         lowered_name = func.lower(Node.name)
         statement = select(Node).where(
@@ -205,6 +211,12 @@ class NodeRepository:
 
     async def rename(self, node: Node, name: str) -> Node:
         node.name = name
+        await self.session.flush()
+        return node
+
+    async def update_file_metadata(self, node: Node, *, size: int) -> Node:
+        node.size = size
+        node.updated_at = datetime.now(UTC)
         await self.session.flush()
         return node
 

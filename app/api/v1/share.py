@@ -2,22 +2,28 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Body, Depends, Query, Request
-from fastapi.responses import RedirectResponse, StreamingResponse
+import mimetypes
+
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
+from fastapi.responses import RedirectResponse
 
 from app.middleware.auth_context import get_current_user
-from app.models.tables import User
+from app.models.enums import StoragePolicyType
+from app.models.tables import Node, ShareRecord, User
 from app.schemas.common import MessageResponse
-from app.schemas.node import DownloadLinkResponse
 from app.schemas.share import (
     ShareAccessTokenResponse,
     ShareCreateRequest,
     ShareNodeInfo,
     ShareRead,
     ShareVerifyRequest,
+    SharedNodeRead,
 )
 from app.services.explorer.download import DownloadFileService
+from app.services.explorer.preview import DERIVED_CACHE_CONTROL, PreviewService, build_local_preview_response
 from app.services.explorer.share import ShareService
+from app.services.user.response import build_avatar_url
+from app.storage_adapters.local_fs import LocalFsAdapter
 
 
 router = APIRouter(prefix="/share", tags=["share"])
@@ -34,6 +40,23 @@ def _build_share_service(request: Request, session):
     )
 
 
+def _require_share_access(service: ShareService, share: ShareRecord, access_token: str | None) -> None:
+    if share.access.value == "password" and (
+        access_token is None or not service.verify_access_token(share, access_token)
+    ):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Share access token required")
+
+
+def _shared_node_read(node: Node) -> SharedNodeRead:
+    return SharedNodeRead(
+        id=node.id,
+        parent_id=node.parent_id,
+        name=node.name,
+        type=node.type.value,
+        size=node.size,
+    )
+
+
 @router.post("", response_model=ShareRead)
 async def create_share(
     request: Request,
@@ -42,8 +65,7 @@ async def create_share(
 ) -> ShareRead:
     dep = request.app.state.dep
     async with dep.session_scope() as session:
-        service = _build_share_service(request, session)
-        return await service.create_share(request, current_user, payload)
+        return await _build_share_service(request, session).create_share(request, current_user, payload)
 
 
 @router.get("/my", response_model=list[ShareRead])
@@ -53,8 +75,7 @@ async def list_my_shares(
 ) -> list[ShareRead]:
     dep = request.app.state.dep
     async with dep.session_scope() as session:
-        service = _build_share_service(request, session)
-        return await service.list_shares(current_user)
+        return await _build_share_service(request, session).list_shares(current_user)
 
 
 @router.delete("/{share_id}", response_model=MessageResponse)
@@ -65,8 +86,7 @@ async def revoke_share(
 ) -> MessageResponse:
     dep = request.app.state.dep
     async with dep.session_scope() as session:
-        service = _build_share_service(request, session)
-        await service.revoke_share(request, current_user, share_id)
+        await _build_share_service(request, session).revoke_share(request, current_user, share_id)
         return MessageResponse(message="Share revoked")
 
 
@@ -74,22 +94,51 @@ async def revoke_share(
 async def get_share_info(
     share_id: str,
     request: Request,
+    access_token: str | None = Query(None),
 ) -> ShareNodeInfo:
     dep = request.app.state.dep
     async with dep.session_scope() as session:
         service = _build_share_service(request, session)
-        share, node = await service.get_share_info(share_id)
+        share, nodes = await service.get_share_info(share_id)
+        owner = await session.get(User, share.owner_id)
+        may_reveal = share.access.value != "password" or (
+            access_token is not None and service.verify_access_token(share, access_token)
+        )
+        visible_nodes = nodes if may_reveal else []
+        primary = visible_nodes[0] if visible_nodes else None
         return ShareNodeInfo(
             share_id=share.id,
             access=share.access,
-            node_id=node.id,
-            node_name=node.name,
-            node_type=node.type.value,
+            node_id=primary.id if primary else None,
+            node_name=primary.name if primary else "",
+            node_type=primary.type.value if primary else "",
+            node_size=primary.size if primary else 0,
+            owner_name=owner.username if owner else "Cloudrave 用户",
+            owner_avatar=build_avatar_url(owner) if owner else None,
+            folder_count=sum(node.type.value == "folder" for node in nodes),
+            file_count=sum(node.type.value == "file" for node in nodes),
+            items=[_shared_node_read(node) for node in visible_nodes],
             expires_at=share.expires_at,
             max_downloads=share.max_downloads,
             download_count=share.download_count,
             view_count=share.view_count,
         )
+
+
+@router.get("/{share_id}/nodes", response_model=list[SharedNodeRead])
+async def list_shared_nodes(
+    share_id: str,
+    request: Request,
+    parent_id: int | None = Query(None),
+    access_token: str | None = Query(None),
+) -> list[SharedNodeRead]:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = _build_share_service(request, session)
+        share, _ = await service.get_share_info(share_id)
+        _require_share_access(service, share, access_token)
+        nodes = await service.list_shared_nodes(share, parent_id)
+        return [_shared_node_read(node) for node in nodes]
 
 
 @router.post("/{share_id}/verify", response_model=ShareAccessTokenResponse)
@@ -100,8 +149,7 @@ async def verify_share_password(
 ) -> ShareAccessTokenResponse:
     dep = request.app.state.dep
     async with dep.session_scope() as session:
-        service = _build_share_service(request, session)
-        token = await service.verify_password(share_id, payload)
+        token = await _build_share_service(request, session).verify_password(share_id, payload)
         return ShareAccessTokenResponse(access_token=token)
 
 
@@ -110,22 +158,16 @@ async def download_shared_file(
     share_id: str,
     request: Request,
     access_token: str | None = Query(None),
+    node_id: int | None = Query(None),
 ):
     dep = request.app.state.dep
     async with dep.session_scope() as session:
         service = _build_share_service(request, session)
-        share, node = await service.get_share_info(share_id)
-
-        if share.access.value == "password":
-            if access_token is None or not service.verify_access_token(share, access_token):
-                from fastapi import HTTPException, status
-
-                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Share access token required")
-
+        share, _ = await service.get_share_info(share_id)
+        _require_share_access(service, share, access_token)
+        node = await service.resolve_shared_node(share, node_id)
         if node.type.value == "folder":
-            from fastapi import HTTPException, status
-
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Folder download via share is not supported yet")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Folder download is not supported yet")
 
         download_service = DownloadFileService(
             mounts=dep.get_mount_repository(session),
@@ -138,3 +180,94 @@ async def download_shared_file(
         response = download_service.build_file_stream(node, mount, policy)
         await service.record_download(share)
         return response
+
+
+@router.get("/{share_id}/preview")
+@router.head("/{share_id}/preview", include_in_schema=False)
+async def preview_shared_file(
+    share_id: str,
+    request: Request,
+    access_token: str | None = Query(None),
+    node_id: int | None = Query(None),
+):
+    """Stream one file inside a share inline without counting a download."""
+
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = _build_share_service(request, session)
+        share, _ = await service.get_share_info(share_id)
+        _require_share_access(service, share, access_token)
+        node = await service.resolve_shared_node(share, node_id)
+        if node.type.value == "folder":
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Folders cannot be previewed")
+
+        download_service = DownloadFileService(
+            mounts=dep.get_mount_repository(session),
+            nodes=dep.get_node_repository(session),
+            policies=dep.get_policy_repository(session),
+            objects=dep.get_object_repository(session),
+            storage_manager=dep.storage_manager,
+        )
+        node, mount, policy = await download_service.resolve_shared(node.id)
+        adapter = dep.storage_manager.get_adapter(policy)
+        if policy.provider == StoragePolicyType.LOCAL_FS:
+            if not isinstance(adapter, LocalFsAdapter):
+                raise RuntimeError("Local filesystem policy has no local adapter")
+            return build_local_preview_response(
+                request,
+                adapter.resolve_object_path(mount, node.blob_path),
+                filename=node.name,
+                media_type=mimetypes.guess_type(node.name)[0] or "application/octet-stream",
+                cache_control="private, no-store",
+            )
+        signed = adapter.build_download_url(policy, mount, node.blob_path)
+        return RedirectResponse(signed.url, headers={"Cache-Control": "private, no-store"})
+
+
+@router.get("/{share_id}/cover")
+async def shared_audio_cover(
+    share_id: str,
+    request: Request,
+    access_token: str | None = Query(None),
+    node_id: int | None = Query(None),
+):
+    """Return the embedded cover art for an audio file shared via a share link."""
+
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = _build_share_service(request, session)
+        share, _ = await service.get_share_info(share_id)
+        _require_share_access(service, share, access_token)
+        node = await service.resolve_shared_node(share, node_id)
+        if node.type.value == "folder":
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Folders cannot have cover art")
+
+        resolver = DownloadFileService(
+            mounts=dep.get_mount_repository(session),
+            nodes=dep.get_node_repository(session),
+            policies=dep.get_policy_repository(session),
+            objects=dep.get_object_repository(session),
+            storage_manager=dep.storage_manager,
+        )
+        preview_service = PreviewService(
+            resolver=resolver,
+            nodes=dep.get_node_repository(session),
+            objects=dep.get_object_repository(session),
+            audits=dep.get_audit_repository(session),
+            storage_manager=dep.storage_manager,
+            token_service=dep.token_service,
+            cache_root=dep.config.preview_cache_root_path,
+            public_base_url=dep.config.app.public_base_url,
+            office_ttl_seconds=dep.config.app.office_source_ttl_seconds,
+            text_max_bytes=dep.config.app.text_preview_max_bytes,
+        )
+        cover_path = await preview_service.shared_audio_cover(node.id)
+        if cover_path is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No embedded cover art found")
+        return build_local_preview_response(
+            request,
+            cover_path,
+            filename="cover.webp",
+            media_type="image/webp",
+            cache_control=DERIVED_CACHE_CONTROL,
+        )

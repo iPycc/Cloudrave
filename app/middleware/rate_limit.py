@@ -17,13 +17,19 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
     requests_per_window: ClassVar[int] = 120
     preview_requests_per_window: ClassVar[int] = 600
+    office_source_requests_per_window: ClassVar[int] = 3000
     window_seconds: ClassVar[float] = 60.0
     _windows: ClassVar[dict[tuple[str, str], deque[float]]] = {}
     _last_cleanup: ClassVar[float] = 0.0
 
     @classmethod
     def _policy_for(cls, request: StarletteRequest) -> tuple[str, int]:
-        if request.method in {"GET", "HEAD"} and request.url.path.startswith("/api/v1/explorer/preview/"):
+        if request.method in {"GET", "HEAD"} and request.url.path.startswith("/api/v1/explorer/office/source/"):
+            return "office-source", cls.office_source_requests_per_window
+        if request.method in {"GET", "HEAD"} and (
+            request.url.path.startswith("/api/v1/explorer/preview/")
+            or request.url.path.startswith("/api/v1/share/") and request.url.path.endswith("/preview")
+        ):
             return "preview", cls.preview_requests_per_window
         return "api", cls.requests_per_window
 
