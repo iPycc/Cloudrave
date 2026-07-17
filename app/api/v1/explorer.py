@@ -6,8 +6,7 @@ import mimetypes
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Body, Depends, File, Form, Query, Request, UploadFile
-from fastapi.responses import RedirectResponse, StreamingResponse
-from starlette.background import BackgroundTask
+from fastapi.responses import RedirectResponse
 
 from app.middleware.auth_context import get_current_user
 from app.models.enums import StoragePolicyType
@@ -37,21 +36,13 @@ from app.schemas.upload import (
 )
 from app.services.explorer.download import DownloadFileService
 from app.services.explorer.file import FileExplorerService
+from app.services.explorer.preview import build_local_preview_response
 from app.services.explorer.upload import CreateUploadSessionService
+from app.storage_adapters.local_fs import LocalFsAdapter
 from app.services.user.storage import UserStorageProvisionService
 
 
 router = APIRouter(prefix="/explorer", tags=["explorer"])
-
-
-def _stream_local_object(adapter, policy, mount, blob_path: str, *, media_type: str, headers: dict[str, str] | None = None):
-    stream = adapter.open_object(policy, mount, blob_path)
-    return StreamingResponse(
-        stream,
-        media_type=media_type,
-        headers=headers,
-        background=BackgroundTask(stream.close),
-    )
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -460,13 +451,16 @@ async def preview_file(
         adapter = dep.storage_manager.get_adapter(policy)
         content_type = mimetypes.guess_type(node.name)[0] or "application/octet-stream"
         if policy.provider == StoragePolicyType.LOCAL_FS:
-            return _stream_local_object(
-                adapter,
-                policy,
-                mount,
-                node.blob_path,
+            if not isinstance(adapter, LocalFsAdapter):
+                raise RuntimeError("Local filesystem policy has no local adapter")
+            return build_local_preview_response(
+                request,
+                adapter.resolve_object_path(mount, node.blob_path),
+                filename=node.name,
                 media_type=content_type,
-                headers={"Cache-Control": "private, max-age=3600"},
             )
         signed = adapter.build_download_url(policy, mount, node.blob_path)
-        return RedirectResponse(signed.url)
+        return RedirectResponse(
+            signed.url,
+            headers={"Cache-Control": "private, max-age=30"},
+        )

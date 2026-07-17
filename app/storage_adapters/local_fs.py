@@ -57,6 +57,11 @@ class LocalFsAdapter(StorageAdapterBase):
         normalized = normalize_object_key(object_key)
         return self.prepare_mount_root(mount) / "objects" / normalized
 
+    def resolve_object_path(self, mount, object_key: str) -> Path:
+        """Return a validated local path for optimized internal file serving."""
+
+        return self._resolve_object_path(mount, object_key)
+
     def _resolve_trash_path(self, mount, object_key: str) -> Path:
         normalized = normalize_object_key(object_key)
         return self.prepare_mount_root(mount) / "trash" / normalized
