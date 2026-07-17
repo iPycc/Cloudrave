@@ -21,6 +21,7 @@ from app.services.session.issue import IssueSessionService
 from app.services.user.response import build_user_response
 from app.services.user.storage import UserStorageProvisionService
 from app.storage.manager import StorageManager
+from logging_config import LogOperation, LogOutcome
 
 
 LOGGER = logging.getLogger("cloudrave.auth")
@@ -91,9 +92,12 @@ class UserRegisterService:
             request_id=getattr(request.state, "request_id", None),
         )
         LOGGER.info(
-            f"Registered user {user.email}",
+            "Registered user %s",
+            user.email,
             extra={
-                "operation": "CREATE",
+                "operation": LogOperation.REGISTER,
+                "resource": "user",
+                "outcome": LogOutcome.SUCCESS,
                 "request_id": getattr(request.state, "request_id", "-"),
                 "ip": request.client.host if request.client else "-",
                 "actor": user.email,

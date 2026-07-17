@@ -24,6 +24,7 @@ from app.services.user.storage import UserStorageProvisionService
 from app.services.user.totp import TOTPService
 from app.storage.manager import StorageManager
 from config import CloudraveConfig
+from logging_config import LogOperation, LogOutcome
 
 
 LOGGER = logging.getLogger("cloudrave.auth")
@@ -70,6 +71,18 @@ class UserLoginService:
                 result="failure",
             )
             await self.session.commit()
+            LOGGER.warning(
+                "Login denied for %s: invalid credentials",
+                normalized_email,
+                extra={
+                    "operation": LogOperation.LOGIN,
+                    "resource": "session",
+                    "outcome": LogOutcome.DENIED,
+                    "request_id": getattr(request.state, "request_id", "-"),
+                    "ip": request.client.host if request.client else "-",
+                    "actor": normalized_email,
+                },
+            )
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="邮箱或密码错误",
@@ -83,6 +96,18 @@ class UserLoginService:
                 result="disabled",
             )
             await self.session.commit()
+            LOGGER.warning(
+                "Login denied for %s: account disabled",
+                normalized_email,
+                extra={
+                    "operation": LogOperation.LOGIN,
+                    "resource": "session",
+                    "outcome": LogOutcome.DENIED,
+                    "request_id": getattr(request.state, "request_id", "-"),
+                    "ip": request.client.host if request.client else "-",
+                    "actor": user.uid,
+                },
+            )
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="账号已被禁用",
@@ -127,9 +152,12 @@ class UserLoginService:
             session_id=session_record.id,
         )
         LOGGER.info(
-            f"Created session {session_record.id}",
+            "User logged in with session %s",
+            session_record.id,
             extra={
-                "operation": "CREATE",
+                "operation": LogOperation.LOGIN,
+                "resource": "session",
+                "outcome": LogOutcome.SUCCESS,
                 "request_id": getattr(request.state, "request_id", "-"),
                 "ip": request.client.host if request.client else "-",
                 "actor": user.uid,

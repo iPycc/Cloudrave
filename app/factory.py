@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app import __version__
 from app.api.v1 import router as v1_router
 from app.dep import Dep
 from app.exception_handlers import install_exception_handlers
@@ -15,15 +16,51 @@ from app.middleware.rate_limit import RateLimitMiddleware
 from app.middleware.request_id import RequestIdMiddleware
 from app.middleware.security_headers import SecurityHeadersMiddleware
 from config import CloudraveConfig
-from logging_config import configure_logging
+from logging_config import LogOperation, LogOutcome, configure_logging, get_logger
+
+
+LOGGER = get_logger("cloudrave.lifecycle")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     dep: Dep = app.state.dep
-    await dep.connect()
-    yield
-    await dep.disconnect()
+    LOGGER.info("Opening application services.")
+    try:
+        await dep.connect()
+    except Exception:
+        LOGGER.exception(
+            "Application services failed to start.",
+            extra={
+                "operation": LogOperation.STARTUP,
+                "resource": "application",
+                "outcome": LogOutcome.FAILED,
+            },
+        )
+        await dep.disconnect()
+        raise
+
+    LOGGER.info(
+        "Application services are ready.",
+        extra={
+            "operation": LogOperation.STARTUP,
+            "resource": "application",
+            "outcome": LogOutcome.SUCCESS,
+        },
+    )
+    try:
+        yield
+    finally:
+        LOGGER.info("Closing application services.")
+        await dep.disconnect()
+        LOGGER.info(
+            "Application services stopped cleanly.",
+            extra={
+                "operation": LogOperation.SHUTDOWN,
+                "resource": "application",
+                "outcome": LogOutcome.SUCCESS,
+            },
+        )
 
 
 def create_app(config: CloudraveConfig) -> FastAPI:
@@ -32,7 +69,7 @@ def create_app(config: CloudraveConfig) -> FastAPI:
 
     app = FastAPI(
         title=config.app.name,
-        version="0.1.0",
+        version=__version__,
         docs_url=None if config.app.env == "production" else "/api/docs",
         redoc_url=None if config.app.env == "production" else "/api/redoc",
         lifespan=lifespan,

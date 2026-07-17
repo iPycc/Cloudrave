@@ -15,6 +15,7 @@ from app.repositories.nodes import NodeRepository
 from app.repositories.policies import StoragePolicyRepository
 from app.schemas.mount import BucketMountCreate, BucketMountRead, BucketMountUpdate
 from app.storage.manager import StorageManager
+from logging_config import LogOperation, LogOutcome
 
 
 LOGGER = logging.getLogger("cloudrave.storage")
@@ -70,7 +71,9 @@ class MountAdminService:
         LOGGER.info(
             f"Created mount {mount.name}",
             extra={
-                "operation": "CREATE",
+                "operation": LogOperation.CREATE,
+                "resource": "mount",
+                "outcome": LogOutcome.SUCCESS,
                 "request_id": getattr(request.state, "request_id", "-"),
                 "ip": request.client.host if request.client else "-",
                 "actor": actor.email,
@@ -117,7 +120,9 @@ class MountAdminService:
         LOGGER.info(
             f"Deleted mount {mount.name}",
             extra={
-                "operation": "DELETE",
+                "operation": LogOperation.DELETE,
+                "resource": "mount",
+                "outcome": LogOutcome.SUCCESS,
                 "request_id": getattr(request.state, "request_id", "-"),
                 "ip": request.client.host if request.client else "-",
                 "actor": actor.email,

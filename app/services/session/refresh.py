@@ -15,6 +15,7 @@ from app.repositories.sessions import SessionRepository
 from app.repositories.users import UserRepository
 from app.schemas.auth import RefreshRequest, TokenPairResponse
 from app.security.jwt import AuthError, TokenService
+from logging_config import LogOperation, LogOutcome
 
 
 LOGGER = logging.getLogger("cloudrave.auth")
@@ -88,8 +89,13 @@ class RefreshTokenService:
             request_id=getattr(request.state, "request_id", None),
         )
         LOGGER.info(
-            f"Rotated session {session_record.id} to token version {next_version}",
+            "Refreshed session %s to token version %s",
+            session_record.id,
+            next_version,
             extra={
+                "operation": LogOperation.REFRESH,
+                "resource": "session",
+                "outcome": LogOutcome.SUCCESS,
                 "request_id": getattr(request.state, "request_id", "-"),
                 "ip": request.client.host if request.client else "-",
                 "actor": user.email,

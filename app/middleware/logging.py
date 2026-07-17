@@ -33,9 +33,17 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         if reason:
             message = f'{message} reason="{_single_line(reason)}"'
 
-        log_method = LOGGER.warning if response.status_code >= 400 else LOGGER.info
+        log_method = _response_log_method(response.status_code)
         log_method(message, extra=_log_context(request))
         return response
+
+
+def _response_log_method(status_code: int):
+    if status_code >= 500:
+        return LOGGER.error
+    if status_code in {401, 403, 429}:
+        return LOGGER.warning
+    return LOGGER.info
 
 
 def _single_line(value: object, *, limit: int = 500) -> str:

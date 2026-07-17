@@ -11,6 +11,7 @@ from app.models.tables import User
 from app.repositories.audit_logs import AuditLogRepository
 from app.repositories.policies import StoragePolicyRepository
 from app.schemas.policy import StoragePolicyCreate, StoragePolicyRead, StoragePolicyUpdate
+from logging_config import LogOperation, LogOutcome
 
 
 LOGGER = logging.getLogger("cloudrave.storage")
@@ -51,7 +52,9 @@ class SingleStoragePolicyService:
         LOGGER.info(
             f"Created storage policy {policy.name}",
             extra={
-                "operation": "CREATE",
+                "operation": LogOperation.CREATE,
+                "resource": "storage_policy",
+                "outcome": LogOutcome.SUCCESS,
                 "request_id": getattr(request.state, "request_id", "-"),
                 "ip": request.client.host if request.client else "-",
                 "actor": actor.email,
@@ -98,7 +101,9 @@ class SingleStoragePolicyService:
         LOGGER.info(
             f"Deleted storage policy {policy.name}",
             extra={
-                "operation": "DELETE",
+                "operation": LogOperation.DELETE,
+                "resource": "storage_policy",
+                "outcome": LogOutcome.SUCCESS,
                 "request_id": getattr(request.state, "request_id", "-"),
                 "ip": request.client.host if request.client else "-",
                 "actor": actor.email,

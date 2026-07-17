@@ -12,6 +12,7 @@ from app.repositories.sessions import SessionRepository
 from app.repositories.users import UserRepository
 from app.schemas.auth import LogoutRequest
 from app.security.jwt import AuthError, TokenService
+from logging_config import LogOperation, LogOutcome
 
 
 LOGGER = logging.getLogger("cloudrave.auth")
@@ -63,9 +64,14 @@ class RevokeSessionService:
             request_id=getattr(request.state, "request_id", None),
         )
         LOGGER.info(
-            f"Revoked {revoked} sessions for user {user.email}",
+            "User logged out; revoked %s session(s)",
+            revoked,
             extra={
-                "operation": "DELETE",
+                "operation": LogOperation.LOGOUT,
+                "resource": "session",
+                "outcome": LogOutcome.SUCCESS,
+                "scope": payload.scope,
+                "count": revoked,
                 "request_id": getattr(request.state, "request_id", "-"),
                 "ip": request.client.host if request.client else "-",
                 "actor": user.email,

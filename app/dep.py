@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from urllib.parse import urlsplit, urlunsplit
 
+from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,7 +25,7 @@ from app.security.password import PasswordService
 from app.storage.manager import StorageManager
 from config import CloudraveConfig
 from database import create_schema, make_async_engine, make_session_factory, session_scope, write_schema_sql
-from logging_config import get_logger
+from logging_config import LogOperation, LogOutcome, get_logger
 
 
 LOGGER = get_logger("cloudrave.bootstrap")
@@ -46,12 +47,39 @@ class Dep:
             raise RuntimeError("Missing [auth].share_signing_key in config.ini")
         return key.encode()
 
+    async def check_database(self) -> None:
+        """Verify database availability without running application bootstrap."""
+
+        database_url = self._mask_database_url(self.config.database.url)
+        LOGGER.info(
+            "Checking %s database availability at %s.",
+            self.config.database.backend.upper(),
+            database_url,
+        )
+        try:
+            async with self.engine.connect() as connection:
+                await connection.execute(text("SELECT 1"))
+        except (OSError, SQLAlchemyError) as exc:
+            raise RuntimeError(
+                "Cloudrave could not connect to the database. "
+                f"Configured target: {database_url}. "
+                f"Start {self.config.database.backend} or update [database] database/url in "
+                f"{self.config.config_path}."
+            ) from exc
+        LOGGER.info(
+            "Database connection check passed.",
+            extra={
+                "operation": LogOperation.DATABASE_CHECK,
+                "resource": "database",
+                "outcome": LogOutcome.SUCCESS,
+            },
+        )
 
     async def connect(self) -> None:
         schema_path = write_schema_sql(self.config)
         LOGGER.info(
-            "Generated database schema SQL.",
-            extra={"request_id": "bootstrap", "ip": "-", "actor": "system", "target": str(schema_path)},
+            "Schema snapshot refreshed at %s.",
+            schema_path,
         )
 
         try:
@@ -62,6 +90,8 @@ class Dep:
                 f" 当前配置: {self._mask_database_url(self.config.database.url)}。"
                 f" 请先启动 {self.config.database.backend}，或修改 {self.config.config_path} 中 [database] 的 database/url 配置。"
             ) from exc
+
+        LOGGER.info("Database schema and runtime migrations are ready.")
 
         if len(self.config.auth.jwt_secret.strip()) < 32:
             LOGGER.warning(
@@ -79,6 +109,7 @@ class Dep:
             )
             if admin_state is None:
                 session.add(SystemMeta(key="auth.first_admin_user_id", value=""))
+                LOGGER.info("Initial administrator bootstrap marker created.")
 
     async def disconnect(self) -> None:
         await self.engine.dispose()

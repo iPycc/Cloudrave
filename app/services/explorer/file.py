@@ -36,6 +36,7 @@ from app.schemas.node import (
     NodeSearchResult,
 )
 from app.storage.manager import StorageManager
+from logging_config import LogOperation, LogOutcome
 
 
 LOGGER = logging.getLogger("cloudrave.explorer")
@@ -219,7 +220,9 @@ class FileExplorerService:
         LOGGER.info(
             f"Created folder {node.name}",
             extra={
-                "operation": "CREATE",
+                "operation": LogOperation.CREATE,
+                "resource": "folder",
+                "outcome": LogOutcome.SUCCESS,
                 "request_id": getattr(request.state, "request_id", "-"),
                 "ip": request.client.host if request.client else "-",
                 "actor": actor.email,
@@ -282,7 +285,11 @@ class FileExplorerService:
             LOGGER.info(
                 f"Hard deleted {len(all_ids)} node(s)",
                 extra={
-                    "operation": "DELETE",
+                    "operation": LogOperation.DELETE,
+                    "resource": "node",
+                    "outcome": LogOutcome.SUCCESS,
+                    "scope": "permanent",
+                    "count": len(all_ids),
                     "request_id": getattr(request.state, "request_id", "-"),
                     "ip": request.client.host if request.client else "-",
                     "actor": actor.email,
@@ -301,9 +308,12 @@ class FileExplorerService:
             request_id=getattr(request.state, "request_id", None),
         )
         LOGGER.info(
-            f"Soft deleted {len(deleted)} node(s)",
+            f"Moved {len(deleted)} node(s) to the recycle bin",
             extra={
-                "operation": "DELETE",
+                "operation": LogOperation.RECYCLE,
+                "resource": "node",
+                "outcome": LogOutcome.SUCCESS,
+                "count": len(deleted),
                 "request_id": getattr(request.state, "request_id", "-"),
                 "ip": request.client.host if request.client else "-",
                 "actor": actor.email,
