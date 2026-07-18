@@ -46,6 +46,12 @@ class FolderCreateRequest(CloudraveSchema):
     name: str = Field(min_length=1, max_length=255)
 
 
+class FileCreateRequest(CloudraveSchema):
+    mount_id: int
+    parent_id: int | None = None
+    name: str = Field(min_length=1, max_length=255)
+
+
 class NodeRenameRequest(CloudraveSchema):
     name: str = Field(min_length=1, max_length=255)
 

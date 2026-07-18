@@ -5,12 +5,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import io
 import logging
 import re
 import zipfile
 from collections import deque
+from pathlib import Path
 from typing import AsyncIterator
+from uuid import uuid4
 
 from fastapi import HTTPException, Request, status
 from fastapi.responses import StreamingResponse
@@ -26,6 +29,7 @@ from app.repositories.objects import ObjectRepository
 from app.repositories.policies import StoragePolicyRepository
 from app.schemas.mount import BucketMountRead
 from app.schemas.node import (
+    FileCreateRequest,
     FolderCreateRequest,
     NodeCopyRequest,
     NodeDeleteRequest,
@@ -222,6 +226,100 @@ class FileExplorerService:
             extra={
                 "operation": LogOperation.CREATE,
                 "resource": "folder",
+                "outcome": LogOutcome.SUCCESS,
+                "request_id": getattr(request.state, "request_id", "-"),
+                "ip": request.client.host if request.client else "-",
+                "actor": actor.email,
+            },
+        )
+        return NodeRead.model_validate(node)
+
+    async def create_file(self, request: Request, actor: User, payload: FileCreateRequest) -> NodeRead:
+        mount, policy = await self._require_mount_access(actor, payload.mount_id)
+        parent = await self._resolve_parent_folder(mount, payload.parent_id)
+        requested_name = payload.name.strip()
+        if "/" in requested_name or "\\" in requested_name or requested_name in {".", ".."}:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid file name")
+        extension = Path(requested_name).suffix.lower()
+        if extension not in {".txt", ".md", ".markdown"}:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Only TXT and Markdown files can be created here",
+            )
+
+        siblings = await self.nodes.list_children(mount.id, parent.id, include_deleted=True)
+        sibling_names = {sibling.name for sibling in siblings}
+        file_name = requested_name
+        if file_name in sibling_names:
+            stem = Path(file_name).stem
+            suffix = Path(file_name).suffix
+            base = re.sub(r"\s*\(\d+\)$", "", stem)
+            counter = 2
+            while f"{base} ({counter}){suffix}" in sibling_names:
+                counter += 1
+            file_name = f"{base} ({counter}){suffix}"
+
+        parent_path = await self._build_parent_relative_path(mount, parent)
+        storage_name = f"{uuid4().hex}-{file_name}"
+        object_key = self.storage_manager.build_object_key(mount, storage_name, parent_path)
+        content_type = "text/markdown; charset=utf-8" if extension in {".md", ".markdown"} else "text/plain; charset=utf-8"
+        adapter = self.storage_manager.get_adapter(policy)
+
+        object_written = False
+
+        async def cleanup_object() -> None:
+            if not object_written:
+                return
+            try:
+                await asyncio.to_thread(adapter.delete_object, policy, mount, object_key, hard_delete=True)
+            except Exception:
+                LOGGER.exception("Failed to clean up object after text file creation failed", extra={"object_key": object_key})
+
+        try:
+            await asyncio.to_thread(
+                adapter.put_object,
+                policy,
+                mount,
+                object_key,
+                b"",
+                mime_type=content_type,
+            )
+            object_written = True
+            node = await self.nodes.create_file(
+                owner_id=mount.owner_id,
+                mount_id=mount.id,
+                parent_id=parent.id,
+                name=file_name,
+                blob_path=object_key,
+                size=0,
+            )
+            await self.objects.create_or_update(
+                node_id=node.id,
+                policy_id=policy.id,
+                blob_path=object_key,
+                checksum=hashlib.sha256(b"").hexdigest(),
+                content_type=content_type,
+            )
+            await self.audits.create(
+                actor_id=actor.id,
+                action="node.create_file",
+                target=f"node:{node.id}",
+                detail=node.name,
+                ip=request.client.host if request.client else None,
+                user_agent=request.headers.get("user-agent"),
+                request_id=getattr(request.state, "request_id", None),
+            )
+        except IntegrityError as error:
+            await cleanup_object()
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A file with this name already exists") from error
+        except Exception:
+            await cleanup_object()
+            raise
+        LOGGER.info(
+            f"Created file {node.name}",
+            extra={
+                "operation": LogOperation.CREATE,
+                "resource": "file",
                 "outcome": LogOutcome.SUCCESS,
                 "request_id": getattr(request.state, "request_id", "-"),
                 "ip": request.client.host if request.client else "-",
@@ -472,6 +570,25 @@ class FileExplorerService:
         if policy is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Storage policy not found")
         return mount, policy
+
+    async def _resolve_parent_folder(self, mount: BucketMount, parent_id: int | None) -> Node:
+        if parent_id is None:
+            return await self.nodes.ensure_mount_root(owner_id=mount.owner_id, mount_id=mount.id, name=mount.name)
+        parent = await self.nodes.get_by_id(parent_id)
+        if parent is None or parent.mount_id != mount.id or parent.type != NodeType.FOLDER:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Parent folder not found")
+        return parent
+
+    async def _build_parent_relative_path(self, mount: BucketMount, parent: Node) -> str | None:
+        root = await self.nodes.ensure_mount_root(owner_id=mount.owner_id, mount_id=mount.id, name=mount.name)
+        if parent.id == root.id:
+            return None
+        segments: list[str] = []
+        current: Node | None = parent
+        while current is not None and current.id != root.id:
+            segments.append(current.name)
+            current = await self.nodes.get_by_id(current.parent_id) if current.parent_id is not None else None
+        return "/".join(reversed(segments)) if segments else None
 
     async def _require_node_access(self, actor: User, node_id: int):
         node = await self.nodes.get_by_id(node_id)

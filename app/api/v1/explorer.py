@@ -16,6 +16,7 @@ from app.schemas.common import HealthResponse, MessageResponse
 from app.schemas.mount import BucketMountRead
 from app.schemas.node import (
     DownloadLinkResponse,
+    FileCreateRequest,
     FolderCreateRequest,
     NodeCopyRequest,
     NodeDeleteRequest,
@@ -222,6 +223,26 @@ async def create_folder(
             storage_manager=dep.storage_manager,
         )
         return await service.create_folder(request, current_user, payload)
+
+
+@router.post("/node/file", response_model=NodeRead)
+async def create_file(
+    request: Request,
+    payload: FileCreateRequest = Body(...),
+    current_user: User = Depends(get_current_user),
+) -> NodeRead:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = FileExplorerService(
+            session=session,
+            mounts=dep.get_mount_repository(session),
+            policies=dep.get_policy_repository(session),
+            nodes=dep.get_node_repository(session),
+            objects=dep.get_object_repository(session),
+            audits=dep.get_audit_repository(session),
+            storage_manager=dep.storage_manager,
+        )
+        return await service.create_file(request, current_user, payload)
 
 
 @router.patch("/node/{node_id}", response_model=NodeRead)
