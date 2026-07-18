@@ -37,6 +37,7 @@ class NodeStatus(StrEnum):
 
 
 class UploadMode(StrEnum):
+    AUTO = "auto"
     SINGLE = "single_put"
     MULTIPART = "multipart"
 
@@ -45,6 +46,7 @@ class UploadState(StrEnum):
     CREATED = "created"
     UPLOADING = "uploading"
     COMPLETING = "completing"
+    ABORTING = "aborting"
     COMPLETED = "completed"
     ABORTED = "aborted"
     EXPIRED = "expired"

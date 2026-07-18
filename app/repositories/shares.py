@@ -5,7 +5,7 @@ from __future__ import annotations
 import secrets
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import and_, case, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -33,6 +33,16 @@ class ShareRepository:
             .where(ShareRecord.owner_id == owner_id)
             .options(selectinload(ShareRecord.node), selectinload(ShareRecord.items))
             .order_by(ShareRecord.created_at.desc())
+        )
+        return list(result)
+
+    async def list_by_ids(self, share_ids: list[str]) -> list[ShareRecord]:
+        if not share_ids:
+            return []
+        result = await self.session.scalars(
+            select(ShareRecord)
+            .where(ShareRecord.id.in_(share_ids))
+            .options(selectinload(ShareRecord.items))
         )
         return list(result)
 
@@ -85,14 +95,45 @@ class ShareRepository:
         return node_ids or [share.node_id]
 
     async def increment_view(self, share: ShareRecord) -> None:
-        share.view_count += 1
+        await self.session.execute(
+            update(ShareRecord)
+            .where(ShareRecord.id == share.id, ShareRecord.is_active.is_(True))
+            .values(view_count=ShareRecord.view_count + 1)
+            .execution_options(synchronize_session=False)
+        )
         await self.session.flush()
+        await self.session.refresh(share)
 
-    async def increment_download(self, share: ShareRecord) -> None:
-        share.download_count += 1
-        if share.max_downloads is not None and share.download_count >= share.max_downloads:
-            share.is_active = False
+    async def increment_download(self, share: ShareRecord) -> bool:
+        """Atomically reserve one download without overshooting the limit."""
+
+        result = await self.session.execute(
+            update(ShareRecord)
+            .where(
+                ShareRecord.id == share.id,
+                ShareRecord.is_active.is_(True),
+                or_(ShareRecord.max_downloads.is_(None), ShareRecord.download_count < ShareRecord.max_downloads),
+            )
+            .values(
+                download_count=ShareRecord.download_count + 1,
+                is_active=case(
+                    (
+                        and_(
+                            ShareRecord.max_downloads.is_not(None),
+                            ShareRecord.download_count + 1 >= ShareRecord.max_downloads,
+                        ),
+                        False,
+                    ),
+                    else_=ShareRecord.is_active,
+                ),
+            )
+            .execution_options(synchronize_session=False)
+        )
         await self.session.flush()
+        consumed = bool(result.rowcount)
+        if consumed:
+            await self.session.refresh(share)
+        return consumed
 
     async def delete(self, share: ShareRecord) -> None:
         await self.session.delete(share)

@@ -17,12 +17,14 @@ from app.repositories.objects import ObjectRepository
 from app.repositories.passkeys import PasskeyRepository
 from app.repositories.policies import StoragePolicyRepository
 from app.repositories.sessions import SessionRepository
+from app.repositories.shared import SharedRepository
 from app.repositories.shares import ShareRepository
 from app.repositories.uploads import UploadRepository
 from app.repositories.users import UserRepository
 from app.security.jwt import TokenService
 from app.security.password import PasswordService
 from app.storage.manager import StorageManager
+from app.services.explorer.gc_job import GcWorker
 from config import CloudraveConfig
 from database import create_schema, make_async_engine, make_session_factory, session_scope, write_schema_sql
 from logging_config import LogOperation, LogOutcome, get_logger
@@ -39,6 +41,7 @@ class Dep:
         self.password_service = PasswordService(config.auth.password_salt)
         self.token_service = TokenService(config.auth)
         self.storage_manager = StorageManager(config=config, local_root=config.local_upload_root_path)
+        self.gc_worker = GcWorker(self.session_factory, self.storage_manager)
 
     @property
     def share_signing_key(self) -> bytes:
@@ -93,6 +96,33 @@ class Dep:
 
         LOGGER.info("Database schema and runtime migrations are ready.")
 
+        async with self.session_scope() as session:
+            from app.services.admin.ids import ObjectIdService
+
+            filled, failed = await ObjectIdService(
+                session=session,
+                mounts=self.get_mount_repository(session),
+                policies=self.get_policy_repository(session),
+                objects=self.get_object_repository(session),
+                storage_manager=self.storage_manager,
+            ).fill()
+            if filled or failed:
+                LOGGER.info("Physical object identities backfilled: %s ready, %s unresolved.", filled, failed)
+
+        async with self.session_scope() as session:
+            from app.services.explorer.gc import ObjectGc
+
+            cleaned = await ObjectGc(
+                mounts=self.get_mount_repository(session),
+                nodes=self.get_node_repository(session),
+                policies=self.get_policy_repository(session),
+                objects=self.get_object_repository(session),
+                storage_manager=self.storage_manager,
+            ).run_pending(limit=100)
+            if cleaned:
+                LOGGER.info("Retried %s pending physical object cleanup task(s).", cleaned)
+        self.gc_worker.start()
+
         if len(self.config.auth.jwt_secret.strip()) < 32:
             LOGGER.warning(
                 "JWT secret length is shorter than recommended. Please update [auth].jwt_secret in config.ini.",
@@ -112,6 +142,7 @@ class Dep:
                 LOGGER.info("Initial administrator bootstrap marker created.")
 
     async def disconnect(self) -> None:
+        await self.gc_worker.stop()
         await self.engine.dispose()
 
     @asynccontextmanager
@@ -148,6 +179,9 @@ class Dep:
 
     def get_share_repository(self, session: AsyncSession) -> ShareRepository:
         return ShareRepository(session)
+
+    def get_shared_repository(self, session: AsyncSession) -> SharedRepository:
+        return SharedRepository(session)
 
     def _mask_database_url(self, value: str) -> str:
         parsed = urlsplit(value)

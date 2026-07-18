@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.tables import StoragePolicy
+from app.models.tables import BucketMount, StoragePolicy
 from app.schemas.policy import StoragePolicyCreate, StoragePolicyUpdate
 
 
@@ -30,6 +30,12 @@ class StoragePolicyRepository:
         statement = select(StoragePolicy).where(StoragePolicy.name == name)
         return await self.session.scalar(statement)
 
+    async def has_mounts(self, policy_id: int) -> bool:
+        count = await self.session.scalar(
+            select(func.count(BucketMount.id)).where(BucketMount.policy_id == policy_id)
+        )
+        return bool(count)
+
     async def create(self, payload: StoragePolicyCreate) -> StoragePolicy:
         policy = StoragePolicy(**payload.model_dump())
         self.session.add(policy)
@@ -38,6 +44,8 @@ class StoragePolicyRepository:
 
     async def update(self, policy: StoragePolicy, payload: StoragePolicyUpdate) -> StoragePolicy:
         for key, value in payload.model_dump(exclude_unset=True).items():
+            if key == "extra":
+                value = {**(policy.extra or {}), **(value or {})}
             setattr(policy, key, value)
         await self.session.flush()
         return policy

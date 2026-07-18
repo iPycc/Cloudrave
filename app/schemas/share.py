@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from app.models.enums import ShareAccess
 from app.schemas.common import CloudraveSchema
@@ -17,6 +17,12 @@ class ShareCreateRequest(CloudraveSchema):
     password: str | None = Field(default=None, min_length=1, max_length=128)
     expires_in_hours: int | None = Field(default=None, ge=1, le=720)
     max_downloads: int | None = Field(default=None, ge=1, le=100000)
+
+    @model_validator(mode="after")
+    def require_password(self) -> "ShareCreateRequest":
+        if self.access == ShareAccess.PASSWORD and not self.password:
+            raise ValueError("Password-protected shares require a password")
+        return self
 
 
 class ShareRead(CloudraveSchema):
@@ -59,6 +65,7 @@ class ShareNodeInfo(CloudraveSchema):
     node_type: str = ""
     node_size: int = 0
     owner_name: str
+    owner_uid: str
     owner_avatar: str | None = None
     folder_count: int = 0
     file_count: int = 0

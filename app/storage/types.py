@@ -55,6 +55,16 @@ class StorageObject:
 
 
 @dataclass(slots=True)
+class StorageObjectPage:
+    """One provider page, with provider continuation state kept explicit."""
+
+    objects: list[StorageObject] = field(default_factory=list)
+    common_prefixes: list[str] = field(default_factory=list)
+    next_marker: str | None = None
+    is_truncated: bool = False
+
+
+@dataclass(slots=True)
 class PresignedURL:
     method: str
     url: str
@@ -106,6 +116,9 @@ class StorageAdapter(Protocol):
     def prepare_mount_root(self, mount: Any) -> Path:
         ...
 
+    def physical_id(self, policy: Any, mount: Any, object_key: str) -> str:
+        ...
+
     def put_object(
         self,
         policy: Any,
@@ -121,6 +134,9 @@ class StorageAdapter(Protocol):
     def open_object(self, policy: Any, mount: Any, object_key: str) -> BinaryIO:
         ...
 
+    def head_object(self, policy: Any, mount: Any, object_key: str) -> StorageObject:
+        ...
+
     def delete_object(self, policy: Any, mount: Any, object_key: str, *, hard_delete: bool = False) -> bool:
         ...
 
@@ -129,6 +145,9 @@ class StorageAdapter(Protocol):
         policy: Any,
         mount: Any,
         object_key: str,
+        *,
+        mime_type: str | None = None,
+        metadata: dict[str, str] | None = None,
     ) -> PresignedURL:
         ...
 
@@ -186,7 +205,16 @@ class StorageAdapter(Protocol):
     def abort_multipart_upload(self, policy: Any, mount: Any, upload: MultipartUploadState) -> bool:
         ...
 
-    def build_download_url(self, policy: Any, mount: Any, object_key: str, *, expires_in: int | None = None) -> PresignedURL:
+    def build_download_url(
+        self,
+        policy: Any,
+        mount: Any,
+        object_key: str,
+        *,
+        expires_in: int | None = None,
+        download_name: str | None = None,
+        inline: bool = False,
+    ) -> PresignedURL:
         ...
 
     def configure_cors(self, policy: Any, mount: Any) -> dict[str, Any]:

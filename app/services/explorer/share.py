@@ -27,12 +27,14 @@ class ShareService:
         nodes: NodeRepository,
         audits: AuditLogRepository,
         share_signing_key: bytes,
+        access_token_ttl: timedelta = timedelta(hours=12),
     ) -> None:
         self.session = session
         self.shares = shares
         self.nodes = nodes
         self.audits = audits
         self.share_signing_key = share_signing_key
+        self.access_token_ttl = access_token_ttl
 
     @staticmethod
     def _serialize_share(share: ShareRecord, node: Node | None) -> ShareRead:
@@ -47,7 +49,7 @@ class ShareService:
     async def create_share(self, request: Request, actor: User, payload: ShareCreateRequest) -> ShareRead:
         requested_ids = list(dict.fromkeys(payload.node_ids or ([payload.node_id] if payload.node_id is not None else [])))
         if not requested_ids:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="At least one node is required")
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="At least one node is required")
         nodes = await self.nodes.list_by_ids(requested_ids)
         nodes_by_id = {node.id: node for node in nodes}
         if len(nodes) != len(requested_ids) or any(
@@ -154,13 +156,15 @@ class ShareService:
         await self.shares.increment_view(share)
 
     async def record_download(self, share: ShareRecord) -> None:
-        await self.shares.increment_download(share)
+        if not await self.shares.increment_download(share):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Share download limit reached")
 
     async def _require_valid_share(self, share_id: str) -> ShareRecord:
         share = await self.shares.get_by_id(share_id)
         if share is None or not share.is_active:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Share not found")
-        if share.expires_at is not None and share.expires_at < datetime.now(UTC):
+        expires_at = self._utc_expiry(share.expires_at)
+        if expires_at is not None and expires_at < datetime.now(UTC):
             share.is_active = False
             await self.session.flush()
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Share expired")
@@ -179,26 +183,42 @@ class ShareService:
         return hmac.compare_digest(digest, expected)
 
     def _issue_access_token(self, share: ShareRecord) -> str:
-        payload = f"{share.id}:{share.node_id}:{int(datetime.now(UTC).timestamp())}"
+        grant = self._access_grant(share)
+        payload = f"{share.id}:{share.node_id}:{int(datetime.now(UTC).timestamp())}:{grant}"
         signature = hmac.new(self.share_signing_key, payload.encode(), hashlib.sha256).hexdigest()
         return f"{payload}:{signature}"
 
     def verify_access_token(self, share: ShareRecord, token: str) -> bool:
         parts = token.split(":")
-        if len(parts) != 4:
+        if len(parts) != 5:
             return False
-        share_id, node_id_str, ts_str, provided_sig = parts
+        share_id, node_id_str, ts_str, grant, provided_sig = parts
         if share_id != share.id or node_id_str != str(share.node_id):
+            return False
+        if not hmac.compare_digest(grant, self._access_grant(share)):
             return False
         try:
             ts = int(ts_str)
         except ValueError:
             return False
         issued_at = datetime.fromtimestamp(ts, UTC)
-        if issued_at > datetime.now(UTC) + timedelta(minutes=5):
+        now = datetime.now(UTC)
+        if issued_at > now + timedelta(minutes=5) or now - issued_at > self.access_token_ttl:
             return False
-        if share.expires_at is not None and issued_at > share.expires_at:
+        expires_at = self._utc_expiry(share.expires_at)
+        if expires_at is not None and issued_at > expires_at:
             return False
-        payload = f"{share_id}:{node_id_str}:{ts_str}"
+        payload = f"{share_id}:{node_id_str}:{ts_str}:{grant}"
         expected_sig = hmac.new(self.share_signing_key, payload.encode(), hashlib.sha256).hexdigest()
         return hmac.compare_digest(provided_sig, expected_sig)
+
+    @staticmethod
+    def _access_grant(share: ShareRecord) -> str:
+        value = f"{share.access.value}:{share.password_hash or ''}"
+        return hashlib.sha256(value.encode()).hexdigest()[:24]
+
+    @staticmethod
+    def _utc_expiry(value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)

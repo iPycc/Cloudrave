@@ -8,6 +8,8 @@ from pydantic import Field, field_validator
 
 from app.models.enums import UploadMode, UploadState
 from app.schemas.common import CloudraveSchema
+from app.schemas.name import valid_name
+from app.storage.limits import MAX_OBJECT_SIZE, MAX_PART_SIZE
 from app.storage.types import normalize_object_key
 
 
@@ -18,10 +20,15 @@ class UploadSessionCreate(CloudraveSchema):
     relative_path: str | None = Field(default=None, max_length=2048)
     checksum: str | None = Field(default=None, max_length=128)
     object_key: str | None = None
-    mode: UploadMode = UploadMode.MULTIPART
-    size: int = Field(ge=0)
-    part_size: int | None = Field(default=None, ge=1)
+    mode: UploadMode = UploadMode.AUTO
+    size: int = Field(ge=0, le=MAX_OBJECT_SIZE)
+    part_size: int | None = Field(default=None, ge=1, le=MAX_PART_SIZE)
     content_type: str | None = Field(default=None, max_length=255)
+
+    @field_validator("file_name")
+    @classmethod
+    def validate_file_name(cls, value: str) -> str:
+        return valid_name(value)
 
     @field_validator("object_key")
     @classmethod
@@ -36,11 +43,12 @@ class UploadSessionCreate(CloudraveSchema):
         if value is None:
             return None
         normalized = value.replace("\\", "/").strip("/")
-        # Reject path traversal attempts
-        for segment in normalized.split("/"):
-            if segment in {"..", "."}:
-                raise ValueError("Invalid relative path segment")
-        return normalized or None
+        if not normalized:
+            return None
+        segments = normalized.split("/")
+        if any(not segment for segment in segments):
+            raise ValueError("Invalid empty relative path segment")
+        return "/".join(valid_name(segment) for segment in segments)
 
 
 class UploadPartPlan(CloudraveSchema):
@@ -57,6 +65,7 @@ class UploadSessionPlan(CloudraveSchema):
     upload_id: str | None = None
     object_key: str
     part_size: int
+    part_count: int = 1
     upload_urls: list[UploadPartPlan] = Field(default_factory=list)
     expires_at: datetime | None = None
     is_duplicate: bool = False
@@ -87,6 +96,7 @@ class UploadSessionRead(CloudraveSchema):
     upload_id: str | None
     file_name: str
     content_type: str | None
+    checksum: str | None = None
     size: int
     part_size: int
     created_at: datetime

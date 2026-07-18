@@ -5,7 +5,7 @@ from __future__ import annotations
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.tables import AuditLog
+from app.models.tables import AuditLog, User
 
 
 class AuditLogRepository:
@@ -54,3 +54,19 @@ class AuditLogRepository:
         )
         result = await self.session.scalars(stmt)
         return list(result)
+
+    async def list_node_events(
+        self,
+        node_id: int,
+        *,
+        limit: int = 100,
+    ) -> list[tuple[AuditLog, User | None]]:
+        stmt = (
+            select(AuditLog, User)
+            .outerjoin(User, User.id == AuditLog.actor_id)
+            .where(AuditLog.target == f"node:{node_id}")
+            .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+            .limit(limit)
+        )
+        rows = await self.session.execute(stmt)
+        return [(log, user) for log, user in rows.all()]

@@ -23,7 +23,7 @@ class StoragePolicyBase(CloudraveSchema):
     status: str = Field(default="active", max_length=32)
     description: str | None = Field(default=None, max_length=512)
     multipart_threshold_mb: int = Field(default=64, ge=1)
-    part_size_mb: int = Field(default=16, ge=1)
+    part_size_mb: int = Field(default=16, ge=1, le=5120)
     presign_ttl_seconds: int = Field(default=900, ge=60)
     is_default: bool = False
     cors_auto_configured: bool = False
@@ -51,7 +51,7 @@ class StoragePolicyUpdate(CloudraveSchema):
     status: str | None = Field(default=None, max_length=32)
     description: str | None = Field(default=None, max_length=512)
     multipart_threshold_mb: int | None = Field(default=None, ge=1)
-    part_size_mb: int | None = Field(default=None, ge=1)
+    part_size_mb: int | None = Field(default=None, ge=1, le=5120)
     presign_ttl_seconds: int | None = Field(default=None, ge=60)
     is_default: bool | None = None
     cors_auto_configured: bool | None = None

@@ -1,0 +1,9 @@
+"""Provider-safe transfer size limits."""
+
+MIB = 1024 * 1024
+GIB = 1024 * MIB
+
+MAX_PARTS = 10_000
+MAX_PART_SIZE = 5 * GIB
+MAX_SINGLE_PUT = 5 * GIB
+MAX_OBJECT_SIZE = MAX_PART_SIZE * MAX_PARTS

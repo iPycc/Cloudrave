@@ -43,6 +43,8 @@ from app.schemas.preview import (
 from app.security.jwt import AuthError, TokenService
 from app.services.explorer.download import DownloadFileService
 from app.storage.manager import StorageManager
+from app.storage.call import call_adapter
+from app.storage.key import managed_key
 from app.storage_adapters.local_fs import LocalFsAdapter
 
 
@@ -72,6 +74,7 @@ _media_tasks: set[asyncio.Task[None]] = set()
 _derivative_semaphore = asyncio.Semaphore(4)
 _media_job_semaphore = asyncio.Semaphore(2)
 MEDIA_MARKER_STALE_SECONDS = 120
+SEEKABLE_MAX_BYTES = 512 * 1024 * 1024
 
 
 def preview_kind(name: str) -> str:
@@ -399,6 +402,21 @@ class PreviewService:
                         await asyncio.to_thread(self._generate_image_variant, node, mount, policy, target, IMAGE_VARIANTS[variant])
         return target, f"{Path(node.name).stem}-{variant}.webp"
 
+    async def archive_entry(self, actor: User, node_id: int, entry_path: str) -> tuple[bytes, str, str]:
+        node, mount, policy = await self.resolver.resolve(actor, node_id)
+        if preview_kind(node.name) != "archive":
+            raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="File is not an archive")
+        normalized = entry_path.replace("\\", "/").lstrip("/")
+        if not normalized or any(part in {"", ".", ".."} for part in normalized.split("/")):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid archive entry path")
+        try:
+            payload = await asyncio.to_thread(self._read_archive_entry, node, mount, policy, normalized)
+        except KeyError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Archive entry not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail=str(exc)) from exc
+        return payload, Path(normalized).name, mimetypes.guess_type(normalized)[0] or "application/octet-stream"
+
     async def dzi_descriptor(self, actor: User, node_id: int) -> str:
         node, mount, policy = await self.resolver.resolve(actor, node_id)
         metadata = await self._cached_json(
@@ -549,6 +567,8 @@ class PreviewService:
         if_match: str | None,
     ) -> TextContentUpdateRead:
         node, mount, policy = await self.resolver.resolve(actor, node_id)
+        if mount.read_only:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bucket mount is read-only")
         if preview_kind(node.name) != "text":
             raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="File is not editable text")
         locked_node = await self.nodes.get_by_id_for_update(node.id)
@@ -562,28 +582,58 @@ class PreviewService:
             raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="File changed since it was opened")
         payload = content.encode("utf-8")
         if len(payload) > self.text_max_bytes:
-            raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Text file exceeds the online editing limit")
+            raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail="Text file exceeds the online editing limit")
         record = await self.objects.get_by_node_id(node.id)
         content_type = (record.content_type if record else None) or "text/plain; charset=utf-8"
         adapter = self.storage_manager.get_adapter(policy)
-        await asyncio.to_thread(
-            adapter.put_object,
+        if not node.blob_path:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="File has no storage object")
+        current_blob = node.blob_path
+        current_physical = (record.physical_id if record else None) or adapter.physical_id(
             policy,
             mount,
-            node.blob_path,
+            current_blob,
+        )
+        references = await self.objects.count_physical_references(
+            physical_id=current_physical,
+            policy_id=policy.id,
+            mount_id=mount.id,
+            blob_path=current_blob,
+        )
+        target_blob = (
+            managed_key(
+                actor.id,
+                node.name,
+                style=str((mount.extra or {}).get("object_key_style", "readable")),
+            )
+            if references > 1
+            else current_blob
+        )
+        extra = dict(record.extra if record else {})
+        if target_blob != current_blob:
+            extra["origin"] = "managed_edit"
+        await call_adapter(
+            adapter,
+            "put_object",
+            policy,
+            mount,
+            target_blob,
             payload,
             mime_type=content_type,
-            metadata=(record.extra if record else None),
+            metadata=extra,
         )
         checksum = hashlib.sha256(payload).hexdigest()
+        node.blob_path = target_blob
         await self.nodes.update_file_metadata(node, size=len(payload))
         await self.objects.create_or_update(
             node_id=node.id,
             policy_id=policy.id,
-            blob_path=node.blob_path,
+            blob_path=target_blob,
+            physical_id=adapter.physical_id(policy, mount, target_blob),
+            revive_physical=True,
             checksum=checksum,
             content_type=content_type,
-            extra=(record.extra if record else None),
+            extra=extra,
         )
         await self.audits.create(
             actor_id=actor.id,
@@ -637,6 +687,8 @@ class PreviewService:
         return adapter.build_download_url(policy, mount, node.blob_path, expires_in=expires_in).url
 
     def _open_seekable(self, node: Node, mount: BucketMount, policy: StoragePolicy) -> BinaryIO:
+        if node.size > SEEKABLE_MAX_BYTES:
+            raise OSError("File is too large for seekable server-side preview metadata")
         adapter = self.storage_manager.get_adapter(policy)
         stream = adapter.open_object(policy, mount, node.blob_path)
         if getattr(stream, "seekable", lambda: False)():
@@ -1035,6 +1087,37 @@ class PreviewService:
                             break
                         entries.append({"name": item.name, "size": item.size, "directory": item.isdir()})
         return entries
+
+    def _read_archive_entry(
+        self,
+        node: Node,
+        mount: BucketMount,
+        policy: StoragePolicy,
+        entry_path: str,
+    ) -> bytes:
+        max_entry_bytes = 32 * 1024 * 1024
+        extension = Path(node.name).suffix.lower().lstrip(".")
+        with self._open_seekable(node, mount, policy) as stream:
+            if extension == "zip":
+                with zipfile.ZipFile(stream) as archive:
+                    info = archive.getinfo(entry_path)
+                    if info.is_dir():
+                        raise KeyError(entry_path)
+                    if info.file_size > max_entry_bytes:
+                        raise ValueError("Archive entry is too large for online preview")
+                    if info.compress_size and info.file_size / info.compress_size > 200:
+                        raise ValueError("Archive entry compression ratio is unsafe")
+                    return archive.read(info)
+            with tarfile.open(fileobj=stream, mode="r:*") as archive:
+                info = archive.getmember(entry_path)
+                if not info.isfile():
+                    raise KeyError(entry_path)
+                if info.size > max_entry_bytes:
+                    raise ValueError("Archive entry is too large for online preview")
+                extracted = archive.extractfile(info)
+                if extracted is None:
+                    raise KeyError(entry_path)
+                return extracted.read(max_entry_bytes + 1)
 
     def _media_dir(self, node: Node, version: str) -> Path:
         return self.cache_root / "media" / str(node.id) / version

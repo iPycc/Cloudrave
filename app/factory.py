@@ -12,7 +12,6 @@ from app.api.v1 import router as v1_router
 from app.dep import Dep
 from app.exception_handlers import install_exception_handlers
 from app.middleware.logging import LoggingMiddleware
-from app.middleware.rate_limit import RateLimitMiddleware
 from app.middleware.request_id import RequestIdMiddleware
 from app.middleware.security_headers import SecurityHeadersMiddleware
 from config import CloudraveConfig
@@ -79,9 +78,8 @@ def create_app(config: CloudraveConfig) -> FastAPI:
     dep = Dep(config)
     app.state.dep = dep
 
-    # Added from inner to outer. Keep request ids and access logging around every
-    # response, including middleware short-circuits such as rate limiting.
-    app.add_middleware(RateLimitMiddleware)
+    # Added from inner to outer. Authentication endpoints retain their focused
+    # anti-brute-force dependency; ordinary API traffic is not globally capped.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(config.app.cors_origins),
@@ -91,6 +89,7 @@ def create_app(config: CloudraveConfig) -> FastAPI:
             "Authorization",
             "Content-Type",
             "X-Request-ID",
+            "X-Device-Fingerprint",
             "X-Cloudrave-Local-Write",
             "X-Cloudrave-Local-Part",
             "If-Match",

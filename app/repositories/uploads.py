@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.enums import UploadMode, UploadState
@@ -26,6 +26,7 @@ class UploadRepository:
         content_type: str | None,
         size: int,
         part_size: int,
+        checksum: str | None = None,
         state: UploadState = UploadState.CREATED,
     ) -> UploadSessionRecord:
         record = UploadSessionRecord(
@@ -38,6 +39,7 @@ class UploadRepository:
             upload_id=upload_id,
             file_name=file_name,
             content_type=content_type,
+            checksum=checksum,
             size=size,
             part_size=part_size,
         )
@@ -84,6 +86,27 @@ class UploadRepository:
         record.state = state
         await self.session.flush()
         return record
+
+    async def transition_state(
+        self,
+        upload_session_id: str,
+        *,
+        expected: tuple[UploadState, ...],
+        target: UploadState,
+    ) -> bool:
+        """Claim a state transition atomically across application instances."""
+
+        result = await self.session.execute(
+            update(UploadSessionRecord)
+            .where(
+                UploadSessionRecord.id == upload_session_id,
+                UploadSessionRecord.state.in_(expected),
+            )
+            .values(state=target)
+            .execution_options(synchronize_session=False)
+        )
+        await self.session.flush()
+        return result.rowcount == 1
 
     async def bind_node(self, upload_session_id: str, node_id: int) -> UploadSessionRecord | None:
         record = await self.get_session(upload_session_id)

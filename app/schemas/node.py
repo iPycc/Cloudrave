@@ -5,10 +5,11 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from app.models.enums import NodeStatus, NodeType
 from app.schemas.common import CloudraveSchema
+from app.schemas.name import valid_name
 
 
 class NodeRead(CloudraveSchema):
@@ -40,10 +41,22 @@ class NodeSearchResult(CloudraveSchema):
     parent_path: str
 
 
+class NodeActivityRead(CloudraveSchema):
+    id: int
+    action: str
+    actor_id: int | None = None
+    actor_name: str
+    actor_avatar: str | None = None
+    detail: str | None = None
+    created_at: datetime
+
+
 class FolderCreateRequest(CloudraveSchema):
     mount_id: int
     parent_id: int | None = None
     name: str = Field(min_length=1, max_length=255)
+
+    _valid_name = field_validator("name")(valid_name)
 
 
 class FileCreateRequest(CloudraveSchema):
@@ -51,9 +64,13 @@ class FileCreateRequest(CloudraveSchema):
     parent_id: int | None = None
     name: str = Field(min_length=1, max_length=255)
 
+    _valid_name = field_validator("name")(valid_name)
+
 
 class NodeRenameRequest(CloudraveSchema):
     name: str = Field(min_length=1, max_length=255)
+
+    _valid_name = field_validator("name")(valid_name)
 
 
 class NodeMoveRequest(CloudraveSchema):

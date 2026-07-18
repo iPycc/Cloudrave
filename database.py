@@ -8,7 +8,7 @@ from pathlib import Path
 import secrets
 import string
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import BigInteger, create_engine, event, inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
@@ -35,7 +35,17 @@ def make_async_engine(config: CloudraveConfig) -> AsyncEngine:
             pool_pre_ping=config.database.pool_pre_ping,
             pool_recycle=config.database.pool_recycle,
         )
-    return create_async_engine(config.database.url, **engine_kwargs)
+    engine = create_async_engine(config.database.url, **engine_kwargs)
+    if config.database.backend == "sqlite":
+        @event.listens_for(engine.sync_engine, "connect")
+        def _sqlite_pragmas(dbapi_connection, _connection_record) -> None:
+            cursor = dbapi_connection.cursor()
+            try:
+                cursor.execute("PRAGMA foreign_keys=ON")
+                cursor.execute("PRAGMA busy_timeout=5000")
+            finally:
+                cursor.close()
+    return engine
 
 
 def make_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
@@ -117,8 +127,15 @@ def _apply_runtime_migrations(connection) -> None:
     Base.metadata.create_all(connection, checkfirst=True)
     inspector = inspect(connection)
     tables = set(inspector.get_table_names())
+    _migrate_large_sizes(connection, inspector, tables)
     if "users" in tables:
         _migrate_users_table(connection, inspector)
+    if "objects" in tables:
+        _migrate_objects_table(connection, inspector)
+    if "upload_sessions" in tables:
+        _migrate_uploads_table(connection, inspector)
+    if "share_mounts" in tables:
+        _migrate_shared_table(connection, inspector)
 
 
 def _migrate_users_table(connection, inspector) -> None:
@@ -175,6 +192,56 @@ def _migrate_users_table(connection, inspector) -> None:
     indexes = {index["name"] for index in inspector.get_indexes("users")}
     if "ix_users_uid" not in indexes:
         connection.execute(text("CREATE UNIQUE INDEX ix_users_uid ON users (uid)"))
+
+
+def _migrate_large_sizes(connection, inspector, tables: set[str]) -> None:
+    dialect = connection.dialect.name
+    if dialect == "sqlite":
+        return  # SQLite INTEGER already stores signed 64-bit values.
+    targets = {
+        "bucket_mounts": {"quota_bytes": True},
+        "nodes": {"size": False},
+        "upload_sessions": {"size": False, "part_size": False},
+        "upload_parts": {"size": False},
+    }
+    for table, columns in targets.items():
+        if table not in tables:
+            continue
+        existing = {column["name"]: column for column in inspector.get_columns(table)}
+        for name, nullable in columns.items():
+            column = existing.get(name)
+            if column is None or isinstance(column["type"], BigInteger):
+                continue
+            if dialect == "postgresql":
+                statement = f"ALTER TABLE {table} ALTER COLUMN {name} TYPE BIGINT"
+            elif dialect == "mysql":
+                statement = f"ALTER TABLE {table} MODIFY COLUMN {name} BIGINT {'NULL' if nullable else 'NOT NULL'}"
+            else:
+                continue
+            connection.execute(text(statement))
+
+
+def _migrate_objects_table(connection, inspector) -> None:
+    columns = {column["name"] for column in inspector.get_columns("objects")}
+    if "physical_id" not in columns:
+        connection.execute(text(f"ALTER TABLE objects ADD COLUMN physical_id {_varchar_type(connection.dialect.name, 64)}"))
+    indexes = {index["name"] for index in inspect(connection).get_indexes("objects")}
+    if "ix_objects_physical_id" not in indexes:
+        connection.execute(text("CREATE INDEX ix_objects_physical_id ON objects (physical_id)"))
+
+
+def _migrate_shared_table(connection, inspector) -> None:
+    columns = {column["name"] for column in inspector.get_columns("share_mounts")}
+    if "grant_hash" not in columns:
+        connection.execute(text(f"ALTER TABLE share_mounts ADD COLUMN grant_hash {_varchar_type(connection.dialect.name, 64)}"))
+
+
+def _migrate_uploads_table(connection, inspector) -> None:
+    columns = {column["name"] for column in inspector.get_columns("upload_sessions")}
+    if "checksum" not in columns:
+        connection.execute(
+            text(f"ALTER TABLE upload_sessions ADD COLUMN checksum {_varchar_type(connection.dialect.name, 128)}")
+        )
 
 
 def _varchar_type(dialect: str, length: int) -> str:

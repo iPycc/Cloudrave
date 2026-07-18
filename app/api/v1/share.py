@@ -5,7 +5,6 @@ from __future__ import annotations
 import mimetypes
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
-from fastapi.responses import RedirectResponse
 
 from app.middleware.auth_context import get_current_user
 from app.models.enums import StoragePolicyType
@@ -21,6 +20,7 @@ from app.schemas.share import (
 )
 from app.services.explorer.download import ArchiveDownloadService, DownloadFileService
 from app.services.explorer.preview import DERIVED_CACHE_CONTROL, PreviewService, build_local_preview_response
+from app.services.explorer.proxy import remote_response
 from app.services.explorer.share import ShareService
 from app.services.user.response import build_avatar_url
 from app.storage_adapters.local_fs import LocalFsAdapter
@@ -119,6 +119,7 @@ async def get_share_info(
             node_type=primary.type.value if primary else "",
             node_size=primary.size if primary else 0,
             owner_name=owner.username if owner else "Cloudrave 用户",
+            owner_uid=owner.uid if owner else "",
             owner_avatar=build_avatar_url(owner) if owner else None,
             folder_count=sum(node.type.value == "folder" for node in nodes),
             file_count=sum(node.type.value == "file" for node in nodes),
@@ -198,7 +199,7 @@ async def download_shared_file(
         else:
             requested_ids = [node.id for node in (await service.get_share_info(share_id))[1]]
         if len(requested_ids) > 100:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Too many nodes selected")
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Too many nodes selected")
         nodes = [await service.resolve_shared_node(share, requested_id) for requested_id in requested_ids]
 
         download_service = DownloadFileService(
@@ -210,7 +211,7 @@ async def download_shared_file(
         )
         if len(nodes) == 1 and nodes[0].type.value == "file":
             node, mount, policy = await download_service.resolve_shared(nodes[0].id)
-            response = download_service.build_file_stream(node, mount, policy)
+            response = await download_service.response(node, mount, policy)
         else:
             archive_service = ArchiveDownloadService(
                 mounts=dep.get_mount_repository(session),
@@ -262,8 +263,14 @@ async def preview_shared_file(
                 media_type=mimetypes.guess_type(node.name)[0] or "application/octet-stream",
                 cache_control="private, no-store",
             )
-        signed = adapter.build_download_url(policy, mount, node.blob_path)
-        return RedirectResponse(signed.url, headers={"Cache-Control": "private, no-store"})
+        return await remote_response(
+            request,
+            adapter=adapter,
+            policy=policy,
+            mount=mount,
+            object_key=node.blob_path,
+            filename=node.name,
+        )
 
 
 @router.get("/{share_id}/cover")

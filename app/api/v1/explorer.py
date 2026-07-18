@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Body, Depends, File, Form, Header, Query, Request, UploadFile
-from fastapi.responses import RedirectResponse, Response
+from fastapi.responses import Response
 
 from app.middleware.auth_context import get_current_user
 from app.models.enums import StoragePolicyType
@@ -19,6 +19,7 @@ from app.schemas.node import (
     FileCreateRequest,
     FolderCreateRequest,
     NodeCopyRequest,
+    NodeActivityRead,
     NodeDeleteRequest,
     NodeMoveRequest,
     NodeCategory,
@@ -30,6 +31,7 @@ from app.schemas.node import (
 )
 from app.schemas.upload import (
     UploadPartRead,
+    UploadPartPlan,
     UploadSessionAbortRequest,
     UploadSessionCompleteRequest,
     UploadSessionCreate,
@@ -37,10 +39,14 @@ from app.schemas.upload import (
     UploadSessionRead,
 )
 from app.schemas.preview import PreviewManifestRead, PreviewPrepareRead, TextContentUpdate, TextContentUpdateRead
+from app.schemas.task import ArchiveExtractRequest, BackgroundTaskRead
 from app.services.explorer.download import DownloadFileService
 from app.services.explorer.file import FileExplorerService
 from app.services.explorer.preview import DERIVED_CACHE_CONTROL, PreviewService, build_local_preview_response
+from app.services.explorer.source import content_disposition
+from app.services.explorer.proxy import remote_response
 from app.services.explorer.upload import CreateUploadSessionService
+from app.services.explorer.extract import list_tasks, start_extract
 from app.storage_adapters.local_fs import LocalFsAdapter
 from app.services.user.storage import UserStorageProvisionService
 
@@ -326,6 +332,47 @@ async def copy_nodes(
         return await service.copy_nodes(request, current_user, payload)
 
 
+@router.get("/node/{node_id}/activity", response_model=list[NodeActivityRead])
+async def list_node_activity(
+    node_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+) -> list[NodeActivityRead]:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = FileExplorerService(
+            session=session,
+            mounts=dep.get_mount_repository(session),
+            policies=dep.get_policy_repository(session),
+            nodes=dep.get_node_repository(session),
+            objects=dep.get_object_repository(session),
+            audits=dep.get_audit_repository(session),
+            storage_manager=dep.storage_manager,
+        )
+        return await service.list_activity(current_user, node_id)
+
+
+@router.post("/node/{node_id}/open", status_code=204)
+async def record_node_open(
+    node_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = FileExplorerService(
+            session=session,
+            mounts=dep.get_mount_repository(session),
+            policies=dep.get_policy_repository(session),
+            nodes=dep.get_node_repository(session),
+            objects=dep.get_object_repository(session),
+            audits=dep.get_audit_repository(session),
+            storage_manager=dep.storage_manager,
+        )
+        await service.record_open(request, current_user, node_id)
+    return Response(status_code=204)
+
+
 @router.post("/upload", response_model=UploadSessionPlan)
 async def create_upload_session(
     request: Request,
@@ -366,6 +413,28 @@ async def get_upload_session(
             storage_manager=dep.storage_manager,
         )
         return await service.get(current_user, session_id)
+
+
+@router.get("/upload/{session_id}/part/{part_number}/url", response_model=UploadPartPlan)
+async def get_upload_part_url(
+    session_id: str,
+    part_number: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+) -> UploadPartPlan:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = CreateUploadSessionService(
+            session=session,
+            mounts=dep.get_mount_repository(session),
+            policies=dep.get_policy_repository(session),
+            nodes=dep.get_node_repository(session),
+            objects=dep.get_object_repository(session),
+            uploads=dep.get_upload_repository(session),
+            audits=dep.get_audit_repository(session),
+            storage_manager=dep.storage_manager,
+        )
+        return await service.part_url(current_user, session_id, part_number)
 
 
 @router.post("/upload/{session_id}/part", response_model=UploadPartRead)
@@ -473,7 +542,7 @@ async def download_file(
             storage_manager=dep.storage_manager,
         )
         node, mount, policy = await service.resolve(current_user, node_id)
-        return service.build_file_stream(node, mount, policy)
+        return await service.response(node, mount, policy)
 
 
 @router.get("/download/folder/{node_id}")
@@ -524,10 +593,14 @@ async def preview_file(
                 filename=node.name,
                 media_type=content_type,
             )
-        signed = adapter.build_download_url(policy, mount, node.blob_path)
-        return RedirectResponse(
-            signed.url,
-            headers={"Cache-Control": "private, max-age=30"},
+        return await remote_response(
+            request,
+            adapter=adapter,
+            policy=policy,
+            mount=mount,
+            object_key=node.blob_path,
+            filename=node.name,
+            cache_control="private, max-age=30",
         )
 
 
@@ -540,6 +613,53 @@ async def preview_manifest(
     dep = request.app.state.dep
     async with dep.session_scope() as session:
         return await _build_preview_service(dep, session).manifest(request, current_user, node_id)
+
+
+@router.post("/archive/{node_id}/extract", response_model=BackgroundTaskRead, status_code=202)
+async def extract_archive(
+    node_id: int,
+    request: Request,
+    payload: ArchiveExtractRequest = Body(...),
+    current_user: User = Depends(get_current_user),
+) -> BackgroundTaskRead:
+    return await start_extract(
+        request.app.state.dep,
+        current_user.id,
+        node_id,
+        payload.target_parent_id,
+    )
+
+
+@router.get("/task", response_model=list[BackgroundTaskRead])
+async def list_background_tasks(
+    current_user: User = Depends(get_current_user),
+) -> list[BackgroundTaskRead]:
+    return list_tasks(current_user.id)
+
+
+@router.get("/preview/{node_id}/archive/entry")
+async def preview_archive_entry(
+    node_id: int,
+    path: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        payload, filename, media_type = await _build_preview_service(dep, session).archive_entry(
+            current_user,
+            node_id,
+            path,
+        )
+    return Response(
+        payload,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": content_disposition(filename, inline=True),
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @router.get("/preview/{node_id}/image/{variant}", name="preview_image_asset")
@@ -712,6 +832,11 @@ async def office_source(node_id: int, token: str, request: Request):
                 media_type=media_type,
                 cache_control="private, no-store",
             )
-        adapter = dep.storage_manager.get_adapter(policy)
-        signed = adapter.build_download_url(policy, mount, node.blob_path, expires_in=dep.config.app.office_source_ttl_seconds)
-        return RedirectResponse(signed.url, headers={"Cache-Control": "private, no-store"})
+        return await remote_response(
+            request,
+            adapter=dep.storage_manager.get_adapter(policy),
+            policy=policy,
+            mount=mount,
+            object_key=node.blob_path,
+            filename=node.name,
+        )

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import binascii
 import hashlib
@@ -10,7 +9,6 @@ import logging
 import re
 from collections import deque
 from pathlib import Path
-from uuid import uuid4
 
 from fastapi import HTTPException, Request, status
 from fastapi.responses import StreamingResponse
@@ -24,11 +22,12 @@ from app.repositories.mounts import BucketMountRepository
 from app.repositories.nodes import NodeRepository
 from app.repositories.objects import ObjectRepository
 from app.repositories.policies import StoragePolicyRepository
-from app.schemas.mount import BucketMountRead
+from app.schemas.mount import BucketMountRead, mount_read
 from app.schemas.node import (
     FileCreateRequest,
     FolderCreateRequest,
     NodeCopyRequest,
+    NodeActivityRead,
     NodeDeleteRequest,
     NodeMoveRequest,
     NodePageRead,
@@ -36,7 +35,11 @@ from app.schemas.node import (
     NodeRenameRequest,
     NodeSearchResult,
 )
-from app.services.explorer.download import ArchiveDownloadService
+from app.services.explorer.archive import ArchiveDownloadService
+from app.services.explorer.gc import ObjectGc
+from app.services.user.response import build_avatar_url
+from app.storage.call import call_adapter
+from app.storage.key import managed_key
 from app.storage.manager import StorageManager
 from logging_config import LogOperation, LogOutcome
 
@@ -83,7 +86,11 @@ class FileExplorerService:
 
     async def list_mounts(self, actor: User) -> list[BucketMountRead]:
         mounts = await self.mounts.list_for_owner(actor.id)
-        return [BucketMountRead.model_validate(mount) for mount in mounts]
+        policies = {
+            policy.id: policy
+            for policy in await self.policies.list_by_ids([mount.policy_id for mount in mounts])
+        }
+        return [mount_read(mount, policies.get(mount.policy_id)) for mount in mounts]
 
     async def list_children(self, actor: User, mount_id: int, parent_id: int | None = None) -> list[NodeRead]:
         mount, _policy = await self._require_mount_access(actor, mount_id)
@@ -183,8 +190,36 @@ class FileExplorerService:
 
         return results
 
+    async def list_activity(self, actor: User, node_id: int) -> list[NodeActivityRead]:
+        await self._require_node_access(actor, node_id)
+        rows = await self.audits.list_node_events(node_id)
+        return [
+            NodeActivityRead(
+                id=log.id,
+                action=log.action,
+                actor_id=log.actor_id,
+                actor_name=user.username if user is not None else "系统",
+                actor_avatar=build_avatar_url(user) if user is not None else None,
+                detail=log.detail,
+                created_at=log.created_at,
+            )
+            for log, user in rows
+        ]
+
+    async def record_open(self, request: Request, actor: User, node_id: int) -> None:
+        node = await self._require_node_access(actor, node_id)
+        await self.audits.create(
+            actor_id=actor.id,
+            action="file.open",
+            target=f"node:{node.id}",
+            detail=node.name,
+            ip=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            request_id=getattr(request.state, "request_id", None),
+        )
+
     async def create_folder(self, request: Request, actor: User, payload: FolderCreateRequest) -> NodeRead:
-        mount, _policy = await self._require_mount_access(actor, payload.mount_id)
+        mount, _policy = await self._require_mount_write(actor, payload.mount_id)
         parent = None
         if payload.parent_id is not None:
             parent = await self.nodes.get_by_id(payload.parent_id)
@@ -233,7 +268,7 @@ class FileExplorerService:
         return NodeRead.model_validate(node)
 
     async def create_file(self, request: Request, actor: User, payload: FileCreateRequest) -> NodeRead:
-        mount, policy = await self._require_mount_access(actor, payload.mount_id)
+        mount, policy = await self._require_mount_write(actor, payload.mount_id)
         parent = await self._resolve_parent_folder(mount, payload.parent_id)
         requested_name = payload.name.strip()
         if "/" in requested_name or "\\" in requested_name or requested_name in {".", ".."}:
@@ -257,9 +292,11 @@ class FileExplorerService:
                 counter += 1
             file_name = f"{base} ({counter}){suffix}"
 
-        parent_path = await self._build_parent_relative_path(mount, parent)
-        storage_name = f"{uuid4().hex}-{file_name}"
-        object_key = self.storage_manager.build_object_key(mount, storage_name, parent_path)
+        object_key = managed_key(
+            actor.id,
+            file_name,
+            style=str((mount.extra or {}).get("object_key_style", "readable")),
+        )
         content_type = "text/markdown; charset=utf-8" if extension in {".md", ".markdown"} else "text/plain; charset=utf-8"
         adapter = self.storage_manager.get_adapter(policy)
 
@@ -269,13 +306,14 @@ class FileExplorerService:
             if not object_written:
                 return
             try:
-                await asyncio.to_thread(adapter.delete_object, policy, mount, object_key, hard_delete=True)
+                await call_adapter(adapter, "delete_object", policy, mount, object_key, hard_delete=True)
             except Exception:
                 LOGGER.exception("Failed to clean up object after text file creation failed", extra={"object_key": object_key})
 
         try:
-            await asyncio.to_thread(
-                adapter.put_object,
+            await call_adapter(
+                adapter,
+                "put_object",
                 policy,
                 mount,
                 object_key,
@@ -295,8 +333,11 @@ class FileExplorerService:
                 node_id=node.id,
                 policy_id=policy.id,
                 blob_path=object_key,
+                physical_id=adapter.physical_id(policy, mount, object_key),
+                revive_physical=True,
                 checksum=hashlib.sha256(b"").hexdigest(),
                 content_type=content_type,
+                extra={"origin": "managed_create"},
             )
             await self.audits.create(
                 actor_id=actor.id,
@@ -328,6 +369,7 @@ class FileExplorerService:
 
     async def rename_node(self, request: Request, actor: User, node_id: int, payload: NodeRenameRequest) -> NodeRead:
         node = await self._require_node_access(actor, node_id)
+        await self._require_mount_write(actor, node.mount_id)
         updated = await self.nodes.rename(node, payload.name)
         await self.audits.create(
             actor_id=actor.id,
@@ -342,31 +384,18 @@ class FileExplorerService:
 
     async def delete_nodes(self, request: Request, actor: User, payload: NodeDeleteRequest) -> dict[str, list[int] | list[NodeRead]]:
         nodes = [await self._require_node_access(actor, node_id) for node_id in payload.node_ids]
-        _ = nodes
+        for mount_id in {node.mount_id for node in nodes}:
+            await self._require_mount_write(actor, mount_id)
         if payload.hard_delete:
             all_ids = await self.nodes.collect_descendant_ids(payload.node_ids)
-            descendants = await self.nodes.list_by_ids(all_ids)
-
-            file_nodes = [node for node in descendants if node.type == NodeType.FILE and node.blob_path]
-            mount_ids = {node.mount_id for node in file_nodes}
-            mounts = {mount.id: mount for mount in await self.mounts.list_by_ids(list(mount_ids))}
-            policy_ids = {mount.policy_id for mount in mounts.values()}
-            policies = {policy.id: policy for policy in await self.policies.list_by_ids(list(policy_ids))}
-
-            async def _delete_one(node: Node) -> None:
-                mount = mounts.get(node.mount_id)
-                if mount is None:
-                    return
-                policy = policies.get(mount.policy_id)
-                if policy is None:
-                    return
-                adapter = self.storage_manager.get_adapter(policy)
-                # Local filesystem IO can block the event loop; run it in a thread.
-                await asyncio.to_thread(adapter.delete_object, policy, mount, node.blob_path, hard_delete=True)
-
-            if file_nodes:
-                await asyncio.gather(*(_delete_one(node) for node in file_nodes))
-
+            gc = ObjectGc(
+                mounts=self.mounts,
+                nodes=self.nodes,
+                policies=self.policies,
+                objects=self.objects,
+                storage_manager=self.storage_manager,
+            )
+            task_ids = await gc.stage(all_ids)
             await self.objects.delete_by_node_ids(all_ids)
             await self.nodes.hard_delete(payload.node_ids)
             await self.audits.create(
@@ -391,6 +420,9 @@ class FileExplorerService:
                     "actor": actor.email,
                 },
             )
+            await self.session.commit()
+            await gc.run(task_ids)
+            await self.session.commit()
             return {"deleted_node_ids": all_ids}
 
         deleted = await self.nodes.soft_delete(payload.node_ids)
@@ -422,10 +454,15 @@ class FileExplorerService:
         if not nodes:
             return []
         mount_id = nodes[0].mount_id
-        mount, _policy = await self._require_mount_access(actor, mount_id)
+        mount, policy = await self._require_mount_write(actor, mount_id)
+        if any(node.mount_id != mount_id for node in nodes):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="All moved nodes must belong to one mount")
 
         target_parent_id = payload.target_parent_id
-        if target_parent_id is not None:
+        if target_parent_id is None:
+            target = await self.nodes.ensure_mount_root(owner_id=mount.owner_id, mount_id=mount.id, name=mount.name)
+            target_parent_id = target.id
+        else:
             target = await self.nodes.get_by_id(target_parent_id)
             if target is None or target.mount_id != mount_id or target.type != NodeType.FOLDER:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target folder not found")
@@ -460,32 +497,46 @@ class FileExplorerService:
         if not nodes:
             return []
         mount_id = nodes[0].mount_id
-        mount, _policy = await self._require_mount_access(actor, mount_id)
+        mount, _policy = await self._require_mount_write(actor, mount_id)
+        if any(node.mount_id != mount_id for node in nodes):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="All copied nodes must belong to one mount")
 
         target_parent_id = payload.target_parent_id
-        if target_parent_id is not None:
+        if target_parent_id is None:
+            target = await self.nodes.ensure_mount_root(owner_id=mount.owner_id, mount_id=mount.id, name=mount.name)
+            target_parent_id = target.id
+        else:
             target = await self.nodes.get_by_id(target_parent_id)
             if target is None or target.mount_id != mount_id or target.type != NodeType.FOLDER:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target folder not found")
 
         copied: list[NodeRead] = []
         id_map: dict[int, int] = {}
-        source_object_ids = [node.id for node in nodes if node.type == NodeType.FILE and node.blob_path]
+        source_ids = await self.nodes.collect_descendant_ids([node.id for node in nodes])
+        source_object_ids = [node.id for node in await self.nodes.list_by_ids(source_ids) if node.type == NodeType.FILE and node.blob_path]
         source_objects = {obj.node_id: obj for obj in await self.objects.get_by_node_ids(source_object_ids)}
+        adapter = self.storage_manager.get_adapter(policy)
 
         for node in nodes:
             new_node = await self.nodes.copy_subtree(node, target_parent_id, owner_id=actor.id, id_map=id_map)
             copied.append(NodeRead.model_validate(new_node))
-            if node.type == NodeType.FILE and node.id in source_objects:
-                source_obj = source_objects[node.id]
-                await self.objects.create_or_update(
-                    node_id=new_node.id,
-                    policy_id=source_obj.policy_id,
-                    blob_path=source_obj.blob_path,
-                    checksum=source_obj.checksum,
-                    content_type=source_obj.content_type,
-                    extra=source_obj.extra,
-                )
+
+        for source_id, copied_id in id_map.items():
+            source_obj = source_objects.get(source_id)
+            if source_obj is None:
+                continue
+            await self.objects.create_or_update(
+                node_id=copied_id,
+                policy_id=source_obj.policy_id,
+                blob_path=source_obj.blob_path,
+                physical_id=(
+                    source_obj.physical_id
+                    or adapter.physical_id(policy, mount, source_obj.blob_path)
+                ),
+                checksum=source_obj.checksum,
+                content_type=source_obj.content_type,
+                extra=source_obj.extra,
+            )
 
         await self.audits.create(
             actor_id=actor.id,
@@ -540,6 +591,14 @@ class FileExplorerService:
         policy = await self.policies.get_by_id(mount.policy_id)
         if policy is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Storage policy not found")
+        return mount, policy
+
+    async def _require_mount_write(self, actor: User, mount_id: int) -> tuple[BucketMount, StoragePolicy]:
+        mount, policy = await self._require_mount_access(actor, mount_id)
+        if not mount.is_enabled or mount.read_only:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bucket mount is read-only")
+        if policy.status != "active":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Storage policy is inactive")
         return mount, policy
 
     async def _resolve_parent_folder(self, mount: BucketMount, parent_id: int | None) -> Node:

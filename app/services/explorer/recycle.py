@@ -5,7 +5,6 @@ from __future__ import annotations
 from fastapi import HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.enums import NodeType
 from app.models.tables import User
 from app.repositories.audit_logs import AuditLogRepository
 from app.repositories.mounts import BucketMountRepository
@@ -13,6 +12,7 @@ from app.repositories.nodes import NodeRepository
 from app.repositories.objects import ObjectRepository
 from app.repositories.policies import StoragePolicyRepository
 from app.schemas.node import NodeDeleteRequest, NodeRead, NodeRestoreRequest
+from app.services.explorer.gc import ObjectGc
 from app.storage.manager import StorageManager
 
 
@@ -47,6 +47,7 @@ class RecycleBinService:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
             if node.owner_id != actor.id:
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Node access denied")
+            await self._require_write(node.mount_id)
         restored = await self.nodes.restore(payload.node_ids)
         await self.audits.create(
             actor_id=actor.id,
@@ -68,18 +69,16 @@ class RecycleBinService:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
             if node.owner_id != actor.id:
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Node access denied")
+            await self._require_write(node.mount_id)
         deleted_ids = await self.nodes.collect_descendant_ids(payload.node_ids)
-        descendants = await self.nodes.list_by_ids(deleted_ids)
-        for node in descendants:
-            if node.type != NodeType.FILE or not node.blob_path:
-                continue
-            mount = await self.mounts.get_by_id(node.mount_id)
-            if mount is None:
-                continue
-            policy = await self.policies.get_by_id(mount.policy_id)
-            if policy is None:
-                continue
-            self.storage_manager.get_adapter(policy).delete_object(policy, mount, node.blob_path, hard_delete=True)
+        gc = ObjectGc(
+            mounts=self.mounts,
+            nodes=self.nodes,
+            policies=self.policies,
+            objects=self.objects,
+            storage_manager=self.storage_manager,
+        )
+        task_ids = await gc.stage(deleted_ids)
         await self.objects.delete_by_node_ids(deleted_ids)
         await self.nodes.hard_delete(payload.node_ids)
         await self.audits.create(
@@ -91,4 +90,14 @@ class RecycleBinService:
             user_agent=request.headers.get("user-agent"),
             request_id=getattr(request.state, "request_id", None),
         )
+        await self.session.commit()
+        await gc.run(task_ids)
+        await self.session.commit()
         return {"deleted_node_ids": deleted_ids}
+
+    async def _require_write(self, mount_id: int) -> None:
+        mount = await self.mounts.get_by_id(mount_id)
+        if mount is None or not mount.is_enabled:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bucket mount not found")
+        if mount.read_only:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bucket mount is read-only")

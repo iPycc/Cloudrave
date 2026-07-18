@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from sqlalchemy import Index, JSON, Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Index, JSON, Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.enums import (
@@ -150,7 +150,7 @@ class BucketMount(Base, TimestampMixin):
     root_path: Mapped[str] = mapped_column(String(255), default="/")
     provider_label: Mapped[str | None] = mapped_column(String(128), nullable=True)
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    quota_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    quota_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     extra: Mapped[dict] = mapped_column(JSON, default=dict)
 
     owner: Mapped[User] = relationship(back_populates="mounts")
@@ -161,6 +161,39 @@ class BucketMount(Base, TimestampMixin):
         UniqueConstraint("owner_id", "name", name="uq_bucket_mount_owner_name"),
         UniqueConstraint("owner_id", "mount_slug", name="uq_bucket_mount_owner_slug"),
     )
+
+    @property
+    def mode(self) -> str:
+        """Return the mount ownership mode stored in the compatible JSON field."""
+
+        value = (self.extra or {}).get("mode", "managed")
+        return value if value in {"managed", "mirror"} else "managed"
+
+    @property
+    def read_only(self) -> bool:
+        return bool((self.extra or {}).get("read_only", False))
+
+    @property
+    def sync_status(self) -> str:
+        return str(((self.extra or {}).get("_sync") or {}).get("status", "never"))
+
+    @property
+    def last_sync_at(self) -> str | None:
+        value = ((self.extra or {}).get("_sync") or {}).get("completed_at")
+        return str(value) if value else None
+
+    @property
+    def sync_error(self) -> str | None:
+        value = ((self.extra or {}).get("_sync") or {}).get("error")
+        return str(value) if value else None
+
+    @property
+    def synced_objects(self) -> int:
+        value = ((self.extra or {}).get("_sync") or {}).get("synced_objects", 0)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
 
 
 class Node(Base, TimestampMixin):
@@ -174,7 +207,7 @@ class Node(Base, TimestampMixin):
     status: Mapped[NodeStatus] = mapped_column(Enum(NodeStatus, native_enum=False), default=NodeStatus.ACTIVE)
     name: Mapped[str] = mapped_column(String(255))
     blob_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
-    size: Mapped[int] = mapped_column(Integer, default=0)
+    size: Mapped[int] = mapped_column(BigInteger, default=0)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     mount: Mapped[BucketMount] = relationship(back_populates="nodes")
@@ -193,6 +226,7 @@ class ObjectRecord(Base, TimestampMixin):
     node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id", ondelete="CASCADE"), unique=True)
     policy_id: Mapped[int] = mapped_column(ForeignKey("storage_policies.id", ondelete="CASCADE"))
     blob_path: Mapped[str] = mapped_column(String(1024))
+    physical_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     checksum: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     content_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
     extra: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -254,8 +288,9 @@ class UploadSessionRecord(Base, TimestampMixin):
     upload_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     file_name: Mapped[str] = mapped_column(String(255))
     content_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    size: Mapped[int] = mapped_column(Integer, default=0)
-    part_size: Mapped[int] = mapped_column(Integer, default=0)
+    checksum: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    size: Mapped[int] = mapped_column(BigInteger, default=0)
+    part_size: Mapped[int] = mapped_column(BigInteger, default=0)
 
 
 class UploadPartRecord(Base):
@@ -265,7 +300,7 @@ class UploadPartRecord(Base):
     upload_session_id: Mapped[str] = mapped_column(ForeignKey("upload_sessions.id", ondelete="CASCADE"), index=True)
     part_number: Mapped[int] = mapped_column(Integer)
     etag: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    size: Mapped[int] = mapped_column(Integer, default=0)
+    size: Mapped[int] = mapped_column(BigInteger, default=0)
     uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     __table_args__ = (UniqueConstraint("upload_session_id", "part_number", name="uq_upload_parts_session_part"),)

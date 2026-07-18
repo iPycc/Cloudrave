@@ -5,11 +5,15 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from sqlalchemy import Select, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.models.enums import NodeStatus, NodeType
-from app.models.tables import Node
+from app.models.tables import Node, ObjectRecord
+
+
+ID_BATCH_SIZE = 500
 
 
 def _unique_name(name: str, existing: set[str]) -> str:
@@ -41,8 +45,13 @@ class NodeRepository:
     async def list_by_ids(self, node_ids: list[int]) -> list[Node]:
         if not node_ids:
             return []
-        result = await self.session.scalars(select(Node).where(Node.id.in_(node_ids)).order_by(Node.id.asc()))
-        return list(result)
+        unique_ids = list(dict.fromkeys(node_ids))
+        nodes: list[Node] = []
+        for offset in range(0, len(unique_ids), ID_BATCH_SIZE):
+            batch = unique_ids[offset : offset + ID_BATCH_SIZE]
+            result = await self.session.scalars(select(Node).where(Node.id.in_(batch)))
+            nodes.extend(result)
+        return sorted(nodes, key=lambda node: node.id)
 
     async def list_children(self, mount_id: int, parent_id: int | None, *, include_deleted: bool = False) -> list[Node]:
         statement = select(Node).where(Node.mount_id == mount_id, Node.parent_id == parent_id)
@@ -155,6 +164,49 @@ class NodeRepository:
         )
         return result.first()
 
+    async def has_mount_data(self, mount_id: int) -> bool:
+        """Return whether a mount contains anything beyond its virtual root."""
+
+        node_count = await self.session.scalar(
+            select(func.count(Node.id)).where(
+                Node.mount_id == mount_id,
+                or_(
+                    Node.parent_id.is_not(None),
+                    Node.type != NodeType.FOLDER,
+                    Node.blob_path.is_not(None),
+                ),
+            )
+        )
+        if node_count:
+            return True
+        object_count = await self.session.scalar(
+            select(func.count(ObjectRecord.id))
+            .join(Node, Node.id == ObjectRecord.node_id)
+            .where(Node.mount_id == mount_id)
+        )
+        return bool(object_count)
+
+    async def get_child_any(self, mount_id: int, parent_id: int | None, name: str) -> Node | None:
+        """Find a child including a previously missing/deleted imported node."""
+
+        return await self.session.scalar(
+            select(Node).where(
+                Node.mount_id == mount_id,
+                Node.parent_id == parent_id,
+                Node.name == name,
+            )
+        )
+
+    async def reactivate_file(self, node: Node, *, blob_path: str, size: int) -> Node:
+        node.type = NodeType.FILE
+        node.status = NodeStatus.ACTIVE
+        node.deleted_at = None
+        node.blob_path = blob_path
+        node.size = size
+        node.updated_at = datetime.now(UTC)
+        await self.session.flush()
+        return node
+
     async def ensure_mount_root(self, *, owner_id: int, mount_id: int, name: str) -> Node:
         root = await self.get_mount_root(mount_id)
         if root is not None:
@@ -219,6 +271,27 @@ class NodeRepository:
         node.updated_at = datetime.now(UTC)
         await self.session.flush()
         return node
+
+    async def ensure_folder(self, *, owner_id: int, mount_id: int, parent_id: int, name: str) -> Node:
+        existing = await self.get_child_any(mount_id, parent_id, name)
+        if existing is not None:
+            if existing.type == NodeType.FOLDER and existing.deleted_at is None:
+                return existing
+            raise ValueError("Folder path conflicts with an existing node")
+
+        try:
+            async with self.session.begin_nested():
+                return await self.create_folder(
+                    owner_id=owner_id,
+                    mount_id=mount_id,
+                    parent_id=parent_id,
+                    name=name,
+                )
+        except IntegrityError:
+            existing = await self.get_child_any(mount_id, parent_id, name)
+            if existing is not None and existing.type == NodeType.FOLDER and existing.deleted_at is None:
+                return existing
+            raise
 
     async def collect_descendant_ids(self, node_ids: list[int]) -> list[int]:
         if not node_ids:
