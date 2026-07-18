@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app import __version__
 from app.api.v1 import router as v1_router
@@ -14,11 +17,38 @@ from app.exception_handlers import install_exception_handlers
 from app.middleware.logging import LoggingMiddleware
 from app.middleware.request_id import RequestIdMiddleware
 from app.middleware.security_headers import SecurityHeadersMiddleware
+from app.middleware.spa_fallback import SpaFallbackMiddleware
 from config import CloudraveConfig
 from logging_config import LogOperation, LogOutcome, configure_logging, get_logger
 
 
 LOGGER = get_logger("cloudrave.lifecycle")
+ASSETS_DIR_NAME = "assets"
+
+
+def _is_pyinstaller_bundle() -> bool:
+    return getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")
+
+
+def _resolve_assets_dir(config: CloudraveConfig) -> Path | None:
+    """Locate bundled frontend assets.
+
+    When running from source, assets live next to ``main.py``. When packaged
+    with PyInstaller, assets are bundled next to the executable.
+    """
+    candidates: list[Path] = []
+
+    if _is_pyinstaller_bundle():
+        meipass = Path(sys._MEIPASS).resolve()  # type: ignore[attr-defined]
+        candidates.append(meipass / ASSETS_DIR_NAME)
+        candidates.append(Path(sys.executable).resolve().parent / ASSETS_DIR_NAME)
+
+    candidates.append(config.root_dir / ASSETS_DIR_NAME)
+
+    for candidate in candidates:
+        if candidate.is_dir() and (candidate / "index.html").is_file():
+            return candidate
+    return None
 
 
 @asynccontextmanager
@@ -106,4 +136,32 @@ def create_app(config: CloudraveConfig) -> FastAPI:
     install_exception_handlers(app)
 
     app.include_router(v1_router, prefix="/api/v1")
+
+    assets_dir = _resolve_assets_dir(config)
+    if assets_dir is not None:
+        app.mount(
+            "/",
+            StaticFiles(directory=assets_dir, html=True, check_dir=False),
+            name="static",
+        )
+        app.add_middleware(
+            SpaFallbackMiddleware,
+            index_html=assets_dir / "index.html",
+        )
+
+        app.state.spa_mode = True
+        app.state.assets_dir = assets_dir
+        LOGGER.info(
+            "Serving embedded frontend from %s (fullstack mode).",
+            assets_dir,
+            extra={
+                "operation": LogOperation.STARTUP,
+                "resource": "static_assets",
+                "outcome": LogOutcome.SUCCESS,
+            },
+        )
+    else:
+        app.state.spa_mode = False
+        app.state.assets_dir = None
+
     return app

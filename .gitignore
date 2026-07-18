@@ -52,4 +52,19 @@ config.ini
 # Logs
 *.log
 
+# Bundled frontend assets (keep directory, ignore generated files)
+assets/*
+!assets/.gitkeep
+
+# PyInstaller build artifacts
+*.spec
+!cloudrave.spec
+
+# Local binary builds
+bin/
+
+# Runtime packaging
+*.manifest
+*.pyz
+
 tests/

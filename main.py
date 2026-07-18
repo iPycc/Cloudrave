@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 
 import uvicorn
@@ -14,7 +15,19 @@ from config import load_config
 from logging_config import LogOperation, LogOutcome, configure_logging, get_logger, print_startup_banner
 
 
-ROOT_DIR = Path(__file__).resolve().parent
+def _resolve_root_dir() -> Path:
+    """Return the runtime root directory.
+
+    For PyInstaller bundles the executable directory is used so that
+    ``config.ini``, the database, and uploads persist across runs. When running
+    from source the directory containing this file is used.
+    """
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+ROOT_DIR = _resolve_root_dir()
 CONFIG = load_config(ROOT_DIR)
 app = create_app(CONFIG)
 LOGGER = get_logger("cloudrave.main")
@@ -30,13 +43,14 @@ async def preflight_startup() -> None:
 
 if __name__ == "__main__":
     configure_logging(CONFIG)
-    print_startup_banner(CONFIG, __version__)
+    mode = "fullstack" if getattr(app.state, "spa_mode", False) else "API"
+    print_startup_banner(CONFIG, __version__, mode=mode)
     LOGGER.info(
         "Logger initialized at level %s; configuration loaded from %s.",
         CONFIG.logging.level.upper(),
         CONFIG.config_path,
     )
-    LOGGER.info("Runtime profile: %s (standalone API).", CONFIG.app.env)
+    LOGGER.info("Runtime profile: %s (%s).", CONFIG.app.env, mode)
     try:
         asyncio.run(preflight_startup())
     except RuntimeError as exc:

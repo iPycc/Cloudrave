@@ -253,27 +253,14 @@ class UserProfileService:
         return record, ceremony, verification.new_sign_count
 
     def _resolve_origin(self, request: Request) -> str:
-        from urllib.parse import urlsplit
+        from app.services.user.passkey_origin import resolve_passkey_origin
 
-        origin = (request.headers.get("origin") or "").strip()
-        if not origin:
-            referer = (request.headers.get("referer") or "").strip()
-            if referer:
-                parsed = urlsplit(referer)
-                origin = f"{parsed.scheme}://{parsed.netloc}"
-        if not origin:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="无法识别当前 WebAuthn 来源")
-        if self.config.app.cors_origins and origin not in self.config.app.cors_origins:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="当前来源未被允许使用通行密钥")
-        return origin
+        return resolve_passkey_origin(request, self.config)
 
     def _resolve_rp_id(self, request: Request) -> str:
-        from urllib.parse import urlsplit
+        from app.services.user.passkey_origin import resolve_passkey_rp_id
 
-        parsed = urlsplit(self._resolve_origin(request))
-        if not parsed.hostname:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="无法识别当前 WebAuthn 域名")
-        return parsed.hostname
+        return resolve_passkey_rp_id(self._resolve_origin(request))
 
     async def _get_managed_user(self, uid: str) -> User:
         user = await self.users.get_by_uid(uid)

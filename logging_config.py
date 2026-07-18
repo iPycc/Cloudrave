@@ -177,10 +177,10 @@ def configure_logging(config: CloudraveConfig) -> None:
     logging.getLogger("uvicorn.access").handlers.clear()
 
 
-def print_startup_banner(config: CloudraveConfig, version: str) -> None:
+def print_startup_banner(config: CloudraveConfig, version: str, mode: str = "API") -> None:
     """Write a small unprefixed product header before structured logs begin."""
 
-    details = f"Cloudrave v{version}  |  {config.app.env}  |  Python API"
+    details = f"Cloudrave v{version}  |  {config.app.env}  |  Python {mode}"
     rule = "=" * max(len(details), 48)
     sys.stderr.write(f"Starting Cloudrave {version} in {config.app.env} environment...\n")
     sys.stderr.write(f"\n{STARTUP_BANNER}\n\n{details}\n{rule}\n\n")

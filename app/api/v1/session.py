@@ -21,6 +21,7 @@ from app.schemas.passkey import (
 )
 from app.security.auth_cookies import clear_auth_cookies, resolve_refresh_token, set_auth_cookies
 from app.schemas.common import MessageResponse
+from app.repositories.site_settings import SiteSettingsRepository
 from app.services.session.refresh import RefreshTokenService
 from app.services.session.revoke import RevokeSessionService
 from app.services.session.two_factor import TwoFactorLoginService
@@ -79,6 +80,7 @@ async def passkey_options(
             token_service=dep.token_service,
             storage_manager=dep.storage_manager,
             config=dep.config,
+            site_settings=SiteSettingsRepository(session),
         )
         return await service.begin_authentication(request, payload)
 
@@ -104,6 +106,7 @@ async def passkey_verify(
             token_service=dep.token_service,
             storage_manager=dep.storage_manager,
             config=dep.config,
+            site_settings=SiteSettingsRepository(session),
         )
         result = await service.finish_authentication(request, payload)
         if result.login.token:
