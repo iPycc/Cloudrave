@@ -1,4 +1,3 @@
-"""Cloudrave-style login service."""
 
 from __future__ import annotations
 

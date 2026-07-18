@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cloudrave-backend"
 version = "0.1.0"
-description = "Cloudrave backend inspired by Cloudrave service boundaries"
+description = "Cloudrave backend"
 requires-python = ">=3.12"
 dependencies = [
   "aiomysql>=0.2.0",

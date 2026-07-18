@@ -1,6 +1,4 @@
-"""Dependency container similar to Cloudrave's centralized dependency layer."""
 
-from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager

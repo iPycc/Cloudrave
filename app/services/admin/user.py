@@ -11,11 +11,6 @@ class RegistrationRoleDecision:
 
 
 class AdminUserService:
-    """Small helper for role-related admin decisions.
-
-    The actual user/account workflow will live in the auth module, but this
-    helper keeps the storage/admin boundary close to Cloudrave's service split.
-    """
 
     def resolve_registration_role(self, *, is_first_user: bool) -> RegistrationRoleDecision:
         return RegistrationRoleDecision(
