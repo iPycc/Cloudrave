@@ -1,6 +1,6 @@
 <h1 align="center">
   <br>
-  <a href="https://github.com/ipycc/cloudrave" alt="logo"><img src="https://raw.githubusercontent.com/iPycc/Cloudrave-Frontend/refs/heads/main/public/cloudrave-logo.svg?token=GHSAT0AAAAAAD4G4DAENE6RA2MLNOK66KOC2S35CVA" width="100"/></a>
+  <a href="https://github.com/ipycc/cloudrave" alt="logo"><img src="https://raw.githubusercontent.com/iPycc/frontend/00aca676ea29ef3186bd330e670df7e7aafaf7b5/public/cloudrave-logo.svg" width="100"/></a>
   <br>
   Cloudrave
   <br>
