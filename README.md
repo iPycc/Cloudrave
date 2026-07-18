@@ -2,7 +2,7 @@
   <br>
   <a href="https://github.com/ipycc/cloudrave" alt="logo"><img src="https://raw.githubusercontent.com/iPycc/frontend/00aca676ea29ef3186bd330e670df7e7aafaf7b5/public/cloudrave-logo.svg" width="100"/></a>
   <br>
-  Cloudrave
+  Cloudrave B1
   <br>
 </h1>
 
@@ -110,17 +110,13 @@ use_color = true
 
 Cloudrave 后端可以嵌入前端编译产物，作为统一服务运行：
 
-1. 构建前端并自动复制到后端 `assets/` 目录：
+1. 构建前端并嵌入到后端 `assets/` 目录：
 
 ```bash
-# 在项目根目录执行
-python build-fullstack.py
+pnpm install --frozen-lockfile
+pnpm build
 ```
-
-该脚本会依次执行：
-- `pnpm install --frozen-lockfile`
-- `pnpm build`
-- 将 `Frontend/dist/` 复制到 `Cloudrave/assets/`
+- 将 `./frontend/dist/` 复制到 `./Cloudrave/assets/`
 
 2. 启动后端：
 
