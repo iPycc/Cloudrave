@@ -6,13 +6,10 @@ import asyncio
 import base64
 import binascii
 import hashlib
-import io
 import logging
 import re
-import zipfile
 from collections import deque
 from pathlib import Path
-from typing import AsyncIterator
 from uuid import uuid4
 
 from fastapi import HTTPException, Request, status
@@ -39,6 +36,7 @@ from app.schemas.node import (
     NodeRenameRequest,
     NodeSearchResult,
 )
+from app.services.explorer.download import ArchiveDownloadService
 from app.storage.manager import StorageManager
 from logging_config import LogOperation, LogOutcome
 
@@ -504,61 +502,34 @@ class FileExplorerService:
         node = await self._require_node_access(actor, node_id)
         if node.type != NodeType.FOLDER:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Node is not a folder")
-        mount, policy = await self._require_mount_access(actor, node.mount_id)
+        return await self.download_nodes(request, actor, [node_id], filename=node.name)
 
-        all_ids = await self.nodes.collect_descendant_ids([node_id])
-        descendants = await self.nodes.list_by_ids(all_ids)
-        file_nodes = [n for n in descendants if n.type == NodeType.FILE and n.blob_path]
-        if not file_nodes:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Folder is empty")
-
-        # Build relative archive paths
-        node_map = {n.id: n for n in descendants}
-        node_map[node.id] = node
-        entries: list[tuple[str, Node]] = []
-        for file_node in file_nodes:
-            parts: list[str] = []
-            current: Node | None = file_node
-            while current is not None and current.id != node.id:
-                parts.append(current.name)
-                current = node_map.get(current.parent_id) if current.parent_id is not None else None
-            rel_path = "/".join(reversed(parts))
-            entries.append((rel_path, file_node))
-
-        adapter = self.storage_manager.get_adapter(policy)
-        chunk_size = 64 * 1024
-
-        def _build_zip_in_thread() -> bytes:
-            buffer = io.BytesIO()
-            with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-                for rel_path, file_node in entries:
-                    stream = adapter.open_object(policy, mount, file_node.blob_path)
-                    data = stream.read() if hasattr(stream, "read") else b"".join(stream)
-                    if isinstance(data, str):
-                        data = data.encode("utf-8")
-                    zf.writestr(rel_path, data)
-            return buffer.getvalue()
-
-        async def _stream() -> AsyncIterator[bytes]:
-            archive = await asyncio.to_thread(_build_zip_in_thread)
-            for offset in range(0, len(archive), chunk_size):
-                yield archive[offset : offset + chunk_size]
-
+    async def download_nodes(
+        self,
+        request: Request,
+        actor: User,
+        node_ids: list[int],
+        *,
+        filename: str,
+    ) -> StreamingResponse:
+        archive_service = ArchiveDownloadService(
+            mounts=self.mounts,
+            nodes=self.nodes,
+            policies=self.policies,
+            storage_manager=self.storage_manager,
+        )
+        roots = await archive_service.resolve_owned_roots(actor, node_ids)
+        response = await archive_service.build_archive_response(roots, filename=filename)
         await self.audits.create(
             actor_id=actor.id,
-            action="node.download_folder",
-            target=f"node:{node.id}",
-            detail=node.name,
+            action="node.download_archive",
+            target=f"nodes:{','.join(str(node.id) for node in roots)}",
+            detail=filename,
             ip=request.client.host if request.client else None,
             user_agent=request.headers.get("user-agent"),
             request_id=getattr(request.state, "request_id", None),
         )
-        safe_name = node.name.replace('"', "")
-        return StreamingResponse(
-            _stream(),
-            media_type="application/zip",
-            headers={"Content-Disposition": f'attachment; filename="{safe_name}.zip"'},
-        )
+        return response
 
     async def _require_mount_access(self, actor: User, mount_id: int) -> tuple[BucketMount, StoragePolicy]:
         mount = await self.mounts.get_by_id(mount_id)

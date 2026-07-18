@@ -767,11 +767,17 @@ class PreviewService:
                 [ffprobe, "-v", "error", "-show_format", "-show_streams", "-of", "json", self._source_locator(node, mount, policy)],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=True,
                 timeout=20,
             )
+            if not result.stdout:
+                return {"probe_available": True, "probe_failed": True}
             payload = json.loads(result.stdout)
-        except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+            if not isinstance(payload, dict):
+                return {"probe_available": True, "probe_failed": True}
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError, TypeError, ValueError):
             return {"probe_available": True, "probe_failed": True}
         metadata: dict[str, object] = {"probe_available": True}
         format_data = payload.get("format", {})
@@ -927,6 +933,8 @@ class PreviewService:
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=True,
                 timeout=120,
             )
@@ -987,6 +995,8 @@ class PreviewService:
                         command,
                         capture_output=True,
                         text=True,
+                        encoding="utf-8",
+                        errors="replace",
                         check=True,
                         timeout=7200,
                     )

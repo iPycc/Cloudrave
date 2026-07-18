@@ -19,7 +19,7 @@ from app.schemas.share import (
     ShareVerifyRequest,
     SharedNodeRead,
 )
-from app.services.explorer.download import DownloadFileService
+from app.services.explorer.download import ArchiveDownloadService, DownloadFileService
 from app.services.explorer.preview import DERIVED_CACHE_CONTROL, PreviewService, build_local_preview_response
 from app.services.explorer.share import ShareService
 from app.services.user.response import build_avatar_url
@@ -45,6 +45,11 @@ def _require_share_access(service: ShareService, share: ShareRecord, access_toke
         access_token is None or not service.verify_access_token(share, access_token)
     ):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Share access token required")
+
+
+def _require_share_download_available(share: ShareRecord) -> None:
+    if share.max_downloads is not None and share.download_count >= share.max_downloads:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Share download limit reached")
 
 
 def _shared_node_read(node: Node) -> SharedNodeRead:
@@ -153,21 +158,48 @@ async def verify_share_password(
         return ShareAccessTokenResponse(access_token=token)
 
 
+@router.post("/{share_id}/download/record", response_model=MessageResponse)
+async def record_shared_directory_download(
+    share_id: str,
+    request: Request,
+    access_token: str | None = Query(None),
+) -> MessageResponse:
+    """Count one browser-managed directory download before its file streams start."""
+
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = _build_share_service(request, session)
+        share, _ = await service.get_share_info(share_id)
+        _require_share_access(service, share, access_token)
+        _require_share_download_available(share)
+        await service.record_download(share)
+        return MessageResponse(message="Share download recorded")
+
+
 @router.get("/{share_id}/download")
 async def download_shared_file(
     share_id: str,
     request: Request,
     access_token: str | None = Query(None),
     node_id: int | None = Query(None),
+    node_ids: list[int] | None = Query(None),
 ):
     dep = request.app.state.dep
     async with dep.session_scope() as session:
         service = _build_share_service(request, session)
         share, _ = await service.get_share_info(share_id)
         _require_share_access(service, share, access_token)
-        node = await service.resolve_shared_node(share, node_id)
-        if node.type.value == "folder":
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Folder download is not supported yet")
+        _require_share_download_available(share)
+
+        if node_ids:
+            requested_ids = list(dict.fromkeys(node_ids))
+        elif node_id is not None:
+            requested_ids = [node_id]
+        else:
+            requested_ids = [node.id for node in (await service.get_share_info(share_id))[1]]
+        if len(requested_ids) > 100:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Too many nodes selected")
+        nodes = [await service.resolve_shared_node(share, requested_id) for requested_id in requested_ids]
 
         download_service = DownloadFileService(
             mounts=dep.get_mount_repository(session),
@@ -176,8 +208,18 @@ async def download_shared_file(
             objects=dep.get_object_repository(session),
             storage_manager=dep.storage_manager,
         )
-        node, mount, policy = await download_service.resolve_shared(node.id)
-        response = download_service.build_file_stream(node, mount, policy)
+        if len(nodes) == 1 and nodes[0].type.value == "file":
+            node, mount, policy = await download_service.resolve_shared(nodes[0].id)
+            response = download_service.build_file_stream(node, mount, policy)
+        else:
+            archive_service = ArchiveDownloadService(
+                mounts=dep.get_mount_repository(session),
+                nodes=dep.get_node_repository(session),
+                policies=dep.get_policy_repository(session),
+                storage_manager=dep.storage_manager,
+            )
+            archive_name = nodes[0].name if len(nodes) == 1 else f"Cloudrave-share-{share.id[:8]}"
+            response = await archive_service.build_archive_response(nodes, filename=archive_name)
         await service.record_download(share)
         return response
 
