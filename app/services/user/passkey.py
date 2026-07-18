@@ -31,6 +31,7 @@ from app.repositories.nodes import NodeRepository
 from app.repositories.passkeys import PasskeyRepository
 from app.repositories.policies import StoragePolicyRepository
 from app.repositories.sessions import SessionRepository
+from app.repositories.site_settings import SiteSettingsRepository
 from app.repositories.users import UserRepository
 from app.schemas.auth import LoginResponse
 from app.services.user.totp import TOTPService
@@ -81,6 +82,7 @@ class PasskeyService:
         token_service: TokenService,
         storage_manager: StorageManager,
         config: CloudraveConfig,
+        site_settings: SiteSettingsRepository,
     ) -> None:
         self.session = session
         self.users = users
@@ -93,6 +95,7 @@ class PasskeyService:
         self.token_service = token_service
         self.storage_manager = storage_manager
         self.config = config
+        self.site_settings = site_settings
 
     async def list_for_user(self, actor: User) -> PasskeyListResponse:
         records = await self.passkeys.list_for_user(actor.id)
@@ -108,7 +111,7 @@ class PasskeyService:
         payload: PasskeyRegistrationOptionsRequest,
     ) -> PasskeyOptionsResponse:
         await self.passkeys.delete_expired_ceremonies()
-        rp_id = self._resolve_rp_id(request)
+        rp_id = await self._resolve_rp_id(request)
         records = await self.passkeys.list_for_user(actor.id)
         options = generate_registration_options(
             rp_id=rp_id,
@@ -145,13 +148,13 @@ class PasskeyService:
         if ceremony is None or ceremony.user_id != actor.id:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="通行密钥注册挑战已失效")
 
-        expected_origin = self._resolve_origin(request)
+        expected_origin = await self._resolve_origin(request)
         try:
             verification = verify_registration_response(
                 credential=payload.credential,
                 expected_challenge=base64url_to_bytes(ceremony.challenge),
                 expected_origin=expected_origin,
-                expected_rp_id=self._resolve_rp_id(request),
+                expected_rp_id=await self._resolve_rp_id(request),
                 require_user_verification=True,
             )
         except Exception as exc:
@@ -250,7 +253,7 @@ class PasskeyService:
             user_id = user.id
 
         options = generate_authentication_options(
-            rp_id=self._resolve_rp_id(request),
+            rp_id=await self._resolve_rp_id(request),
             allow_credentials=allow_credentials or None,
             user_verification=UserVerificationRequirement.REQUIRED,
         )
@@ -283,12 +286,12 @@ class PasskeyService:
         if ceremony.user_id is not None and ceremony.user_id != record.user_id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="通行密钥与当前登录挑战不匹配")
 
-        expected_origin = self._resolve_origin(request)
+        expected_origin = await self._resolve_origin(request)
         try:
             verification = verify_authentication_response(
                 credential=payload.credential,
                 expected_challenge=base64url_to_bytes(ceremony.challenge),
-                expected_rp_id=self._resolve_rp_id(request),
+                expected_rp_id=await self._resolve_rp_id(request),
                 expected_origin=expected_origin,
                 credential_public_key=base64url_to_bytes(record.public_key),
                 credential_current_sign_count=record.sign_count,
@@ -383,7 +386,7 @@ class PasskeyService:
             transports=list(record.transports or []),
         )
 
-    def _resolve_origin(self, request: Request) -> str:
+    async def _resolve_origin(self, request: Request) -> str:
         origin = (request.headers.get("origin") or "").strip()
         if not origin:
             referer = (request.headers.get("referer") or "").strip()
@@ -391,13 +394,20 @@ class PasskeyService:
                 parsed = urlsplit(referer)
                 origin = f"{parsed.scheme}://{parsed.netloc}"
         if not origin:
+            settings = await self.site_settings.get_settings()
+            origin = (settings.get("site_url") or "").strip()
+        if not origin:
+            origin = self.config.app.public_base_url.strip()
+        if not origin:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="无法识别当前 WebAuthn 来源")
-        if self.config.app.cors_origins and origin not in self.config.app.cors_origins:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="当前来源未被允许使用通行密钥")
-        return origin
 
-    def _resolve_rp_id(self, request: Request) -> str:
-        parsed = urlsplit(self._resolve_origin(request))
+        allowed_origins = set(self.config.app.cors_origins or ())
+        if self.config.app.cors_origins and origin not in allowed_origins:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="当前来源未被允许使用通行密钥")
+        return origin.rstrip("/")
+
+    async def _resolve_rp_id(self, request: Request) -> str:
+        parsed = urlsplit(await self._resolve_origin(request))
         if not parsed.hostname:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="无法识别当前 WebAuthn 域名")
         return parsed.hostname

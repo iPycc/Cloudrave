@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 
 class WebsiteSettings(BaseModel):
+    site_url: str = Field(default="", max_length=512)
     site_title: str = Field(default="", max_length=128)
     site_logo_url: str = Field(default="", max_length=512)
     site_description: str = Field(default="", max_length=1024)

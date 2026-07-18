@@ -36,6 +36,7 @@ from app.schemas.user import (
     UserPreferencesUpdateRequest,
     UserProfileUpdateRequest,
 )
+from app.repositories.site_settings import SiteSettingsRepository
 from app.services.user.passkey import PasskeyService
 from app.services.user.profile import UserProfileService
 from app.services.user.register import UserRegisterService
@@ -312,6 +313,7 @@ async def list_passkeys(
             token_service=dep.token_service,
             storage_manager=dep.storage_manager,
             config=dep.config,
+            site_settings=SiteSettingsRepository(session),
         )
         return await service.list_for_user(current_user)
 
@@ -336,6 +338,7 @@ async def begin_passkey_registration(
             token_service=dep.token_service,
             storage_manager=dep.storage_manager,
             config=dep.config,
+            site_settings=SiteSettingsRepository(session),
         )
         return await service.begin_registration(request, current_user, payload)
 
@@ -360,6 +363,7 @@ async def verify_passkey_registration(
             token_service=dep.token_service,
             storage_manager=dep.storage_manager,
             config=dep.config,
+            site_settings=SiteSettingsRepository(session),
         )
         return await service.finish_registration(request, current_user, payload)
 
@@ -384,6 +388,7 @@ async def delete_passkey(
             token_service=dep.token_service,
             storage_manager=dep.storage_manager,
             config=dep.config,
+            site_settings=SiteSettingsRepository(session),
         )
         await service.delete_for_user(request, current_user, passkey_id)
         return MessageResponse(message="通行密钥已删除")
@@ -410,6 +415,7 @@ async def rename_passkey(
             token_service=dep.token_service,
             storage_manager=dep.storage_manager,
             config=dep.config,
+            site_settings=SiteSettingsRepository(session),
         )
         return await service.rename_for_user(request, current_user, passkey_id, payload)
 

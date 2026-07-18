@@ -19,6 +19,7 @@ from app.repositories.policies import StoragePolicyRepository
 from app.repositories.sessions import SessionRepository
 from app.repositories.shared import SharedRepository
 from app.repositories.shares import ShareRepository
+from app.repositories.site_settings import SiteSettingsRepository
 from app.repositories.uploads import UploadRepository
 from app.repositories.users import UserRepository
 from app.security.jwt import TokenService
@@ -182,6 +183,9 @@ class Dep:
 
     def get_shared_repository(self, session: AsyncSession) -> SharedRepository:
         return SharedRepository(session)
+
+    def get_site_settings_repository(self, session: AsyncSession) -> SiteSettingsRepository:
+        return SiteSettingsRepository(session)
 
     def _mask_database_url(self, value: str) -> str:
         parsed = urlsplit(value)
