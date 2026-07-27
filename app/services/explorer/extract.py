@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
+import logging
 import mimetypes
-import shutil
 import tempfile
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+from typing import Any, BinaryIO
 from uuid import uuid4
 
 from fastapi import HTTPException, status
@@ -28,6 +31,8 @@ MAX_ENTRY_BYTES = 4 * 1024 * 1024 * 1024
 MAX_COMPRESSION_RATIO = 200
 CHUNK_SIZE = 1024 * 1024
 
+LOGGER = logging.getLogger(__name__)
+
 
 @dataclass(slots=True)
 class _Task:
@@ -40,6 +45,15 @@ class _Task:
     result_node_id: int | None
     created_at: datetime
     updated_at: datetime
+
+
+@dataclass(slots=True, frozen=True)
+class _ExtractSource:
+    node_name: str
+    blob_path: str
+    mount: Any
+    policy: Any
+    parent_id: int
 
 
 _tasks: dict[str, _Task] = {}
@@ -126,34 +140,188 @@ def _safe_parts(filename: str) -> tuple[str, ...] | None:
     return parts
 
 
+async def _call_stream_method(method: Callable[..., Any], *args: Any) -> Any:
+    if inspect.iscoroutinefunction(method):
+        return await method(*args)
+    result = await asyncio.to_thread(method, *args)
+    return await result if inspect.isawaitable(result) else result
+
+
+async def _copy_stream(source: Any, target: BinaryIO) -> None:
+    while chunk := await _call_stream_method(source.read, CHUNK_SIZE):
+        await asyncio.to_thread(target.write, chunk)
+
+
+async def _close_stream(source: Any) -> None:
+    close = getattr(source, "close", None)
+    if close is not None:
+        await _call_stream_method(close)
+
+
+async def _load_extract_source(dep, task: _Task, node_id: int, target_parent_id: int | None) -> _ExtractSource:
+    """Load archive metadata without keeping a transaction over storage I/O."""
+
+    async with dep.session_scope() as session:
+        nodes = dep.get_node_repository(session)
+        mounts = dep.get_mount_repository(session)
+        policies = dep.get_policy_repository(session)
+        node = await nodes.get_by_id(node_id)
+        if node is None or not node.blob_path:
+            raise RuntimeError("ZIP source no longer exists")
+        mount = await mounts.get_by_id(node.mount_id)
+        policy = await policies.get_by_id(mount.policy_id) if mount else None
+        if mount is None or policy is None:
+            raise RuntimeError("ZIP storage mount is unavailable")
+        parent_id = target_parent_id if target_parent_id is not None else node.parent_id
+        if parent_id is None:
+            parent = await nodes.ensure_mount_root(owner_id=task.owner_id, mount_id=mount.id, name=mount.name)
+            parent_id = parent.id
+        return _ExtractSource(
+            node_name=node.name,
+            blob_path=node.blob_path,
+            mount=mount,
+            policy=policy,
+            parent_id=parent_id,
+        )
+
+
+async def _create_extract_root(dep, task: _Task, source: _ExtractSource) -> int:
+    async with dep.session_scope() as session:
+        nodes = dep.get_node_repository(session)
+        existing = await nodes.get_child_names(source.mount.id, source.parent_id)
+        root = await nodes.create_folder(
+            owner_id=task.owner_id,
+            mount_id=source.mount.id,
+            parent_id=source.parent_id,
+            name=_unique_name(Path(source.node_name).stem, existing),
+        )
+        return root.id
+
+
+async def _ensure_folder_path(
+    dep,
+    task: _Task,
+    *,
+    mount_id: int,
+    folder_ids: dict[tuple[str, ...], int],
+    parts: tuple[str, ...],
+) -> int:
+    cursor: tuple[str, ...] = ()
+    for segment in parts:
+        next_cursor = (*cursor, segment)
+        if next_cursor not in folder_ids:
+            async with dep.session_scope() as session:
+                nodes = dep.get_node_repository(session)
+                parent_id = folder_ids[cursor]
+                siblings = await nodes.get_child_names(mount_id, parent_id)
+                folder = await nodes.create_folder(
+                    owner_id=task.owner_id,
+                    mount_id=mount_id,
+                    parent_id=parent_id,
+                    name=_unique_name(segment, siblings),
+                )
+                folder_ids[next_cursor] = folder.id
+        cursor = next_cursor
+    return folder_ids[cursor]
+
+
+async def _persist_uploaded_file(
+    dep,
+    task: _Task,
+    *,
+    source: _ExtractSource,
+    parent_id: int,
+    filename: str,
+    object_key: str,
+    size: int,
+    checksum: str,
+    content_type: str,
+    physical_id: str | None,
+    etag: str | None,
+) -> str:
+    """Persist one uploaded object in a short transaction."""
+
+    async with dep.session_scope() as session:
+        nodes = dep.get_node_repository(session)
+        objects = dep.get_object_repository(session)
+        siblings = await nodes.get_child_names(source.mount.id, parent_id)
+        target_name = _unique_name(filename, siblings)
+        created = await nodes.create_file(
+            owner_id=task.owner_id,
+            mount_id=source.mount.id,
+            parent_id=parent_id,
+            name=target_name,
+            blob_path=object_key,
+            size=size,
+        )
+        await objects.create_or_update(
+            node_id=created.id,
+            policy_id=source.policy.id,
+            blob_path=object_key,
+            physical_id=physical_id,
+            revive_physical=True,
+            checksum=checksum,
+            content_type=content_type,
+            extra={"origin": "archive_extract", "etag": etag},
+        )
+        return target_name
+
+
+async def _cleanup_uploaded_object(adapter, source: _ExtractSource, object_key: str) -> None:
+    try:
+        await call_adapter(
+            adapter,
+            "delete_object",
+            source.policy,
+            source.mount,
+            object_key,
+            hard_delete=True,
+        )
+    except Exception:
+        LOGGER.exception(
+            "Failed to clean up an archive object after metadata persistence failed",
+            extra={"object_key": object_key},
+        )
+
+
+async def _write_extract_audit(
+    dep,
+    task: _Task,
+    *,
+    node_id: int,
+    root_id: int,
+    written: int,
+) -> None:
+    async with dep.session_scope() as session:
+        await dep.get_audit_repository(session).create(
+            actor_id=task.owner_id,
+            action="archive.extract",
+            target=f"node:{node_id}",
+            detail=f"result_node:{root_id};bytes:{written}",
+            ip=None,
+            user_agent=None,
+            request_id=None,
+        )
+
+
 async def _run_extract(dep, task: _Task, node_id: int, target_parent_id: int | None) -> None:
     _update(task, status="running", detail="读取 ZIP 目录")
     try:
-        async with dep.session_scope() as session:
-            nodes = dep.get_node_repository(session)
-            mounts = dep.get_mount_repository(session)
-            policies = dep.get_policy_repository(session)
-            objects = dep.get_object_repository(session)
-            audits = dep.get_audit_repository(session)
-            node = await nodes.get_by_id(node_id)
-            if node is None or not node.blob_path:
-                raise RuntimeError("ZIP source no longer exists")
-            mount = await mounts.get_by_id(node.mount_id)
-            policy = await policies.get_by_id(mount.policy_id) if mount else None
-            if mount is None or policy is None:
-                raise RuntimeError("ZIP storage mount is unavailable")
-            parent_id = target_parent_id if target_parent_id is not None else node.parent_id
-            if parent_id is None:
-                parent = await nodes.ensure_mount_root(owner_id=task.owner_id, mount_id=mount.id, name=mount.name)
-                parent_id = parent.id
+        source_info = await _load_extract_source(dep, task, node_id, target_parent_id)
+        adapter = dep.storage_manager.get_adapter(source_info.policy)
 
-            adapter = dep.storage_manager.get_adapter(policy)
-            source = await call_adapter(adapter, "open_object", policy, mount, node.blob_path)
-            spool = tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024)
+        with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as spool:
+            source_stream = await call_adapter(
+                adapter,
+                "open_object",
+                source_info.policy,
+                source_info.mount,
+                source_info.blob_path,
+            )
             try:
-                await asyncio.to_thread(shutil.copyfileobj, source, spool, CHUNK_SIZE)
+                await _copy_stream(source_stream, spool)
             finally:
-                source.close()
+                await _close_stream(source_stream)
             spool.seek(0)
 
             with zipfile.ZipFile(spool) as archive:
@@ -169,79 +337,90 @@ async def _run_extract(dep, task: _Task, node_id: int, target_parent_id: int | N
                     if info.compress_size and info.file_size / info.compress_size > MAX_COMPRESSION_RATIO:
                         raise ValueError(f"{info.filename} 压缩率异常")
 
-                existing = await nodes.get_child_names(mount.id, parent_id)
-                root_name = _unique_name(Path(node.name).stem, existing)
-                root = await nodes.create_folder(
-                    owner_id=task.owner_id,
-                    mount_id=mount.id,
-                    parent_id=parent_id,
-                    name=root_name,
-                )
-                task.result_node_id = root.id
-                folder_ids: dict[tuple[str, ...], int] = {(): root.id}
+                root_id = await _create_extract_root(dep, task, source_info)
+                task.result_node_id = root_id
+                folder_ids: dict[tuple[str, ...], int] = {(): root_id}
                 written = 0
                 file_infos = [info for info in infos if not info.is_dir()]
+
+                directory_paths = {
+                    parts
+                    for info in infos
+                    if info.is_dir() and (parts := _safe_parts(info.filename))
+                }
+                directory_paths.update(
+                    parts[:-1]
+                    for info in file_infos
+                    if (parts := _safe_parts(info.filename)) and parts[:-1]
+                )
+                for folder_path in sorted(directory_paths, key=lambda parts: (len(parts), parts)):
+                    await _ensure_folder_path(
+                        dep,
+                        task,
+                        mount_id=source_info.mount.id,
+                        folder_ids=folder_ids,
+                        parts=folder_path,
+                    )
 
                 for index, info in enumerate(file_infos):
                     parts = _safe_parts(info.filename)
                     if not parts:
                         continue
                     folder_parts, filename = parts[:-1], parts[-1]
-                    cursor: tuple[str, ...] = ()
-                    for segment in folder_parts:
-                        next_cursor = (*cursor, segment)
-                        if next_cursor not in folder_ids:
-                            siblings = await nodes.get_child_names(mount.id, folder_ids[cursor])
-                            folder = await nodes.create_folder(
-                                owner_id=task.owner_id,
-                                mount_id=mount.id,
-                                parent_id=folder_ids[cursor],
-                                name=_unique_name(segment, siblings),
-                            )
-                            folder_ids[next_cursor] = folder.id
-                        cursor = next_cursor
-
-                    siblings = await nodes.get_child_names(mount.id, folder_ids[cursor])
-                    target_name = _unique_name(filename, siblings)
+                    parent_id = await _ensure_folder_path(
+                        dep,
+                        task,
+                        mount_id=source_info.mount.id,
+                        folder_ids=folder_ids,
+                        parts=folder_parts,
+                    )
                     object_key = managed_key(
                         task.owner_id,
-                        target_name,
-                        style=str((mount.extra or {}).get("object_key_style", "readable")),
+                        filename,
+                        style=str((source_info.mount.extra or {}).get("object_key_style", "readable")),
                     )
+                    content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
                     digest = hashlib.sha256()
+                    object_written = False
                     with archive.open(info) as entry, tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024) as payload:
                         while chunk := await asyncio.to_thread(entry.read, CHUNK_SIZE):
                             digest.update(chunk)
                             payload.write(chunk)
                         payload.seek(0)
-                        stored = await call_adapter(
-                            adapter,
-                            "put_object",
-                            policy,
-                            mount,
-                            object_key,
-                            payload,
-                            mime_type=mimetypes.guess_type(target_name)[0] or "application/octet-stream",
-                            metadata={"origin": "archive_extract"},
-                        )
-                    created = await nodes.create_file(
-                        owner_id=task.owner_id,
-                        mount_id=mount.id,
-                        parent_id=folder_ids[cursor],
-                        name=target_name,
-                        blob_path=object_key,
-                        size=info.file_size,
-                    )
-                    await objects.create_or_update(
-                        node_id=created.id,
-                        policy_id=policy.id,
-                        blob_path=object_key,
-                        physical_id=adapter.physical_id(policy, mount, object_key),
-                        revive_physical=True,
-                        checksum=digest.hexdigest(),
-                        content_type=mimetypes.guess_type(target_name)[0] or "application/octet-stream",
-                        extra={"origin": "archive_extract", "etag": getattr(stored, "etag", None)},
-                    )
+                        try:
+                            stored = await call_adapter(
+                                adapter,
+                                "put_object",
+                                source_info.policy,
+                                source_info.mount,
+                                object_key,
+                                payload,
+                                mime_type=content_type,
+                                metadata={"origin": "archive_extract"},
+                            )
+                            object_written = True
+                            physical_id = adapter.physical_id(
+                                source_info.policy,
+                                source_info.mount,
+                                object_key,
+                            )
+                            await _persist_uploaded_file(
+                                dep,
+                                task,
+                                source=source_info,
+                                parent_id=parent_id,
+                                filename=filename,
+                                object_key=object_key,
+                                size=info.file_size,
+                                checksum=digest.hexdigest(),
+                                content_type=content_type,
+                                physical_id=physical_id,
+                                etag=getattr(stored, "etag", None),
+                            )
+                        except Exception:
+                            if object_written:
+                                await _cleanup_uploaded_object(adapter, source_info, object_key)
+                            raise
                     written += info.file_size
                     _update(
                         task,
@@ -249,16 +428,17 @@ async def _run_extract(dep, task: _Task, node_id: int, target_parent_id: int | N
                         detail=f"已解压 {index + 1} / {len(file_infos)} 个文件",
                     )
 
-                await audits.create(
-                    actor_id=task.owner_id,
-                    action="archive.extract",
-                    target=f"node:{node.id}",
-                    detail=f"result_node:{root.id};bytes:{written}",
-                    ip=None,
-                    user_agent=None,
-                    request_id=None,
+                await _write_extract_audit(
+                    dep,
+                    task,
+                    node_id=node_id,
+                    root_id=root_id,
+                    written=written,
                 )
-            spool.close()
         _update(task, status="completed", progress=100, detail="解压完成")
     except Exception as exc:
+        LOGGER.exception(
+            "Archive extraction failed",
+            extra={"task_id": task.id, "node_id": node_id},
+        )
         _update(task, status="failed", detail=str(exc))
