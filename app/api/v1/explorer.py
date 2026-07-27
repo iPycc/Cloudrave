@@ -663,6 +663,7 @@ async def preview_archive_entry(
         headers={
             "Content-Disposition": content_disposition(filename, inline=True),
             "Cache-Control": "private, no-store",
+            "Content-Security-Policy": "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:",
             "X-Content-Type-Options": "nosniff",
         },
     )
