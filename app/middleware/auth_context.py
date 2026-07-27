@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+import logging
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy.exc import OperationalError
 
 from app.dep import Dep
 from app.models.enums import UserStatus
@@ -14,6 +17,20 @@ from app.security.jwt import AuthError
 
 
 bearer_scheme = HTTPBearer(auto_error=False)
+LOGGER = logging.getLogger(__name__)
+SESSION_TOUCH_INTERVAL = timedelta(minutes=5)
+
+
+def _session_touch_due(last_seen_at: datetime | None) -> bool:
+    if last_seen_at is None:
+        return True
+    if last_seen_at.tzinfo is None:
+        last_seen_at = last_seen_at.replace(tzinfo=UTC)
+    return datetime.now(UTC) - last_seen_at >= SESSION_TOUCH_INTERVAL
+
+
+def _is_sqlite_locked(error: OperationalError) -> bool:
+    return "database is locked" in str(error).lower()
 
 
 async def get_current_user(
@@ -46,7 +63,19 @@ async def get_current_user(
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Account disabled")
         if session_record.token_version != token_version:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session token rotated")
-        await session_repo.touch(session_id)
+        touch_due = _session_touch_due(session_record.last_seen_at)
+
+    if touch_due:
+        try:
+            async with dep.session_scope() as touch_session:
+                await dep.get_session_repository(touch_session).touch(session_id)
+        except OperationalError as error:
+            if not _is_sqlite_locked(error):
+                raise
+            LOGGER.warning(
+                "Skipped non-critical session heartbeat because SQLite is busy",
+                extra={"session_id": session_id},
+            )
 
     request.state.actor = user.uid
     return user
