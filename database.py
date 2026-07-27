@@ -41,8 +41,13 @@ def make_async_engine(config: CloudraveConfig) -> AsyncEngine:
         def _sqlite_pragmas(dbapi_connection, _connection_record) -> None:
             cursor = dbapi_connection.cursor()
             try:
+                cursor.execute("PRAGMA busy_timeout=30000")
                 cursor.execute("PRAGMA foreign_keys=ON")
-                cursor.execute("PRAGMA busy_timeout=5000")
+                cursor.execute("PRAGMA journal_mode")
+                current_journal_mode = cursor.fetchone()[0]
+                if str(current_journal_mode).lower() != "wal":
+                    cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=NORMAL")
             finally:
                 cursor.close()
     return engine
