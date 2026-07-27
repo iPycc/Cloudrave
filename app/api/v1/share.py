@@ -5,11 +5,13 @@ from __future__ import annotations
 import mimetypes
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
+from fastapi.responses import Response
 
 from app.middleware.auth_context import get_current_user
 from app.models.enums import StoragePolicyType
 from app.models.tables import Node, ShareRecord, User
 from app.schemas.common import MessageResponse
+from app.schemas.preview import PreviewManifestRead
 from app.schemas.share import (
     ShareAccessTokenResponse,
     ShareCreateRequest,
@@ -19,9 +21,15 @@ from app.schemas.share import (
     SharedNodeRead,
 )
 from app.services.explorer.download import ArchiveDownloadService, DownloadFileService
-from app.services.explorer.preview import DERIVED_CACHE_CONTROL, PreviewService, build_local_preview_response
+from app.services.explorer.preview import (
+    DERIVED_CACHE_CONTROL,
+    PreviewService,
+    build_local_preview_response,
+    relative_preview_url,
+)
 from app.services.explorer.proxy import remote_response
 from app.services.explorer.share import ShareService
+from app.services.explorer.source import content_disposition
 from app.services.user.response import build_avatar_url
 from app.storage_adapters.local_fs import LocalFsAdapter
 
@@ -37,6 +45,43 @@ def _build_share_service(request: Request, session):
         nodes=dep.get_node_repository(session),
         audits=dep.get_audit_repository(session),
         share_signing_key=dep.share_signing_key,
+    )
+
+
+def _build_preview_service(request: Request, session) -> PreviewService:
+    dep = request.app.state.dep
+    return PreviewService(
+        resolver=DownloadFileService(
+            mounts=dep.get_mount_repository(session),
+            nodes=dep.get_node_repository(session),
+            policies=dep.get_policy_repository(session),
+            objects=dep.get_object_repository(session),
+            storage_manager=dep.storage_manager,
+        ),
+        nodes=dep.get_node_repository(session),
+        objects=dep.get_object_repository(session),
+        audits=dep.get_audit_repository(session),
+        storage_manager=dep.storage_manager,
+        token_service=dep.token_service,
+        cache_root=dep.config.preview_cache_root_path,
+        public_base_url=dep.config.app.public_base_url,
+        office_ttl_seconds=dep.config.app.office_source_ttl_seconds,
+        text_max_bytes=dep.config.app.text_preview_max_bytes,
+    )
+
+
+def _share_preview_url(
+    request: Request,
+    route_name: str,
+    share_id: str,
+    node_id: int,
+    access_token: str | None,
+) -> str:
+    query: dict[str, str | int] = {"node_id": node_id}
+    if access_token:
+        query["access_token"] = access_token
+    return relative_preview_url(
+        request.url_for(route_name, share_id=share_id).include_query_params(**query)
     )
 
 
@@ -273,6 +318,86 @@ async def preview_shared_file(
         )
 
 
+@router.get("/{share_id}/preview/manifest", response_model=PreviewManifestRead)
+async def preview_shared_manifest(
+    share_id: str,
+    request: Request,
+    access_token: str | None = Query(None),
+    node_id: int | None = Query(None),
+) -> PreviewManifestRead:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = _build_share_service(request, session)
+        share, _ = await service.get_share_info(share_id)
+        _require_share_access(service, share, access_token)
+        node = await service.resolve_shared_node(share, node_id)
+        if node.type.value == "folder":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Folders cannot be previewed",
+            )
+        return await _build_preview_service(request, session).shared_manifest(
+            request,
+            node.id,
+            source_url=_share_preview_url(
+                request,
+                "preview_shared_file",
+                share_id,
+                node.id,
+                access_token,
+            ),
+            archive_entry_url=_share_preview_url(
+                request,
+                "preview_shared_archive_entry",
+                share_id,
+                node.id,
+                access_token,
+            ),
+            cover_url=_share_preview_url(
+                request,
+                "shared_audio_cover",
+                share_id,
+                node.id,
+                access_token,
+            ),
+        )
+
+
+@router.get("/{share_id}/preview/archive/entry")
+async def preview_shared_archive_entry(
+    share_id: str,
+    path: str,
+    request: Request,
+    access_token: str | None = Query(None),
+    node_id: int | None = Query(None),
+):
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = _build_share_service(request, session)
+        share, _ = await service.get_share_info(share_id)
+        _require_share_access(service, share, access_token)
+        node = await service.resolve_shared_node(share, node_id)
+        if node.type.value == "folder":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Folders cannot be previewed",
+            )
+        payload, filename, media_type = await _build_preview_service(
+            request,
+            session,
+        ).shared_archive_entry(node.id, path)
+    return Response(
+        payload,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": content_disposition(filename, inline=True),
+            "Cache-Control": "private, no-store",
+            "Content-Security-Policy": "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 @router.get("/{share_id}/cover")
 async def shared_audio_cover(
     share_id: str,
@@ -291,25 +416,7 @@ async def shared_audio_cover(
         if node.type.value == "folder":
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Folders cannot have cover art")
 
-        resolver = DownloadFileService(
-            mounts=dep.get_mount_repository(session),
-            nodes=dep.get_node_repository(session),
-            policies=dep.get_policy_repository(session),
-            objects=dep.get_object_repository(session),
-            storage_manager=dep.storage_manager,
-        )
-        preview_service = PreviewService(
-            resolver=resolver,
-            nodes=dep.get_node_repository(session),
-            objects=dep.get_object_repository(session),
-            audits=dep.get_audit_repository(session),
-            storage_manager=dep.storage_manager,
-            token_service=dep.token_service,
-            cache_root=dep.config.preview_cache_root_path,
-            public_base_url=dep.config.app.public_base_url,
-            office_ttl_seconds=dep.config.app.office_source_ttl_seconds,
-            text_max_bytes=dep.config.app.text_preview_max_bytes,
-        )
+        preview_service = _build_preview_service(request, session)
         cover_path = await preview_service.shared_audio_cover(node.id)
         if cover_path is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No embedded cover art found")
