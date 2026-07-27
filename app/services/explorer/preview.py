@@ -481,6 +481,19 @@ class PreviewService:
 
     async def archive_entry(self, actor: User, node_id: int, entry_path: str) -> tuple[bytes, str, str]:
         node, mount, policy = await self.resolver.resolve(actor, node_id)
+        return await self._archive_entry(node, mount, policy, entry_path)
+
+    async def shared_archive_entry(self, node_id: int, entry_path: str) -> tuple[bytes, str, str]:
+        node, mount, policy = await self.resolver.resolve_shared(node_id)
+        return await self._archive_entry(node, mount, policy, entry_path)
+
+    async def _archive_entry(
+        self,
+        node: Node,
+        mount: BucketMount,
+        policy: StoragePolicy,
+        entry_path: str,
+    ) -> tuple[bytes, str, str]:
         if preview_kind(node.name) != "archive":
             raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="File is not an archive")
         normalized = entry_path.replace("\\", "/").lstrip("/")
