@@ -215,7 +215,10 @@ class PreviewService:
 
     async def manifest(self, request: Request, actor: User, node_id: int) -> PreviewManifestRead:
         node, mount, policy = await self.resolver.resolve(actor, node_id)
-        return await self._build_manifest(request, node, mount, policy)
+        manifest = await self._build_manifest(request, node, mount, policy)
+        if Path(node.name).suffix.lower() == ".zip" and manifest.status == "ready":
+            manifest.capabilities.append("extract")
+        return manifest
 
     async def shared_manifest(self, request: Request, node_id: int) -> PreviewManifestRead:
         node, mount, policy = await self.resolver.resolve_shared(node_id)
