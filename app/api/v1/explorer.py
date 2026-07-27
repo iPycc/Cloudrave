@@ -6,7 +6,7 @@ import mimetypes
 from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Body, Depends, File, Form, Header, Query, Request, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import Response
 
 from app.middleware.auth_context import get_current_user
@@ -38,7 +38,13 @@ from app.schemas.upload import (
     UploadSessionPlan,
     UploadSessionRead,
 )
-from app.schemas.preview import PreviewManifestRead, PreviewPrepareRead, TextContentUpdate, TextContentUpdateRead
+from app.schemas.preview import (
+    OfficeCardPreviewRead,
+    PreviewManifestRead,
+    PreviewPrepareRead,
+    TextContentUpdate,
+    TextContentUpdateRead,
+)
 from app.schemas.task import ArchiveExtractRequest, BackgroundTaskRead
 from app.services.explorer.download import DownloadFileService
 from app.services.explorer.file import FileExplorerService
@@ -676,6 +682,37 @@ async def preview_image_asset(
             request,
             path,
             filename=filename,
+            media_type="image/webp",
+            cache_control=DERIVED_CACHE_CONTROL,
+        )
+
+
+@router.get("/preview/{node_id}/office/card", response_model=OfficeCardPreviewRead)
+async def preview_office_card(
+    node_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+) -> OfficeCardPreviewRead:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        return await _build_preview_service(dep, session).office_card_preview(current_user, node_id)
+
+
+@router.get("/preview/{node_id}/office/cover", name="preview_office_cover")
+async def preview_office_cover(
+    node_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        path = await _build_preview_service(dep, session).office_card_cover(current_user, node_id)
+        if path is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Office cover not available")
+        return build_local_preview_response(
+            request,
+            path,
+            filename="cover.webp",
             media_type="image/webp",
             cache_control=DERIVED_CACHE_CONTROL,
         )

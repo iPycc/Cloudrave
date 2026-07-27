@@ -11,6 +11,8 @@ from app.schemas.common import CloudraveSchema
 
 PreviewKind = Literal["image", "video", "audio", "pdf", "office", "text", "archive", "unsupported"]
 PreviewStatus = Literal["ready", "processing", "unsupported", "failed"]
+OfficeCardKind = Literal["document", "spreadsheet", "presentation", "unsupported"]
+OfficeCoverKind = Literal["thumbnail", "slide-image"]
 
 
 class PreviewAssetRead(CloudraveSchema):
@@ -41,6 +43,15 @@ class PreviewManifestRead(CloudraveSchema):
 class PreviewPrepareRead(CloudraveSchema):
     status: PreviewStatus
     message: str
+
+
+class OfficeCardPreviewRead(CloudraveSchema):
+    kind: OfficeCardKind
+    lines: list[str] = Field(default_factory=list)
+    rows: list[list[str]] = Field(default_factory=list)
+    cover_available: bool = False
+    cover_kind: OfficeCoverKind | None = None
+    aspect_ratio: float | None = None
 
 
 class TextContentUpdate(CloudraveSchema):
