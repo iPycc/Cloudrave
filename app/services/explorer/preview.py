@@ -220,9 +220,41 @@ class PreviewService:
             manifest.capabilities.append("extract")
         return manifest
 
-    async def shared_manifest(self, request: Request, node_id: int) -> PreviewManifestRead:
+    async def shared_manifest(
+        self,
+        request: Request,
+        node_id: int,
+        *,
+        source_url: str,
+        archive_entry_url: str | None = None,
+        cover_url: str | None = None,
+    ) -> PreviewManifestRead:
         node, mount, policy = await self.resolver.resolve_shared(node_id)
-        return await self._build_manifest(request, node, mount, policy)
+        manifest = await self._build_manifest(request, node, mount, policy)
+        assets = {
+            "source": manifest.assets["source"].model_copy(update={"url": source_url}),
+        }
+        if manifest.kind == "office":
+            for name in ("office_source", "office_viewer"):
+                if name in manifest.assets:
+                    assets[name] = manifest.assets[name]
+        if cover_url is not None and "cover" in manifest.assets:
+            assets["cover"] = manifest.assets["cover"].model_copy(update={"url": cover_url})
+        if manifest.kind == "archive" and archive_entry_url is not None:
+            assets["archive_entry"] = PreviewAssetRead(
+                url=archive_entry_url,
+                mime_type="application/octet-stream",
+            )
+        return manifest.model_copy(
+            update={
+                "assets": assets,
+                "capabilities": [
+                    capability
+                    for capability in manifest.capabilities
+                    if capability not in {"edit", "extract"}
+                ],
+            }
+        )
 
     async def _build_manifest(
         self,
