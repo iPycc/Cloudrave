@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import Field
@@ -11,6 +12,7 @@ from app.schemas.common import CloudraveSchema
 
 PreviewKind = Literal["image", "video", "audio", "pdf", "office", "text", "archive", "unsupported"]
 PreviewStatus = Literal["ready", "processing", "unsupported", "failed"]
+PreviewDelivery = Literal["cloudrave", "storage", "external"]
 OfficeCardKind = Literal["document", "spreadsheet", "presentation", "unsupported"]
 OfficeCoverKind = Literal["thumbnail", "slide-image"]
 
@@ -22,6 +24,8 @@ class PreviewAssetRead(CloudraveSchema):
     height: int | None = None
     size: int | None = None
     supports_range: bool = False
+    delivery: PreviewDelivery = "cloudrave"
+    expires_at: datetime | None = None
 
 
 class PreviewManifestRead(CloudraveSchema):

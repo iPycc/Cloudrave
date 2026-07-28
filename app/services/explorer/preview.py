@@ -231,9 +231,21 @@ class PreviewService:
     ) -> PreviewManifestRead:
         node, mount, policy = await self.resolver.resolve_shared(node_id)
         manifest = await self._build_manifest(request, node, mount, policy)
-        assets = {
-            "source": manifest.assets["source"].model_copy(update={"url": source_url}),
-        }
+        source_asset = manifest.assets["source"]
+        if source_asset.delivery == "storage":
+            assets = {
+                "source": source_asset,
+                "proxy": PreviewAssetRead(
+                    url=source_url,
+                    mime_type=source_asset.mime_type,
+                    size=source_asset.size,
+                    supports_range=source_asset.supports_range,
+                ),
+            }
+        else:
+            assets = {
+                "source": source_asset.model_copy(update={"url": source_url}),
+            }
         if manifest.kind == "office":
             for name in ("office_source", "office_viewer"):
                 if name in manifest.assets:
@@ -267,18 +279,11 @@ class PreviewService:
         version = preview_version(node)
         kind = preview_kind(node.name)
         mime_type = (record.content_type if record else None) or mimetypes.guess_type(node.name)[0] or "application/octet-stream"
-        source_url = relative_preview_url(
-            request.url_for("preview_file", node_id=node.id).include_query_params(v=version)
-        )
-        assets: dict[str, PreviewAssetRead] = {
-            "source": PreviewAssetRead(
-                url=source_url,
-                mime_type=mime_type,
-                size=node.size,
-                supports_range=True,
-            )
+        assets = await self._source_assets(request, node, mount, policy, version, mime_type)
+        metadata: dict[str, object] = {
+            "extension": Path(node.name).suffix.lower().lstrip("."),
+            "source_delivery": assets["source"].delivery,
         }
-        metadata: dict[str, object] = {"extension": Path(node.name).suffix.lower().lstrip(".")}
         capabilities = ["download", "properties"]
         manifest_status: str = "ready"
         error: str | None = None
@@ -385,11 +390,21 @@ class PreviewService:
             capabilities.extend(["pages", "search", "zoom", "print"])
         elif kind == "office":
             capabilities.append("microsoft-viewer")
-            office_source = self._office_source_url(request, node, mount, policy, version)
-            assets["office_source"] = PreviewAssetRead(url=office_source, mime_type=mime_type, size=node.size)
+            if assets["source"].delivery == "storage":
+                office_source = assets["source"].url
+                assets["office_source"] = assets["source"].model_copy()
+            else:
+                office_source = self._office_source_url(request, node, mount, policy, version)
+                assets["office_source"] = PreviewAssetRead(
+                    url=office_source,
+                    mime_type=mime_type,
+                    size=node.size,
+                    supports_range=True,
+                )
             assets["office_viewer"] = PreviewAssetRead(
                 url=f"https://view.officeapps.live.com/op/embed.aspx?src={quote(office_source, safe='')}",
                 mime_type="text/html",
+                delivery="external",
             )
             metadata["external_service"] = "Microsoft Office Web Viewer"
             metadata["requires_public_https"] = True
@@ -434,6 +449,53 @@ class PreviewService:
             preparation_available=preparation_available,
             error=error,
         )
+
+    async def _source_assets(
+        self,
+        request: Request,
+        node: Node,
+        mount: BucketMount,
+        policy: StoragePolicy,
+        version: str,
+        mime_type: str,
+    ) -> dict[str, PreviewAssetRead]:
+        proxy_asset = PreviewAssetRead(
+            url=relative_preview_url(
+                request.url_for("preview_file", node_id=node.id).include_query_params(v=version)
+            ),
+            mime_type=mime_type,
+            size=node.size,
+            supports_range=True,
+        )
+        if policy.provider == StoragePolicyType.LOCAL_FS:
+            return {"source": proxy_asset}
+        if not node.blob_path:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="File has no storage object",
+            )
+
+        adapter = self.storage_manager.get_adapter(policy)
+        signed = await call_adapter(
+            adapter,
+            "build_download_url",
+            policy,
+            mount,
+            node.blob_path,
+            download_name=node.name,
+            inline=True,
+        )
+        return {
+            "source": PreviewAssetRead(
+                url=signed.url,
+                mime_type=mime_type,
+                size=node.size,
+                supports_range=True,
+                delivery="storage",
+                expires_at=signed.expires_at,
+            ),
+            "proxy": proxy_asset,
+        }
 
     async def image_asset(self, actor: User, node_id: int, variant: str) -> tuple[Path, str]:
         if variant not in IMAGE_VARIANTS:
