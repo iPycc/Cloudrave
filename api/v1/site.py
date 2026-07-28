@@ -5,12 +5,12 @@ from __future__ import annotations
 from fastapi import APIRouter, Body, Depends, Request
 from pydantic import BaseModel, Field
 
-from app.middleware.auth_context import get_current_user
-from app.models.tables import User
-from app.repositories.site_settings import SiteSettingsRepository
-from app.schemas.site import WebsiteSettings, WebsiteSettingsResponse
-from app.security.rbac import require_admin
-from app.services.site.settings import WebsiteSettingsService, detect_site_url
+from web.mid.auth import get_current_user
+from models.tables import User
+from repositories.site_settings import SiteSettingsRepository
+from schemas.site import WebsiteSettings, WebsiteSettingsResponse
+from security.rbac import require_admin
+from services.site.settings import WebsiteSettingsService, detect_site_url
 
 
 router = APIRouter(prefix="/site", tags=["site"])

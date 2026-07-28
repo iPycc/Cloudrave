@@ -7,12 +7,12 @@ import mimetypes
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 from fastapi.responses import Response
 
-from app.middleware.auth_context import get_current_user
-from app.models.enums import StoragePolicyType
-from app.models.tables import Node, ShareRecord, User
-from app.schemas.common import MessageResponse
-from app.schemas.preview import PreviewManifestRead
-from app.schemas.share import (
+from web.mid.auth import get_current_user
+from models.enums import StoragePolicyType
+from models.tables import Node, ShareRecord, User
+from schemas.common import MessageResponse
+from schemas.preview import PreviewManifestRead
+from schemas.share import (
     ShareAccessTokenResponse,
     ShareCreateRequest,
     ShareNodeInfo,
@@ -20,18 +20,17 @@ from app.schemas.share import (
     ShareVerifyRequest,
     SharedNodeRead,
 )
-from app.services.explorer.download import ArchiveDownloadService, DownloadFileService
-from app.services.explorer.preview import (
+from services.explorer.download import ArchiveDownloadService, DownloadFileService
+from services.explorer.preview import (
     DERIVED_CACHE_CONTROL,
     PreviewService,
     build_local_preview_response,
     relative_preview_url,
 )
-from app.services.explorer.proxy import remote_response
-from app.services.explorer.share import ShareService
-from app.services.explorer.source import content_disposition
-from app.services.user.response import build_avatar_url
-from app.storage_adapters.local_fs import LocalFsAdapter
+from services.explorer.proxy import remote_response
+from services.explorer.share import ShareService
+from services.explorer.source import content_disposition
+from services.user.response import build_avatar_url
 
 
 router = APIRouter(prefix="/share", tags=["share"])
@@ -299,11 +298,12 @@ async def preview_shared_file(
         node, mount, policy = await download_service.resolve_shared(node.id)
         adapter = dep.storage_manager.get_adapter(policy)
         if policy.provider == StoragePolicyType.LOCAL_FS:
-            if not isinstance(adapter, LocalFsAdapter):
+            local_path = dep.storage_manager.local_path(policy, mount, node.blob_path)
+            if local_path is None:
                 raise RuntimeError("Local filesystem policy has no local adapter")
             return build_local_preview_response(
                 request,
-                adapter.resolve_object_path(mount, node.blob_path),
+                local_path,
                 filename=node.name,
                 media_type=mimetypes.guess_type(node.name)[0] or "application/octet-stream",
                 cache_control="private, no-store",

@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Body, Depends, Request
 
-from app.middleware.auth_context import get_current_user
-from app.models.tables import User
-from app.schemas.sync import MountSyncRead, MountSyncRequest
-from app.security.rbac import require_admin
-from app.services.admin.scan import BucketScanner
-from app.services.admin.sync import MountSyncService
+from web.mid.auth import get_current_user
+from models.tables import User
+from schemas.sync import MountSyncRead, MountSyncRequest
+from security.rbac import require_admin
+from services.admin.scan import BucketScanner
+from services.admin.sync import MountSyncService
 
 
 router = APIRouter(prefix="/admin/mount", tags=["admin-mount-sync"])

@@ -5,19 +5,19 @@ from __future__ import annotations
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 from fastapi.responses import Response
 
-from app.middleware.auth_context import get_current_user
-from app.models.tables import User
-from app.schemas.common import MessageResponse
-from app.schemas.node import NodeRead
-from app.schemas.preview import PreviewManifestRead
-from app.schemas.shared import SharedCreate, SharedNode, SharedRead, SharedSaveRequest
-from app.services.explorer.download import DownloadFileService
-from app.services.explorer.preview import PreviewService, relative_preview_url
-from app.services.explorer.share import ShareService
-from app.services.explorer.archive import ArchiveService
-from app.services.explorer.shared import SharedService
-from app.services.explorer.shared_io import SharedIo
-from app.services.explorer.source import FileSourceService, content_disposition
+from web.mid.auth import get_current_user
+from models.tables import User
+from schemas.common import MessageResponse
+from schemas.node import NodeRead
+from schemas.preview import PreviewManifestRead
+from schemas.shared import SharedCreate, SharedNode, SharedRead, SharedSaveRequest
+from services.explorer.download import DownloadFileService
+from services.explorer.preview import PreviewService, relative_preview_url
+from services.explorer.share import ShareService
+from services.explorer.archive import ArchiveService
+from services.explorer.shared import SharedService
+from services.explorer.shared_io import SharedIo
+from services.explorer.source import FileSourceService, content_disposition
 
 
 router = APIRouter(prefix="/shared", tags=["shared"])

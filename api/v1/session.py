@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response, status
 
-from app.middleware.rate_limit import login_rate_limit
-from app.schemas.auth import (
+from web.mid.rate import login_rate_limit
+from schemas.auth import (
     LoginRequest,
     LoginResponse,
     LogoutRequest,
@@ -13,20 +13,20 @@ from app.schemas.auth import (
     TokenPairResponse,
     TwoFactorVerifyRequest,
 )
-from app.schemas.passkey import (
+from schemas.passkey import (
     PasskeyAuthenticationOptionsRequest,
     PasskeyAuthenticationResponse,
     PasskeyAuthenticationVerifyRequest,
     PasskeyOptionsResponse,
 )
-from app.security.auth_cookies import clear_auth_cookies, resolve_refresh_token, set_auth_cookies
-from app.schemas.common import MessageResponse
-from app.repositories.site_settings import SiteSettingsRepository
-from app.services.session.refresh import RefreshTokenService
-from app.services.session.revoke import RevokeSessionService
-from app.services.session.two_factor import TwoFactorLoginService
-from app.services.user.passkey import PasskeyService
-from app.services.user.login import UserLoginService
+from security.auth_cookies import clear_auth_cookies, resolve_refresh_token, set_auth_cookies
+from schemas.common import MessageResponse
+from repositories.site_settings import SiteSettingsRepository
+from services.session.refresh import RefreshTokenService
+from services.session.revoke import RevokeSessionService
+from services.session.two_factor import TwoFactorLoginService
+from services.user.passkey import PasskeyService
+from services.user.login import UserLoginService
 
 
 router = APIRouter(prefix="/session", tags=["session"])

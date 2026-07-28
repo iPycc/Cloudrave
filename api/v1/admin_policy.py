@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Body, Depends, Request, status
 
-from app.middleware.auth_context import get_current_user
-from app.models.tables import User
-from app.schemas.common import MessageResponse
-from app.schemas.policy import StoragePolicyCreate, StoragePolicyRead, StoragePolicyUpdate
-from app.security.rbac import require_admin
-from app.services.admin.policy import SingleStoragePolicyService
+from web.mid.auth import get_current_user
+from models.tables import User
+from schemas.common import MessageResponse
+from schemas.policy import StoragePolicyCreate, StoragePolicyRead, StoragePolicyUpdate
+from security.rbac import require_admin
+from services.admin.policy import SingleStoragePolicyService
 
 
 router = APIRouter(prefix="/admin/policy", tags=["admin-policy"])

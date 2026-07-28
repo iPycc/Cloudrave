@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Body, Depends, Request
 
-from app.middleware.auth_context import get_current_user
-from app.models.tables import User
-from app.schemas.node import NodeDeleteRequest, NodeRead, NodeRestoreRequest
-from app.services.explorer.recycle import RecycleBinService
+from web.mid.auth import get_current_user
+from models.tables import User
+from schemas.node import NodeDeleteRequest, NodeRead, NodeRestoreRequest
+from services.explorer.recycle import RecycleBinService
 
 
 router = APIRouter(prefix="/explorer/recycle", tags=["recycle"])

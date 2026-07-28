@@ -5,10 +5,10 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, File, Request, Response, UploadFile
 from fastapi.responses import FileResponse
 
-from app.middleware.auth_context import get_current_user
-from app.middleware.rate_limit import login_rate_limit
-from app.models.tables import User
-from app.schemas.passkey import (
+from web.mid.auth import get_current_user
+from web.mid.rate import login_rate_limit
+from models.tables import User
+from schemas.passkey import (
     PasskeyListResponse,
     PasskeyOptionsResponse,
     PasskeyRead,
@@ -17,7 +17,7 @@ from app.schemas.passkey import (
     PasskeyRegistrationVerifyRequest,
     PasskeyVerificationResponse,
 )
-from app.schemas.totp import (
+from schemas.totp import (
     TwoFactorDisableRequest,
     TwoFactorSetupConfirmRequest,
     TwoFactorSetupConfirmResponse,
@@ -26,22 +26,22 @@ from app.schemas.totp import (
     TwoFactorSetupPasskeyRequest,
     TwoFactorStatusResponse,
 )
-from app.security.auth_cookies import set_auth_cookies
-from app.schemas.auth import LoginResponse, RegisterRequest, UserResponse
-from app.schemas.common import MessageResponse
-from app.schemas.user import (
+from security.auth_cookies import set_auth_cookies
+from schemas.auth import LoginResponse, RegisterRequest, UserResponse
+from schemas.common import MessageResponse
+from schemas.user import (
     LoginActivityEntry,
     PasswordChangeRequest,
     UserPreferencesResponse,
     UserPreferencesUpdateRequest,
     UserProfileUpdateRequest,
 )
-from app.repositories.site_settings import SiteSettingsRepository
-from app.services.user.passkey import PasskeyService
-from app.services.user.profile import UserProfileService
-from app.services.user.register import UserRegisterService
-from app.services.user.response import build_user_response
-from app.services.user.totp import TOTPService
+from repositories.site_settings import SiteSettingsRepository
+from services.user.passkey import PasskeyService
+from services.user.profile import UserProfileService
+from services.user.register import UserRegisterService
+from services.user.response import build_user_response
+from services.user.totp import TOTPService
 
 
 router = APIRouter(prefix="/user", tags=["user"])
