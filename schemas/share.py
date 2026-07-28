@@ -6,8 +6,8 @@ from datetime import datetime
 
 from pydantic import Field, model_validator
 
-from app.models.enums import ShareAccess
-from app.schemas.common import CloudraveSchema
+from models.enums import ShareAccess
+from schemas.common import CloudraveSchema
 
 
 class ShareCreateRequest(CloudraveSchema):

@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 from pydantic import Field
 
-from app.schemas.auth import AuthSchema, LoginResponse
+from schemas.auth import AuthSchema, LoginResponse
 
 
 class PasskeyRegistrationOptionsRequest(AuthSchema):

@@ -7,8 +7,8 @@ from typing import Any, Literal
 
 from pydantic import AliasChoices, AliasPath, Field, field_validator
 
-from app.schemas.common import CloudraveSchema
-from app.schemas.name import valid_name
+from schemas.common import CloudraveSchema
+from schemas.name import valid_name
 
 
 def _slug(value: str) -> str:

@@ -6,7 +6,7 @@ from datetime import datetime
 
 from pydantic import Field
 
-from app.schemas.common import CloudraveSchema
+from schemas.common import CloudraveSchema
 
 
 class MountSyncRequest(CloudraveSchema):

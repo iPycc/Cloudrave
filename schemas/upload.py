@@ -6,11 +6,11 @@ from datetime import datetime
 
 from pydantic import Field, field_validator
 
-from app.models.enums import UploadMode, UploadState
-from app.schemas.common import CloudraveSchema
-from app.schemas.name import valid_name
-from app.storage.limits import MAX_OBJECT_SIZE, MAX_PART_SIZE
-from app.storage.types import normalize_object_key
+from models.enums import UploadMode, UploadState
+from schemas.common import CloudraveSchema
+from schemas.name import valid_name
+from store.limits import MAX_OBJECT_SIZE, MAX_PART_SIZE
+from store.types import normalize_object_key
 
 
 class UploadSessionCreate(CloudraveSchema):

@@ -7,9 +7,9 @@ from typing import Literal
 
 from pydantic import Field, field_validator
 
-from app.models.enums import NodeStatus, NodeType
-from app.schemas.common import CloudraveSchema
-from app.schemas.name import valid_name
+from models.enums import NodeStatus, NodeType
+from schemas.common import CloudraveSchema
+from schemas.name import valid_name
 
 
 class NodeRead(CloudraveSchema):

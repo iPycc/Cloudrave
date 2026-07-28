@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from pydantic import Field
 
-from app.schemas.auth import AuthSchema
+from schemas.auth import AuthSchema
 
 
 class TwoFactorStatusResponse(AuthSchema):

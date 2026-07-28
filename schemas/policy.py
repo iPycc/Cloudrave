@@ -6,8 +6,8 @@ from typing import Any
 
 from pydantic import Field, field_validator
 
-from app.models.enums import StoragePolicyType
-from app.schemas.common import CloudraveSchema
+from models.enums import StoragePolicyType
+from schemas.common import CloudraveSchema
 
 
 class StoragePolicyBase(CloudraveSchema):

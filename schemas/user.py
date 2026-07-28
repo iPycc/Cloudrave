@@ -6,7 +6,7 @@ from datetime import datetime
 
 from pydantic import EmailStr, Field
 
-from app.schemas.auth import AuthSchema, UserResponse
+from schemas.auth import AuthSchema, UserResponse
 
 
 class UserProfileUpdateRequest(AuthSchema):

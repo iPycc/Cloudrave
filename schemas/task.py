@@ -7,7 +7,7 @@ from typing import Literal
 
 from pydantic import Field
 
-from app.schemas.common import CloudraveSchema
+from schemas.common import CloudraveSchema
 
 
 class ArchiveExtractRequest(CloudraveSchema):
