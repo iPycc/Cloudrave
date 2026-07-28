@@ -19,8 +19,6 @@ def normalize_object_key(value: str) -> str:
         raise ValueError("object key is required")
     parts: list[str] = []
     for part in PurePosixPath(candidate).parts:
-        if part in {"", "."}:
-            continue
         if part == "..":
             raise ValueError("object key cannot contain parent traversal")
         parts.append(part)
@@ -114,6 +112,9 @@ class StorageAdapter(Protocol):
     capabilities: StorageCapability
 
     def prepare_mount_root(self, mount: Any) -> Path:
+        ...
+
+    def local_path(self, mount: Any, object_key: str) -> Path | None:
         ...
 
     def physical_id(self, policy: Any, mount: Any, object_key: str) -> str:

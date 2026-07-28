@@ -57,9 +57,7 @@ class AsyncCosStream:
             yield chunk
 
     async def close(self) -> None:
-        close = getattr(self._body, "close", None)
-        if close is not None:
-            await asyncio.to_thread(close)
+        await asyncio.to_thread(self._body.close)
 
     async def __aenter__(self) -> "AsyncCosStream":
         return self

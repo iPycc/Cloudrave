@@ -12,14 +12,14 @@ from threading import Lock
 from typing import Any
 from urllib.parse import urlsplit
 
-from app.storage_adapters.base import StorageAdapterBase
-from app.storage_adapters.cos_cors import RULE_ID, configured_origins, merge_rule
-from app.storage.identity import physical_hash
-from app.storage_adapters.cos_key import mount_prefix, physical_key, physical_list_prefix
-from app.storage_adapters.cos_obj import CosObjectMixin
-from app.storage_adapters.cos_upload import CosUploadMixin
-from app.storage.types import StorageCapability
-from config import TencentCosConfig
+from store.port import StorageAdapterBase
+from store.cos.cors import RULE_ID, configured_origins, merge_rule
+from store.identity import physical_hash
+from store.cos.key import mount_prefix, physical_key, physical_list_prefix
+from store.cos.obj import CosObjectMixin
+from store.cos.upload import CosUploadMixin
+from store.types import StorageCapability
+from core.cfg import TencentCosConfig
 
 CLIENT_CACHE_SIZE = 64
 

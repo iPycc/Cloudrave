@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import PurePath
 from uuid import uuid4
 
-from app.storage.types import join_object_key
+from store.types import join_object_key
 
 
 MANAGED_PREFIX = "blob"

@@ -6,8 +6,8 @@ import asyncio
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from app.storage.types import MultipartPart, MultipartUploadState, PresignedURL, StorageObject, utcnow
-from app.storage_adapters.cos_sec import (
+from store.types import MultipartPart, MultipartUploadState, PresignedURL, StorageObject, utcnow
+from store.cos.sec import (
     assert_encryption,
     encryption_args,
     metadata_headers,

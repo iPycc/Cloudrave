@@ -9,9 +9,9 @@ from pathlib import Path
 from typing import BinaryIO
 from uuid import uuid4
 
-from app.storage_adapters.base import StorageAdapterBase
-from app.storage.identity import physical_hash
-from app.storage.types import (
+from store.port import StorageAdapterBase
+from store.identity import physical_hash
+from store.types import (
     MultipartPart,
     MultipartUploadState,
     PresignedURL,
@@ -20,7 +20,7 @@ from app.storage.types import (
     normalize_object_key,
     utcnow,
 )
-from app.storage.stream import copy_stream, write_atomic
+from store.stream import copy_stream, write_atomic
 
 
 class LocalFsAdapter(StorageAdapterBase):
@@ -67,7 +67,7 @@ class LocalFsAdapter(StorageAdapterBase):
         root = (self.prepare_mount_root(mount) / "objects").resolve()
         return self._contained(root, (root / normalized).resolve(), "object_key")
 
-    def resolve_object_path(self, mount, object_key: str) -> Path:
+    def local_path(self, mount, object_key: str) -> Path:
         """Return a validated local path for optimized internal file serving."""
 
         return self._resolve_object_path(mount, object_key)

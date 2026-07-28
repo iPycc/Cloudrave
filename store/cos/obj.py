@@ -7,10 +7,10 @@ from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from app.storage.types import StorageObject, StorageObjectPage
-from app.storage_adapters.cos_parse import object_from_head, page_from_response
-from app.storage_adapters.cos_sec import assert_encryption, encryption_args, metadata_headers
-from app.storage_adapters.cos_stream import AsyncCosStream, CosStream
+from store.types import StorageObject, StorageObjectPage
+from store.cos.parse import object_from_head, page_from_response
+from store.cos.sec import assert_encryption, encryption_args, metadata_headers
+from store.cos.stream import AsyncCosStream, CosStream
 
 
 class CosObjectMixin:

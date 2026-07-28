@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.storage.types import normalize_object_key
+from store.types import normalize_object_key
 
 
 def clean_prefix(value: str | None) -> str:
