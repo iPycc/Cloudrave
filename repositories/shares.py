@@ -9,8 +9,8 @@ from sqlalchemy import and_, case, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.models.enums import ShareAccess
-from app.models.tables import ShareItem, ShareRecord
+from models.enums import ShareAccess
+from models.tables import ShareItem, ShareRecord
 
 _SHARE_ID_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
 _SHARE_ID_LENGTH = 6

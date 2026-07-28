@@ -8,8 +8,8 @@ import string
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.enums import UserRole, UserStatus
-from app.models.tables import SystemMeta, User, utcnow
+from models.enums import UserRole, UserStatus
+from models.tables import SystemMeta, User, utcnow
 
 
 UID_ALPHABET = string.ascii_uppercase + string.digits

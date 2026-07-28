@@ -5,7 +5,7 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.shared import ShareMount
+from models.shared import ShareMount
 
 
 class SharedRepository:

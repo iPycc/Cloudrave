@@ -5,7 +5,7 @@ from __future__ import annotations
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.tables import AuditLog, User
+from models.tables import AuditLog, User
 
 
 class AuditLogRepository:

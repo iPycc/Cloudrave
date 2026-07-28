@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.tables import PasskeyCeremony, PasskeyCredential
+from models.tables import PasskeyCeremony, PasskeyCredential
 
 
 def _ensure_utc(value: datetime) -> datetime:

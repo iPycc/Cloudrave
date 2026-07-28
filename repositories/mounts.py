@@ -5,10 +5,10 @@ from __future__ import annotations
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.enums import UploadState
-from app.models.tables import BucketMount, UploadSessionRecord
-from app.models.gc import GcTask
-from app.schemas.mount import BucketMountCreate, BucketMountUpdate
+from models.enums import UploadState
+from models.tables import BucketMount, UploadSessionRecord
+from models.gc import GcTask
+from schemas.mount import BucketMountCreate, BucketMountUpdate
 
 
 class BucketMountRepository:

@@ -8,7 +8,7 @@ from uuid import uuid4
 from sqlalchemy import BigInteger, Index, JSON, Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.models.enums import (
+from models.enums import (
     NodeStatus,
     NodeType,
     SessionStatus,
@@ -19,7 +19,7 @@ from app.models.enums import (
     UserRole,
     UserStatus,
 )
-from database import Base
+from db.base import Base
 
 
 def utcnow() -> datetime:

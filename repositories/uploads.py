@@ -5,8 +5,8 @@ from __future__ import annotations
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.enums import UploadMode, UploadState
-from app.models.tables import UploadPartRecord, UploadSessionRecord
+from models.enums import UploadMode, UploadState
+from models.tables import UploadPartRecord, UploadSessionRecord
 
 
 class UploadRepository:

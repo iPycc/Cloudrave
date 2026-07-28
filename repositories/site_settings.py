@@ -7,7 +7,7 @@ import json
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.tables import SystemMeta
+from models.tables import SystemMeta
 
 
 SITE_SETTINGS_KEY = "site.settings"

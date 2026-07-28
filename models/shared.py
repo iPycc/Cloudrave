@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from sqlalchemy import DateTime, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
-from database import Base
+from db.base import Base
 
 
 class ShareMount(Base):

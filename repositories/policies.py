@@ -5,8 +5,8 @@ from __future__ import annotations
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.tables import BucketMount, StoragePolicy
-from app.schemas.policy import StoragePolicyCreate, StoragePolicyUpdate
+from models.tables import BucketMount, StoragePolicy
+from schemas.policy import StoragePolicyCreate, StoragePolicyUpdate
 
 
 class StoragePolicyRepository:

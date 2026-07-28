@@ -7,8 +7,8 @@ from datetime import UTC, datetime
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.enums import SessionStatus
-from app.models.tables import Session
+from models.enums import SessionStatus
+from models.tables import Session
 
 
 class SessionRepository:

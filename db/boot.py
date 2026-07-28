@@ -7,16 +7,16 @@ from pathlib import Path
 
 from sqlalchemy import select
 
-from config import CloudraveConfig, load_config
-from database import create_schema, make_async_engine, make_session_factory, session_scope
-from logging_config import configure_logging, get_logger
+from core.cfg import CloudraveConfig, load_config
+from db.base import create_schema, make_async_engine, make_session_factory, session_scope
+from core.log import configure_logging, get_logger
 
 
 LOGGER = get_logger(__name__)
 
 
 async def run_bootstrap_async(root_dir: Path | None = None) -> CloudraveConfig:
-    resolved_root = (root_dir or Path(__file__).resolve().parent).resolve()
+    resolved_root = (root_dir or Path(__file__).resolve().parents[2]).resolve()
     config = load_config(resolved_root)
     configure_logging(config)
     _ensure_directories(config)
@@ -26,7 +26,7 @@ async def run_bootstrap_async(root_dir: Path | None = None) -> CloudraveConfig:
         await create_schema(engine)
         session_factory = make_session_factory(engine)
         async with session_scope(session_factory) as session:
-            from app.models.tables import SystemMeta
+            from models.tables import SystemMeta
 
             admin_state = await session.scalar(
                 select(SystemMeta).where(SystemMeta.key == "auth.first_admin_user_id")

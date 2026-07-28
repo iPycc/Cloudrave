@@ -1,9 +1,10 @@
 """Import ORM tables so metadata is registered."""
 
-from app.models.blob import BlobRef
-from app.models.gc import GcTask
-from app.models.shared import ShareMount
-from app.models.tables import (
+from models.blob import BlobRef
+from models.gc import GcTask
+from models.shared import ShareMount
+from db.mig.row import SchemaMigration
+from models.tables import (
     AuditLog,
     BucketMount,
     Node,
@@ -32,6 +33,7 @@ __all__ = [
     "Session",
     "ShareItem",
     "ShareMount",
+    "SchemaMigration",
     "ShareRecord",
     "StoragePolicy",
     "SystemMeta",

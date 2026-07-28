@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.blob import BlobRef
+from models.blob import BlobRef
 
 
 class BlobUnavailable(RuntimeError):

@@ -9,8 +9,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from app.models.enums import NodeStatus, NodeType
-from app.models.tables import Node, ObjectRecord
+from models.enums import NodeStatus, NodeType
+from models.tables import Node, ObjectRecord
 
 
 ID_BATCH_SIZE = 500
