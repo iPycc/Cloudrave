@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 
 import jwt
 
-from config import AuthConfig
+from core.cfg import AuthConfig
 
 
 class AuthError(Exception):

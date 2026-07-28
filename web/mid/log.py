@@ -7,7 +7,7 @@ import time
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
-from logging_config import get_logger
+from core.log import get_logger
 
 
 LOGGER = get_logger("cloudrave.http")

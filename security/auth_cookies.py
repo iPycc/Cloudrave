@@ -6,8 +6,8 @@ from datetime import datetime
 
 from fastapi import Request, Response
 
-from app.schemas.auth import TokenPairResponse
-from config import CloudraveConfig
+from schemas.auth import TokenPairResponse
+from core.cfg import CloudraveConfig
 
 
 ACCESS_TOKEN_COOKIE = "cloudrave_access_token"
@@ -58,7 +58,7 @@ def resolve_refresh_token(request: Request, payload_token: str | None) -> str | 
 
 
 def _seconds_until(value) -> int:
-    now = datetime.now(value.tzinfo) if value.tzinfo else datetime.utcnow()
+    now = datetime.now(value.tzinfo) if value.tzinfo else datetime.now()
     return int((value - now).total_seconds())
 
 

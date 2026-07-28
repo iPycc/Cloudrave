@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from fastapi import HTTPException, status
 
-from app.models.enums import UserRole
-from app.models.tables import User
+from models.enums import UserRole
+from models.tables import User
 
 
 def require_admin(user: User) -> None:

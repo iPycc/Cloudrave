@@ -8,25 +8,25 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.repositories.audit_logs import AuditLogRepository
-from app.repositories.mounts import BucketMountRepository
-from app.repositories.nodes import NodeRepository
-from app.repositories.objects import ObjectRepository
-from app.repositories.passkeys import PasskeyRepository
-from app.repositories.policies import StoragePolicyRepository
-from app.repositories.sessions import SessionRepository
-from app.repositories.shared import SharedRepository
-from app.repositories.shares import ShareRepository
-from app.repositories.site_settings import SiteSettingsRepository
-from app.repositories.uploads import UploadRepository
-from app.repositories.users import UserRepository
-from app.security.jwt import TokenService
-from app.security.password import PasswordService
-from app.storage.manager import StorageManager
-from app.services.explorer.gc_job import GcWorker
-from config import CloudraveConfig
-from database import create_schema, make_async_engine, make_session_factory, session_scope, write_schema_sql
-from logging_config import LogOperation, LogOutcome, get_logger
+from repositories.audit_logs import AuditLogRepository
+from repositories.mounts import BucketMountRepository
+from repositories.nodes import NodeRepository
+from repositories.objects import ObjectRepository
+from repositories.passkeys import PasskeyRepository
+from repositories.policies import StoragePolicyRepository
+from repositories.sessions import SessionRepository
+from repositories.shared import SharedRepository
+from repositories.shares import ShareRepository
+from repositories.site_settings import SiteSettingsRepository
+from repositories.uploads import UploadRepository
+from repositories.users import UserRepository
+from security.jwt import TokenService
+from security.password import PasswordService
+from store.manager import StorageManager
+from services.explorer.gc_job import GcWorker
+from core.cfg import CloudraveConfig
+from db.base import create_schema, make_async_engine, make_session_factory, session_scope, write_schema_sql
+from core.log import LogOperation, LogOutcome, get_logger
 
 
 LOGGER = get_logger("cloudrave.bootstrap")
@@ -72,7 +72,7 @@ class Dep:
             "Database connection check passed.",
             extra={
                 "operation": LogOperation.DATABASE_CHECK,
-                "resource": "database",
+                "resource": "cloudrave.db.base",
                 "outcome": LogOutcome.SUCCESS,
             },
         )
@@ -96,7 +96,7 @@ class Dep:
         LOGGER.info("Database schema and runtime migrations are ready.")
 
         async with self.session_scope() as session:
-            from app.services.admin.ids import ObjectIdService
+            from services.admin.ids import ObjectIdService
 
             filled, failed = await ObjectIdService(
                 session=session,
@@ -109,7 +109,7 @@ class Dep:
                 LOGGER.info("Physical object identities backfilled: %s ready, %s unresolved.", filled, failed)
 
         async with self.session_scope() as session:
-            from app.services.explorer.gc import ObjectGc
+            from services.explorer.gc import ObjectGc
 
             cleaned = await ObjectGc(
                 mounts=self.get_mount_repository(session),
@@ -131,7 +131,7 @@ class Dep:
         async with self.session_scope() as session:
             from sqlalchemy import select
 
-            from app.models.tables import SystemMeta
+            from models.tables import SystemMeta
 
             admin_state = await session.scalar(
                 select(SystemMeta).where(SystemMeta.key == "auth.first_admin_user_id")

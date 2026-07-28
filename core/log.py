@@ -8,7 +8,7 @@ from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 
-from config import CloudraveConfig
+from core.cfg import CloudraveConfig
 
 
 RESET = "\033[0m"

@@ -10,16 +10,16 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from app import __version__
-from app.api.v1 import router as v1_router
-from app.dep import Dep
-from app.exception_handlers import install_exception_handlers
-from app.middleware.logging import LoggingMiddleware
-from app.middleware.request_id import RequestIdMiddleware
-from app.middleware.security_headers import SecurityHeadersMiddleware
-from app.middleware.spa_fallback import SpaFallbackMiddleware
-from config import CloudraveConfig
-from logging_config import LogOperation, LogOutcome, configure_logging, get_logger
+from core.ver import __version__
+from api.v1 import router as v1_router
+from core.dep import Dep
+from web.err import install_exception_handlers
+from web.mid.log import LoggingMiddleware
+from web.mid.rid import RequestIdMiddleware
+from web.mid.sec import SecurityHeadersMiddleware
+from web.mid.spa import SpaFallbackMiddleware
+from core.cfg import CloudraveConfig
+from core.log import LogOperation, LogOutcome, configure_logging, get_logger
 
 
 LOGGER = get_logger("cloudrave.lifecycle")
@@ -33,8 +33,8 @@ def _is_pyinstaller_bundle() -> bool:
 def _resolve_assets_dir(config: CloudraveConfig) -> Path | None:
     """Locate bundled frontend assets.
 
-    When running from source, assets live next to ``main.py``. When packaged
-    with PyInstaller, assets are bundled next to the executable.
+    When running from source, assets live in the repository root. When
+    packaged with PyInstaller, assets are bundled next to the executable.
     """
     candidates: list[Path] = []
 

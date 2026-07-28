@@ -10,10 +10,10 @@ from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.exc import OperationalError
 
-from app.dep import Dep
-from app.models.enums import UserStatus
-from app.security.auth_cookies import ACCESS_TOKEN_COOKIE
-from app.security.jwt import AuthError
+from core.dep import Dep
+from models.enums import UserStatus
+from security.auth_cookies import ACCESS_TOKEN_COOKIE
+from security.jwt import AuthError
 
 
 bearer_scheme = HTTPBearer(auto_error=False)
