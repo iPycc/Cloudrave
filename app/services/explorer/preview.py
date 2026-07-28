@@ -48,6 +48,7 @@ from app.security.jwt import AuthError, TokenService
 from app.services.explorer.download import DownloadFileService
 from app.storage.manager import StorageManager
 from app.storage.call import call_adapter
+from app.storage.errors import is_not_found
 from app.storage.key import managed_key
 from app.storage_adapters.local_fs import LocalFsAdapter
 
@@ -476,6 +477,21 @@ class PreviewService:
             )
 
         adapter = self.storage_manager.get_adapter(policy)
+        try:
+            await call_adapter(
+                adapter,
+                "head_object",
+                policy,
+                mount,
+                node.blob_path,
+            )
+        except Exception as exc:
+            if is_not_found(exc):
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="预览源文件在存储中不存在",
+                ) from exc
+            raise
         signed = await call_adapter(
             adapter,
             "build_download_url",

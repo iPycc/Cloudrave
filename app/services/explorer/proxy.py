@@ -14,6 +14,7 @@ from fastapi.responses import Response, StreamingResponse
 
 from app.services.explorer.source import content_disposition
 from app.storage.call import call_adapter
+from app.storage.errors import is_not_found
 
 
 CHUNK_SIZE = 1024 * 1024
@@ -108,7 +109,15 @@ async def remote_response(
 ) -> Response:
     """Stream a private provider object without buffering it in ASGI memory."""
 
-    obj = await call_adapter(adapter, "head_object", policy, mount, object_key)
+    try:
+        obj = await call_adapter(adapter, "head_object", policy, mount, object_key)
+    except Exception as exc:
+        if is_not_found(exc):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="预览源文件在存储中不存在",
+            ) from exc
+        raise
     size = int(obj.size or 0)
     etag = _etag(obj.etag)
     media_type = obj.mime_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
@@ -149,14 +158,22 @@ async def remote_response(
 
     if request.method == "HEAD":
         return Response(status_code=response_status, media_type=media_type, headers=base_headers)
-    stream = await call_adapter(
-        adapter,
-        "open_object",
-        policy,
-        mount,
-        object_key,
-        **({"byte_range": open_range} if open_range else {}),
-    )
+    try:
+        stream = await call_adapter(
+            adapter,
+            "open_object",
+            policy,
+            mount,
+            object_key,
+            **({"byte_range": open_range} if open_range else {}),
+        )
+    except Exception as exc:
+        if is_not_found(exc):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="预览源文件在存储中不存在",
+            ) from exc
+        raise
     return StreamingResponse(
         _chunks(stream),
         status_code=response_status,

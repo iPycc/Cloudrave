@@ -4,11 +4,15 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from types import MethodType, SimpleNamespace
 
+import pytest
+from fastapi import HTTPException
 from starlette.datastructures import URL
+from starlette.requests import Request
 
 from app.models.enums import StoragePolicyType
 from app.schemas.preview import PreviewAssetRead, PreviewManifestRead
 from app.services.explorer.preview import PreviewService
+from app.services.explorer.proxy import remote_response
 from app.storage.types import PresignedURL
 
 
@@ -21,7 +25,12 @@ class _Request:
 class _SignedAdapter:
     def __init__(self, expires_at: datetime) -> None:
         self.expires_at = expires_at
+        self.head_calls: list[str] = []
         self.calls: list[dict[str, object]] = []
+
+    async def ahead_object(self, _policy, _mount, object_key: str):
+        self.head_calls.append(object_key)
+        return SimpleNamespace(size=1024)
 
     async def abuild_download_url(self, _policy, _mount, object_key: str, **kwargs):
         self.calls.append({"object_key": object_key, **kwargs})
@@ -69,6 +78,7 @@ def test_cos_preview_source_is_signed_direct_with_proxy_fallback() -> None:
     assert assets["source"].expires_at == expires_at
     assert assets["proxy"].delivery == "cloudrave"
     assert assets["proxy"].url == "/api/v1/explorer/preview/42?v=version-1"
+    assert adapter.head_calls == ["managed/report.pdf"]
     assert adapter.calls == [
         {
             "object_key": "managed/report.pdf",
@@ -98,6 +108,7 @@ def test_local_preview_source_stays_on_cloudrave() -> None:
     assert list(assets) == ["source"]
     assert assets["source"].delivery == "cloudrave"
     assert assets["source"].url == "/api/v1/explorer/preview/7?v=version-2"
+    assert adapter.head_calls == []
     assert adapter.calls == []
 
 
@@ -143,3 +154,79 @@ def test_shared_manifest_keeps_signed_source_and_uses_share_route_as_fallback() 
     assert manifest.assets["source"].url.startswith("https://bucket.cos.example/")
     assert manifest.assets["proxy"].delivery == "cloudrave"
     assert manifest.assets["proxy"].url == "/api/v1/share/public/preview?node_id=9"
+
+
+def test_remote_preview_maps_missing_cos_object_to_404() -> None:
+    class _MissingResource(Exception):
+        def get_error_code(self) -> str:
+            return "NoSuchResource"
+
+    class _MissingAdapter:
+        async def ahead_object(self, *_args, **_kwargs):
+            raise _MissingResource()
+
+    request = Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "https",
+            "path": "/api/v1/explorer/preview/343",
+            "raw_path": b"/api/v1/explorer/preview/343",
+            "query_string": b"",
+            "headers": [],
+            "client": ("127.0.0.1", 1234),
+            "server": ("cloudrave.test", 443),
+        }
+    )
+
+    with pytest.raises(HTTPException) as captured:
+        asyncio.run(
+            remote_response(
+                request,
+                adapter=_MissingAdapter(),
+                policy=SimpleNamespace(),
+                mount=SimpleNamespace(),
+                object_key="blob/missing.md",
+                filename="missing.md",
+            )
+        )
+
+    assert captured.value.status_code == 404
+    assert captured.value.detail == "预览源文件在存储中不存在"
+
+
+def test_preview_manifest_maps_missing_cos_object_to_404() -> None:
+    class _MissingResource(Exception):
+        def get_error_code(self) -> str:
+            return "NoSuchResource"
+
+    class _MissingAdapter:
+        async def ahead_object(self, *_args, **_kwargs):
+            raise _MissingResource()
+
+    service = object.__new__(PreviewService)
+    service.storage_manager = SimpleNamespace(
+        get_adapter=lambda _policy: _MissingAdapter()
+    )
+    node = SimpleNamespace(
+        id=343,
+        name="CHANGELOG.md",
+        size=2320,
+        blob_path="blob/missing-CHANGELOG.md",
+    )
+
+    with pytest.raises(HTTPException) as captured:
+        asyncio.run(
+            service._source_assets(
+                _Request(),
+                node,
+                SimpleNamespace(),
+                SimpleNamespace(provider=StoragePolicyType.TENCENT_COS),
+                "version-missing",
+                "text/markdown",
+            )
+        )
+
+    assert captured.value.status_code == 404
+    assert captured.value.detail == "预览源文件在存储中不存在"
