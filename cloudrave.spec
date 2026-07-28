@@ -11,6 +11,8 @@ created next to the executable so they persist across runs.
 
 from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_submodules
+
 ROOT = Path(SPECPATH).resolve()
 ASSETS_DIR = ROOT / "assets"
 
@@ -55,12 +57,7 @@ a = Analysis(
         "webauthn.helpers.exceptions",
         "webauthn.helpers.cose",
         # Tencent COS
-        "cos_python_sdk_v5",
-        "cos_python_sdk_v5.cos_client",
-        "cos_python_sdk_v5.cos_auth",
-        "cos_python_sdk_v5.cos_threadpool",
-        "cos_python_sdk_v5.cos_comm",
-        "cos_python_sdk_v5.cos_encryption_client",
+        *collect_submodules("qcloud_cos"),
         # SQLAlchemy / models
         "sqlalchemy.ext.asyncio",
         "app.models",

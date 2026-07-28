@@ -154,11 +154,13 @@ python build-fullstack.py --binary
 
 #### 多平台 CI 打包
 
-仓库包含 [`.github/workflows/build-binaries.yml`](.github/workflows/build-binaries.yml)，推送 `v*` 标签或手动触发后，会在 Ubuntu、Windows、macOS 三个环境分别编译并发布到 GitHub Release。
+仓库包含 [`.github/workflows/build-binaries.yml`](.github/workflows/build-binaries.yml)。手动触发会进行一次不发布的多平台构建预演；推送 `v*` 标签后，会构建完整嵌入前端的 Linux x86_64、Windows x86_64、macOS ARM64、macOS Intel 可执行包，以及独立前端静态资源包，并附带 SHA-256 校验清单发布到 GitHub Release。
+
+发布使用的前端提交固定记录在 [`.frontend-ref`](.frontend-ref) 中。更新前端后，应先通过前端验证并推送提交，再更新此文件，确保发布构建可复现。
 
 ```bash
-git tag v1.0.0
-git push origin v1.0.0
+git tag -a v1.0.0-beta.1 -m "Cloudrave v1.0.0-beta.1"
+git push origin v1.0.0-beta.1
 ```
 
 ## 🛠️ 技术栈

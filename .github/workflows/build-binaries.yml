@@ -1,4 +1,4 @@
-name: Build Cloudrave binaries
+name: Build Cloudrave release artifacts
 
 on:
   workflow_dispatch:
@@ -6,101 +6,328 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: read
+
+concurrency:
+  group: build-cloudrave-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  build:
-    name: Build ${{ matrix.os }} binary
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: linux
-            asset_name: cloudrave-linux
-          - os: windows-latest
-            target: windows
-            asset_name: cloudrave-windows
-          - os: macos-latest
-            target: macos
-            asset_name: cloudrave-macos
-
+  frontend:
+    name: Build pinned frontend
+    runs-on: ubuntu-24.04
+    outputs:
+      frontend_sha: ${{ steps.frontend-ref.outputs.sha }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Checkout backend release source
+        uses: actions/checkout@v6
         with:
-          python-version: "3.12"
+          path: Cloudrave
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - name: Read pinned frontend commit
+        id: frontend-ref
+        shell: bash
+        run: |
+          sha="$(tr -d '\r\n' < Cloudrave/.frontend-ref)"
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid frontend commit in Cloudrave/.frontend-ref: $sha" >&2
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout pinned frontend
+        uses: actions/checkout@v6
         with:
-          node-version: "22"
+          repository: iPycc/frontend
+          ref: ${{ steps.frontend-ref.outputs.sha }}
+          path: Frontend
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
           version: 9
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: Frontend/pnpm-lock.yaml
+
       - name: Install frontend dependencies
-        working-directory: ./Frontend
+        working-directory: Frontend
         run: pnpm install --frozen-lockfile
 
+      - name: Validate frontend types
+        working-directory: Frontend
+        run: pnpm lint
+
       - name: Build frontend
-        working-directory: ./Frontend
+        working-directory: Frontend
         run: pnpm build
 
-      - name: Copy frontend assets into backend
+      - name: Package standalone frontend
+        shell: bash
         run: |
-          mkdir -p Cloudrave/assets
-          cp -r Frontend/dist/* Cloudrave/assets/
+          mkdir -p release
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from zipfile import ZIP_DEFLATED, ZipFile
 
-      - name: Install Python dependencies
-        working-directory: ./Cloudrave
+          source = Path("Frontend/dist")
+          target = Path("release") / f"cloudrave-frontend-{os.environ['GITHUB_REF_NAME']}.zip"
+          with ZipFile(target, "w", ZIP_DEFLATED) as archive:
+              for path in sorted(source.rglob("*")):
+                  if path.is_file():
+                      archive.write(path, path.relative_to(source))
+          PY
+
+      - name: Upload frontend for native builds
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: Frontend/dist
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload standalone frontend artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-frontend
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  backend-test:
+    name: Validate backend
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout backend
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install backend test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Compile backend
+        run: python -m compileall -q app
+
+      - name: Run backend tests
+        run: python -m pytest -q tests
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs:
+      - frontend
+      - backend-test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: linux-x86_64
+            executable: cloudrave
+          - os: windows-2022
+            target: windows-x86_64
+            executable: cloudrave.exe
+          - os: macos-15
+            target: macos-arm64
+            executable: cloudrave
+          - os: macos-15-intel
+            target: macos-x86_64
+            executable: cloudrave
+
+    steps:
+      - name: Checkout backend
+        uses: actions/checkout@v6
+        with:
+          path: Cloudrave
+
+      - name: Download compiled frontend
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: Cloudrave/assets
+
+      - name: Verify embedded frontend
+        shell: bash
+        run: test -f Cloudrave/assets/index.html
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install backend build dependencies
+        working-directory: Cloudrave
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[build]"
 
-      - name: Build binary
-        working-directory: ./Cloudrave
+      - name: Build native binary
+        working-directory: Cloudrave
         run: python build_binary.py
 
-      - name: Package binary (Linux/macOS)
-        if: matrix.target != 'windows'
-        working-directory: ./Cloudrave
+      - name: Smoke test native binary
+        if: runner.os != 'Windows'
+        shell: bash
         run: |
-          tar -czf ${{ matrix.asset_name }}.tar.gz -C dist cloudrave
+          cd Cloudrave/dist
+          ./cloudrave > smoke.stdout.log 2> smoke.stderr.log &
+          pid=$!
+          cleanup() {
+            pkill -TERM -P "$pid" 2>/dev/null || true
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
 
-      - name: Package binary (Windows)
-        if: matrix.target == 'windows'
-        working-directory: ./Cloudrave
+          for _ in {1..60}; do
+            if python -c 'import json; from urllib.request import urlopen; health = json.load(urlopen("http://127.0.0.1:1309/api/v1/explorer/health", timeout=2)); root = urlopen("http://127.0.0.1:1309/", timeout=2).read(); raise SystemExit(0 if health.get("status") == "ok" and b"/assets/index-" in root else 1)'; then
+              exit 0
+            fi
+            if ! kill -0 "$pid" 2>/dev/null; then
+              cat smoke.stdout.log smoke.stderr.log
+              exit 1
+            fi
+            sleep 1
+          done
+
+          cat smoke.stdout.log smoke.stderr.log
+          exit 1
+
+      - name: Smoke test native binary
+        if: runner.os == 'Windows'
         shell: powershell
         run: |
-          Compress-Archive -Path dist\cloudrave.exe -DestinationPath ${{ matrix.asset_name }}.zip
+          $stdout = Join-Path $PWD "Cloudrave\dist\smoke.stdout.log"
+          $stderr = Join-Path $PWD "Cloudrave\dist\smoke.stderr.log"
+          $process = Start-Process `
+            -FilePath (Join-Path $PWD "Cloudrave\dist\cloudrave.exe") `
+            -PassThru `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr
+          $ready = $false
+          try {
+            foreach ($attempt in 1..60) {
+              if ($process.HasExited) {
+                break
+              }
+              try {
+                $health = Invoke-RestMethod `
+                  -Uri "http://127.0.0.1:1309/api/v1/explorer/health" `
+                  -TimeoutSec 2
+                if ($health.status -eq "ok") {
+                  $root = Invoke-WebRequest `
+                    -Uri "http://127.0.0.1:1309/" `
+                    -UseBasicParsing `
+                    -TimeoutSec 2
+                  if ($root.Content -match "/assets/index-") {
+                    $ready = $true
+                    break
+                  }
+                }
+              } catch {
+                Start-Sleep -Seconds 1
+              }
+            }
+            if (-not $ready) {
+              Get-Content $stdout, $stderr -ErrorAction SilentlyContinue
+              throw "Cloudrave binary did not pass the health check."
+            }
+          } finally {
+            $expectedExecutable = (Resolve-Path "Cloudrave\dist\cloudrave.exe").Path
+            $listeners = Get-NetTCPConnection `
+              -State Listen `
+              -LocalPort 1309 `
+              -ErrorAction SilentlyContinue
+            foreach ($listener in $listeners) {
+              $listenerProcess = Get-Process `
+                -Id $listener.OwningProcess `
+                -ErrorAction SilentlyContinue
+              if ($listenerProcess.Path -eq $expectedExecutable) {
+                Stop-Process -Id $listener.OwningProcess -Force
+              }
+            }
+            if (-not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force
+            }
+          }
 
-      - name: Upload artifact
+      - name: Package Linux or macOS binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p release
+          tar -czf "release/cloudrave-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" \
+            -C Cloudrave/dist "${{ matrix.executable }}"
+
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Path release -Force | Out-Null
+          Compress-Archive `
+            -Path "Cloudrave\dist\${{ matrix.executable }}" `
+            -DestinationPath "release\cloudrave-$env:GITHUB_REF_NAME-${{ matrix.target }}.zip"
+
+      - name: Upload native release artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset_name }}
-          path: |
-            Cloudrave/${{ matrix.asset_name }}.*
+          name: release-${{ matrix.target }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
 
   release:
-    name: Create release
-    needs: build
-    runs-on: ubuntu-latest
+    name: Publish GitHub Release
+    needs:
+      - frontend
+      - backend-test
+      - build
     if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - name: Download artifacts
+      - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      - name: Generate SHA-256 manifest
+        shell: bash
+        run: |
+          cd release
+          sha256sum cloudrave-* > SHA256SUMS.txt
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: artifacts/**/*
-          generate_release_notes: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FRONTEND_SHA: ${{ needs.frontend.outputs.frontend_sha }}
+        run: |
+          flags=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            flags+=(--prerelease --latest=false)
+          fi
+
+          gh release create "$GITHUB_REF_NAME" release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "Cloudrave $GITHUB_REF_NAME" \
+            --generate-notes \
+            --notes "测试版本，请先备份现有数据。完整二进制已嵌入前端，只需启动对应服务器平台的一个可执行文件；其他设备可通过浏览器访问服务器的 1309 端口。前端提交：$FRONTEND_SHA" \
+            "${flags[@]}"
