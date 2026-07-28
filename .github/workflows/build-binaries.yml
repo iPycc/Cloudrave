@@ -1,0 +1,106 @@
+name: Build Cloudrave binaries
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }} binary
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux
+            asset_name: cloudrave-linux
+          - os: windows-latest
+            target: windows
+            asset_name: cloudrave-windows
+          - os: macos-latest
+            target: macos
+            asset_name: cloudrave-macos
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install frontend dependencies
+        working-directory: ./Frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        working-directory: ./Frontend
+        run: pnpm build
+
+      - name: Copy frontend assets into backend
+        run: |
+          mkdir -p Cloudrave/assets
+          cp -r Frontend/dist/* Cloudrave/assets/
+
+      - name: Install Python dependencies
+        working-directory: ./Cloudrave
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[build]"
+
+      - name: Build binary
+        working-directory: ./Cloudrave
+        run: python build_binary.py
+
+      - name: Package binary (Linux/macOS)
+        if: matrix.target != 'windows'
+        working-directory: ./Cloudrave
+        run: |
+          tar -czf ${{ matrix.asset_name }}.tar.gz -C dist cloudrave
+
+      - name: Package binary (Windows)
+        if: matrix.target == 'windows'
+        working-directory: ./Cloudrave
+        shell: powershell
+        run: |
+          Compress-Archive -Path dist\cloudrave.exe -DestinationPath ${{ matrix.asset_name }}.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: |
+            Cloudrave/${{ matrix.asset_name }}.*
+
+  release:
+    name: Create release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
