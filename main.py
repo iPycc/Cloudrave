@@ -8,11 +8,17 @@ from pathlib import Path
 
 import uvicorn
 
-from app import __version__
-from app.dep import Dep
-from app.factory import create_app
-from config import load_config
-from logging_config import LogOperation, LogOutcome, configure_logging, get_logger, print_startup_banner
+from core.ver import __version__
+from core.cfg import load_config
+from core.dep import Dep
+from core.log import (
+    LogOperation,
+    LogOutcome,
+    configure_logging,
+    get_logger,
+    print_startup_banner,
+)
+from web.app import create_app
 
 
 def _resolve_root_dir() -> Path:
@@ -20,7 +26,7 @@ def _resolve_root_dir() -> Path:
 
     For PyInstaller bundles the executable directory is used so that
     ``config.ini``, the database, and uploads persist across runs. When running
-    from source the directory containing this file is used.
+    from source the repository root containing the package is used.
     """
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         return Path(sys.executable).resolve().parent
@@ -41,7 +47,7 @@ async def preflight_startup() -> None:
         await dep.disconnect()
 
 
-if __name__ == "__main__":
+def main() -> None:
     configure_logging(CONFIG)
     mode = "fullstack" if getattr(app.state, "spa_mode", False) else "API"
     print_startup_banner(CONFIG, __version__, mode=mode)
@@ -81,3 +87,7 @@ if __name__ == "__main__":
         log_config=None,
         access_log=False,
     )
+
+
+if __name__ == "__main__":
+    main()

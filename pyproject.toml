@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cloudrave-backend"
-version = "1.0.0b1"
+version = "1.0.0b2"
 description = "Cloudrave backend"
 requires-python = ">=3.12"
 dependencies = [
@@ -37,17 +37,32 @@ dependencies = [
 dev = [
   "pytest>=8.4.2",
   "pytest-asyncio>=1.1.0",
+  "pytest-cov>=7.0.0",
 ]
 build = [
   "pyinstaller>=6.0",
 ]
 
+[project.scripts]
+cloudrave = "main:main"
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 pythonpath = ["."]
 
-[tool.setuptools]
-py-modules = ["bootstrap", "config", "database", "logging_config", "main"]
-
 [tool.setuptools.packages.find]
-include = ["app*"]
+include = [
+  "api*",
+  "core*",
+  "db*",
+  "models*",
+  "repositories*",
+  "schemas*",
+  "security*",
+  "services*",
+  "store*",
+  "web*",
+]
+
+[tool.setuptools]
+py-modules = ["main"]
