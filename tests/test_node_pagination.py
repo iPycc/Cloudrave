@@ -125,6 +125,7 @@ async def test_node_pages_are_folder_first_and_filterable() -> None:
         )
         assert [node.name for node in first_page] == ["alpha", "beta"]
         assert first_has_more is True
+        assert await repository.child_content_counts(1, root.id) == (2, 3)
 
         folder_page, folder_has_more = await repository.list_children_page(
             1,
@@ -146,6 +147,7 @@ async def test_node_pages_are_folder_first_and_filterable() -> None:
         )
         assert [node.name for node in image_page] == ["photo.JPG"]
         assert image_has_more is False
+        assert await repository.category_count(1, "image") == 1
 
         search_results = await repository.search(1, "PHOTO", limit=20)
         assert [node.name for node in search_results] == ["photo.JPG"]

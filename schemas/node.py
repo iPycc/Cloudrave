@@ -34,6 +34,9 @@ NodeSort = Literal["updated-desc", "updated-asc", "name-asc", "name-desc", "size
 class NodePageRead(CloudraveSchema):
     items: list[NodeRead]
     next_cursor: str | None = None
+    total: int = 0
+    folder_count: int = 0
+    file_count: int = 0
 
 
 class NodeSearchResult(CloudraveSchema):

@@ -127,9 +127,15 @@ class FileExplorerService:
             sort=sort,
             folders_only=folders_only,
         )
+        folder_count, file_count = await self.nodes.child_content_counts(mount.id, parent_id)
+        if folders_only:
+            file_count = 0
         return NodePageRead(
             items=[NodeRead.model_validate(node) for node in nodes],
             next_cursor=_encode_page_cursor(offset + limit) if has_more else None,
+            total=folder_count + file_count,
+            folder_count=folder_count,
+            file_count=file_count,
         )
 
     async def list_category_page(
@@ -151,9 +157,13 @@ class FileExplorerService:
             offset=offset,
             sort=sort,
         )
+        total = await self.nodes.category_count(mount.id, category)
         return NodePageRead(
             items=[NodeRead.model_validate(node) for node in nodes],
             next_cursor=_encode_page_cursor(offset + limit) if has_more else None,
+            total=total,
+            folder_count=0,
+            file_count=total,
         )
 
     async def search_nodes(
