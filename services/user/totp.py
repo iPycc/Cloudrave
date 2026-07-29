@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from models.tables import User
 from repositories.audit_logs import AuditLogRepository
 from repositories.passkeys import PasskeyRepository
+from repositories.site_settings import SiteSettingsRepository
 from repositories.users import UserRepository
 from security.jwt import TokenService
 from security.password import PasswordService
@@ -42,6 +43,7 @@ class TOTPService:
         password_service: PasswordService,
         token_service: TokenService,
         config: CloudraveConfig,
+        site_settings: SiteSettingsRepository | None = None,
     ) -> None:
         self.session = session
         self.users = users
@@ -50,6 +52,7 @@ class TOTPService:
         self.password_service = password_service
         self.token_service = token_service
         self.config = config
+        self.site_settings = site_settings
         self._totp_fernet = Fernet(_derive_fernet_key(config.auth.totp_secret_key))
 
     def _encrypt_secret(self, secret: str | None) -> str | None:
@@ -135,9 +138,10 @@ class TOTPService:
         if record is None or record.user_id != user.id:
             return False
 
+        site_url = await self._get_site_url()
+        expected_origin = self._resolve_origin(request, site_url)
+        expected_rp_id = self._resolve_rp_id(request, site_url)
         try:
-            expected_origin = self._resolve_origin(request)
-            expected_rp_id = self._resolve_rp_id(request)
             verification = verify_authentication_response(
                 credential=credential,
                 expected_challenge=base64url_to_bytes(ceremony.challenge),
@@ -154,15 +158,22 @@ class TOTPService:
         await self.passkeys.mark_ceremony_used(ceremony)
         return True
 
-    def _resolve_origin(self, request: Request) -> str:
+    async def _get_site_url(self) -> str | None:
+        if self.site_settings is None:
+            return None
+        settings = await self.site_settings.get_settings()
+        value = settings.get("site_url")
+        return str(value).strip() if value else None
+
+    def _resolve_origin(self, request: Request, site_url: str | None = None) -> str:
         from services.user.passkey_origin import resolve_passkey_origin
 
-        return resolve_passkey_origin(request, self.config)
+        return resolve_passkey_origin(request, self.config, site_url=site_url)
 
-    def _resolve_rp_id(self, request: Request) -> str:
+    def _resolve_rp_id(self, request: Request, site_url: str | None = None) -> str:
         from services.user.passkey_origin import resolve_passkey_rp_id
 
-        return resolve_passkey_rp_id(self._resolve_origin(request))
+        return resolve_passkey_rp_id(self._resolve_origin(request, site_url))
 
     async def setup_totp(
         self,

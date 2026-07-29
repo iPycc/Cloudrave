@@ -16,6 +16,7 @@ from models.tables import PasskeyCeremony, PasskeyCredential, User
 from repositories.audit_logs import AuditLogRepository
 from repositories.passkeys import PasskeyRepository
 from repositories.sessions import SessionRepository
+from repositories.site_settings import SiteSettingsRepository
 from repositories.users import UserRepository
 from schemas.common import MessageResponse
 from schemas.user import (
@@ -44,6 +45,7 @@ class UserProfileService:
         passkeys: PasskeyRepository,
         password_service: PasswordService,
         config: CloudraveConfig,
+        site_settings: SiteSettingsRepository | None = None,
     ) -> None:
         self.session = session
         self.users = users
@@ -52,6 +54,7 @@ class UserProfileService:
         self.passkeys = passkeys
         self.password_service = password_service
         self.config = config
+        self.site_settings = site_settings
 
     async def update_profile(self, request: Request, actor: User, payload: UserProfileUpdateRequest):
         user = await self._get_managed_user(actor.uid)
@@ -232,9 +235,10 @@ class UserProfileService:
         if record.user_id != user.id:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="通行密钥与当前账号不匹配")
 
+        site_url = await self._get_site_url()
+        expected_origin = self._resolve_origin(request, site_url)
+        expected_rp_id = self._resolve_rp_id(request, site_url)
         try:
-            expected_origin = self._resolve_origin(request)
-            expected_rp_id = self._resolve_rp_id(request)
             verification = verify_authentication_response(
                 credential=credential,
                 expected_challenge=base64url_to_bytes(ceremony.challenge),
@@ -253,15 +257,22 @@ class UserProfileService:
 
         return record, ceremony, verification.new_sign_count
 
-    def _resolve_origin(self, request: Request) -> str:
+    async def _get_site_url(self) -> str | None:
+        if self.site_settings is None:
+            return None
+        settings = await self.site_settings.get_settings()
+        value = settings.get("site_url")
+        return str(value).strip() if value else None
+
+    def _resolve_origin(self, request: Request, site_url: str | None = None) -> str:
         from services.user.passkey_origin import resolve_passkey_origin
 
-        return resolve_passkey_origin(request, self.config)
+        return resolve_passkey_origin(request, self.config, site_url=site_url)
 
-    def _resolve_rp_id(self, request: Request) -> str:
+    def _resolve_rp_id(self, request: Request, site_url: str | None = None) -> str:
         from services.user.passkey_origin import resolve_passkey_rp_id
 
-        return resolve_passkey_rp_id(self._resolve_origin(request))
+        return resolve_passkey_rp_id(self._resolve_origin(request, site_url))
 
     async def _get_managed_user(self, uid: str) -> User:
         user = await self.users.get_by_uid(uid)

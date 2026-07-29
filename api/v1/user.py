@@ -135,6 +135,7 @@ async def change_password(
             passkeys=dep.get_passkey_repository(session),
             password_service=dep.password_service,
             config=dep.config,
+            site_settings=SiteSettingsRepository(session),
         )
         return await service.change_password(request, current_user, payload)
 
@@ -160,6 +161,7 @@ async def setup_two_factor_password(
             password_service=dep.password_service,
             token_service=dep.token_service,
             config=dep.config,
+            site_settings=SiteSettingsRepository(session),
         )
         result = await service.setup_totp(
             request,
@@ -188,6 +190,7 @@ async def setup_two_factor_passkey(
             password_service=dep.password_service,
             token_service=dep.token_service,
             config=dep.config,
+            site_settings=SiteSettingsRepository(session),
         )
         result = await service.setup_totp(
             request,
@@ -216,6 +219,7 @@ async def confirm_two_factor_setup(
             password_service=dep.password_service,
             token_service=dep.token_service,
             config=dep.config,
+            site_settings=SiteSettingsRepository(session),
         )
         result = await service.confirm_setup(
             request,
@@ -243,6 +247,7 @@ async def disable_two_factor(
             password_service=dep.password_service,
             token_service=dep.token_service,
             config=dep.config,
+            site_settings=SiteSettingsRepository(session),
         )
         await service.disable_totp(
             request,
