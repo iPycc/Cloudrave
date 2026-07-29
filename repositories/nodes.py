@@ -204,6 +204,17 @@ class NodeRepository:
         )
         return int(file_count or 0), int(folder_count or 0)
 
+    async def mount_file_bytes(self, mount_id: int) -> int:
+        """Return logical file bytes, including recycle-bin items that still consume quota."""
+
+        total = await self.session.scalar(
+            select(func.coalesce(func.sum(Node.size), 0)).where(
+                Node.mount_id == mount_id,
+                Node.type == NodeType.FILE,
+            )
+        )
+        return int(total or 0)
+
     async def get_child_any(self, mount_id: int, parent_id: int | None, name: str) -> Node | None:
         """Find a child including a previously missing/deleted imported node."""
 

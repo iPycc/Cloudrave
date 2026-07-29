@@ -9,18 +9,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.tables import User
 from repositories.audit_logs import AuditLogRepository
-from repositories.mounts import BucketMountRepository
-from repositories.nodes import NodeRepository
-from repositories.policies import StoragePolicyRepository
 from repositories.sessions import SessionRepository
 from repositories.users import UserRepository
 from schemas.auth import LoginResponse
 from security.jwt import TokenService
 from services.session.issue import IssueSessionService
 from services.user.response import build_user_response
-from services.user.storage import UserStorageProvisionService
 from services.user.totp import TOTPService
-from store.manager import StorageManager
 from core.cfg import CloudraveConfig
 from web.client_ip import get_client_ip
 
@@ -35,22 +30,14 @@ class TwoFactorLoginService:
         users: UserRepository,
         sessions: SessionRepository,
         audits: AuditLogRepository,
-        policies: StoragePolicyRepository,
-        mounts: BucketMountRepository,
-        nodes: NodeRepository,
         token_service: TokenService,
-        storage_manager: StorageManager,
         config: CloudraveConfig,
     ) -> None:
         self.session = session
         self.users = users
         self.sessions = sessions
         self.audits = audits
-        self.policies = policies
-        self.mounts = mounts
-        self.nodes = nodes
         self.token_service = token_service
-        self.storage_manager = storage_manager
         self.config = config
 
     async def verify(
@@ -64,19 +51,12 @@ class TwoFactorLoginService:
             session=self.session,
             users=self.users,
             audits=self.audits,
-            passkeys=None,  # type: ignore[arg-type]
-            password_service=None,  # type: ignore[arg-type]
+            passkeys=None,
+            password_service=None,
             token_service=self.token_service,
             config=self.config,
         )
         user = await totp_service.verify_login(request, login_token, code, login_method)
-
-        await UserStorageProvisionService(
-            policies=self.policies,
-            mounts=self.mounts,
-            nodes=self.nodes,
-            storage_manager=self.storage_manager,
-        ).ensure_default_local_storage(user)
 
         session_record, token_pair = await IssueSessionService(
             session=self.session,

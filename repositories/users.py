@@ -35,6 +35,30 @@ class UserRepository:
         stmt = select(User).where(User.uid == uid)
         return await self.session.scalar(stmt)
 
+    async def list_by_role(self, role: UserRole) -> list[User]:
+        result = await self.session.scalars(select(User).where(User.role == role).order_by(User.id.asc()))
+        return list(result)
+
+    async def create_guest(self, *, email: str, username: str, password_hash: str) -> User:
+        user = User(
+            uid=await self._generate_unique_uid(),
+            email=email.lower(),
+            username=username,
+            password_hash=password_hash,
+            avatar_path=None,
+            role=UserRole.GUEST,
+            status=UserStatus.ACTIVE,
+            password_updated_at=utcnow(),
+        )
+        self.session.add(user)
+        await self.session.flush()
+        return user
+
+    async def set_status(self, user: User, status: UserStatus) -> User:
+        user.status = status
+        await self.session.flush()
+        return user
+
     async def create_first_admin_aware(self, email: str, username: str, password_hash: str) -> User:
         admin_state = await self.session.scalar(
             select(SystemMeta)

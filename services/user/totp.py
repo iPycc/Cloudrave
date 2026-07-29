@@ -21,6 +21,8 @@ from security.jwt import TokenService
 from security.password import PasswordService
 from core.cfg import CloudraveConfig
 from web.client_ip import get_client_ip
+from services.session.two_factor_token import TwoFactorTokenService
+from security.capabilities import Capability, require_capability
 
 
 def _derive_fernet_key(secret: str) -> bytes:
@@ -31,7 +33,6 @@ class TOTPService:
     """Handles TOTP secret generation, verification and re-authentication."""
 
     SETUP_TOKEN_TTL_SECONDS = 600
-    LOGIN_TOKEN_TTL_SECONDS = 300
 
     def __init__(
         self,
@@ -39,8 +40,8 @@ class TOTPService:
         session: AsyncSession,
         users: UserRepository,
         audits: AuditLogRepository,
-        passkeys: PasskeyRepository,
-        password_service: PasswordService,
+        passkeys: PasskeyRepository | None,
+        password_service: PasswordService | None,
         token_service: TokenService,
         config: CloudraveConfig,
         site_settings: SiteSettingsRepository | None = None,
@@ -110,22 +111,14 @@ class TOTPService:
     def parse_setup_token(self, token: str) -> dict:
         return self.token_service.parse_2fa_token(token, purpose="totp_setup")
 
-    def issue_login_token(self, user_uid: str, login_method: str) -> str:
-        return self.token_service.issue_2fa_token(
-            sub=user_uid,
-            purpose=f"login_2fa:{login_method}",
-            ttl_seconds=self.LOGIN_TOKEN_TTL_SECONDS,
-        )
-
-    def parse_login_token(self, token: str, login_method: str) -> dict:
-        return self.token_service.parse_2fa_token(token, purpose=f"login_2fa:{login_method}")
-
     async def verify_password_reauth(self, user: User, password: str | None) -> bool:
-        if not password:
+        if not password or self.password_service is None:
             return False
         return self.password_service.verify_password(password, user.password_hash)
 
     async def verify_passkey_reauth(self, request: Request, user: User, ceremony_id: str, credential: dict) -> bool:
+        if self.passkeys is None:
+            return False
         from webauthn import verify_authentication_response
         from webauthn.helpers import base64url_to_bytes
 
@@ -184,6 +177,7 @@ class TOTPService:
         passkey_ceremony_id: str | None,
         issuer: str,
     ) -> dict:
+        require_capability(actor, Capability.SECURITY_MANAGE)
         if actor.totp_enabled:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="两步验证已开启")
 
@@ -224,6 +218,7 @@ class TOTPService:
         secret: str,
         code: str,
     ) -> dict:
+        require_capability(actor, Capability.SECURITY_MANAGE)
         user = await self.users.get_by_uid(actor.uid)
         if user is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
@@ -271,6 +266,7 @@ class TOTPService:
         passkey_credential: dict | None,
         passkey_ceremony_id: str | None,
     ) -> None:
+        require_capability(actor, Capability.SECURITY_MANAGE)
         user = await self.users.get_by_uid(actor.uid)
         if user is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
@@ -315,7 +311,7 @@ class TOTPService:
         login_method: str,
     ) -> User:
         try:
-            payload = self.parse_login_token(login_token, login_method)
+            payload = TwoFactorTokenService(self.token_service).parse_login_token(login_token, login_method)
         except Exception as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="登录令牌已失效") from exc
 

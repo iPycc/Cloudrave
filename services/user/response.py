@@ -7,6 +7,7 @@ from pathlib import Path
 
 from models.tables import User
 from schemas.auth import UserResponse
+from security.capabilities import capabilities_for_role
 
 
 def build_user_response(user: User) -> UserResponse:
@@ -22,6 +23,7 @@ def build_user_response(user: User) -> UserResponse:
         created_at=_trim_to_seconds(user.created_at),
         password_updated_at=_trim_to_seconds(user.password_updated_at),
         two_factor_enabled=bool(user.totp_enabled),
+        capabilities=sorted(capability.value for capability in capabilities_for_role(user.role)),
     )
 
 

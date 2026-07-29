@@ -15,6 +15,7 @@ from repositories.shared import SharedRepository
 from schemas.shared import SharedCreate, SharedNode, SharedRead
 from services.explorer.share import ShareService
 from services.user.response import build_avatar_url
+from security.capabilities import Capability, require_capability
 
 
 class SharedService:
@@ -23,6 +24,7 @@ class SharedService:
         self.source = source
 
     async def create(self, actor: User, payload: SharedCreate) -> SharedRead:
+        require_capability(actor, Capability.SHARED_MOUNT)
         share, nodes = await self._info(payload.share_id)
         self._require_other_owner(actor.id, share)
         if share.access == ShareAccess.PASSWORD and (
@@ -44,6 +46,7 @@ class SharedService:
         return self._read(mount, share, nodes, await self._owner(share.owner_id))
 
     async def list(self, actor: User) -> list[SharedRead]:
+        require_capability(actor, Capability.SHARED_MOUNT)
         mounts = await self.shared.list(actor.id)
         all_shares = {
             share.id: share
@@ -91,9 +94,11 @@ class SharedService:
         return result
 
     async def get(self, actor: User, mount_id: int) -> SharedRead:
+        require_capability(actor, Capability.SHARED_MOUNT)
         return await self._resolve(actor, await self._mount(actor.id, mount_id))
 
     async def nodes(self, actor: User, mount_id: int, parent_id: int | None) -> list[SharedNode]:
+        require_capability(actor, Capability.SHARED_MOUNT)
         mount = await self._mount(actor.id, mount_id)
         share, _ = await self._info(mount.share_id)
         self._require_other_owner(actor.id, share)
@@ -102,6 +107,7 @@ class SharedService:
         return [self._node(node) for node in nodes]
 
     async def resolve_node(self, actor: User, mount_id: int, node_id: int) -> tuple[ShareRecord, Node]:
+        require_capability(actor, Capability.SHARED_MOUNT)
         mount = await self._mount(actor.id, mount_id)
         share, _ = await self._info(mount.share_id)
         self._require_other_owner(actor.id, share)
@@ -109,6 +115,7 @@ class SharedService:
         return share, await self.source.resolve_shared_node(share, node_id)
 
     async def delete(self, actor: User, mount_id: int) -> None:
+        require_capability(actor, Capability.SHARED_MOUNT)
         await self.shared.delete(await self._mount(actor.id, mount_id))
 
     async def _mount(self, user_id: int, mount_id: int) -> ShareMount:

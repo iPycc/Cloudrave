@@ -34,6 +34,7 @@ from services.explorer.up_check import (
     validate_complete_parts,
     validate_part_number,
 )
+from services.explorer.access import MountAccessPolicy
 from services.explorer.up_abort import cleanup_upload
 from services.explorer.up_path import UploadPath
 from services.explorer.up_plan import make_plan, sign_part, sign_put
@@ -66,6 +67,7 @@ class CreateUploadSessionService:
         self.audits = audits
         self.storage_manager = storage_manager
         self.paths = UploadPath(nodes)
+        self.mount_access = MountAccessPolicy(mounts=mounts, policies=policies)
 
     async def create(self, request: Request, actor: User, payload: UploadSessionCreate) -> UploadSessionPlan:
         mount, policy = await self._require_mount_write(actor, payload.mount_id)
@@ -78,6 +80,15 @@ class CreateUploadSessionService:
         )
         if await self.nodes.get_child_any(mount.id, parent.id, file_name) is not None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="目标位置已存在同名文件或文件夹")
+
+        if mount.quota_bytes is not None:
+            used_bytes = await self.nodes.mount_file_bytes(mount.id)
+            reserved_bytes = await self.uploads.reserved_bytes_for_mount(mount.id)
+            if used_bytes + reserved_bytes + payload.size > mount.quota_bytes:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail="Storage quota exceeded",
+                )
 
         if payload.checksum:
             existing_object = await self.objects.get_by_checksum(
@@ -468,34 +479,13 @@ class CreateUploadSessionService:
         return await self._to_read(record)
 
     async def _require_mount_access(self, actor: User, mount_id: int) -> tuple[BucketMount, StoragePolicy]:
-        mount = await self.mounts.get_by_id(mount_id)
-        if mount is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bucket mount not found")
-        if mount.owner_id != actor.id:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Mount access denied")
-        if not mount.is_enabled:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Bucket mount is disabled")
-        policy = await self.policies.get_by_id(mount.policy_id)
-        if policy is None or policy.status != "active":
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Storage policy not found")
-        return mount, policy
+        return await self.mount_access.read(actor, mount_id, lock=True)
 
     async def _require_mount_write(self, actor: User, mount_id: int) -> tuple[BucketMount, StoragePolicy]:
-        mount, policy = await self._require_mount_access(actor, mount_id)
-        if mount.read_only:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bucket mount is read-only")
-        return mount, policy
+        return await self.mount_access.write(actor, mount_id, lock=True)
 
     async def _require_mount_cleanup(self, actor: User, mount_id: int) -> tuple[BucketMount, StoragePolicy]:
-        mount = await self.mounts.get_by_id(mount_id)
-        if mount is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bucket mount not found")
-        if mount.owner_id != actor.id:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Mount access denied")
-        policy = await self.policies.get_by_id(mount.policy_id)
-        if policy is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Storage policy not found")
-        return mount, policy
+        return await self.mount_access.cleanup(actor, mount_id)
 
     async def _require_upload_access(self, actor: User, session_id: str):
         record = await self.uploads.get_session(session_id)

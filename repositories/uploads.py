@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.enums import UploadMode, UploadState
@@ -63,6 +63,16 @@ class UploadRepository:
             .order_by(UploadSessionRecord.created_at.asc())
         )
         return list(result)
+
+    async def reserved_bytes_for_mount(self, mount_id: int) -> int:
+        active = (UploadState.CREATED, UploadState.UPLOADING, UploadState.COMPLETING)
+        total = await self.session.scalar(
+            select(func.coalesce(func.sum(UploadSessionRecord.size), 0)).where(
+                UploadSessionRecord.mount_id == mount_id,
+                UploadSessionRecord.state.in_(active),
+            )
+        )
+        return int(total or 0)
 
     async def list_cleanup_candidates(
         self,

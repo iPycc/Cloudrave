@@ -36,12 +36,14 @@ from schemas.node import (
     NodeSearchResult,
 )
 from services.explorer.archive import ArchiveDownloadService
+from services.explorer.access import MountAccessPolicy
 from services.explorer.gc import ObjectGc
 from services.user.response import build_avatar_url
 from store.call import call_adapter
 from store.key import managed_key
 from store.manager import StorageManager
 from core.log import LogOperation, LogOutcome
+from security.capabilities import Capability, require_capability
 
 
 LOGGER = logging.getLogger("cloudrave.explorer")
@@ -83,6 +85,7 @@ class FileExplorerService:
         self.objects = objects
         self.audits = audits
         self.storage_manager = storage_manager
+        self.mount_access = MountAccessPolicy(mounts=mounts, policies=policies)
 
     async def list_mounts(self, actor: User) -> list[BucketMountRead]:
         mounts = await self.mounts.list_for_owner(actor.id)
@@ -268,6 +271,7 @@ class FileExplorerService:
         return NodeRead.model_validate(node)
 
     async def create_file(self, request: Request, actor: User, payload: FileCreateRequest) -> NodeRead:
+        require_capability(actor, Capability.FILE_EDIT)
         mount, policy = await self._require_mount_write(actor, payload.mount_id)
         parent = await self._resolve_parent_folder(mount, payload.parent_id)
         requested_name = payload.name.strip()
@@ -493,6 +497,7 @@ class FileExplorerService:
         return [NodeRead.model_validate(node) for node in moved]
 
     async def copy_nodes(self, request: Request, actor: User, payload: NodeCopyRequest) -> list[NodeRead]:
+        require_capability(actor, Capability.FILE_COPY)
         nodes = [await self._require_node_access(actor, node_id) for node_id in payload.node_ids]
         if not nodes:
             return []
@@ -583,23 +588,10 @@ class FileExplorerService:
         return response
 
     async def _require_mount_access(self, actor: User, mount_id: int) -> tuple[BucketMount, StoragePolicy]:
-        mount = await self.mounts.get_by_id(mount_id)
-        if mount is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bucket mount not found")
-        if mount.owner_id != actor.id:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Mount access denied")
-        policy = await self.policies.get_by_id(mount.policy_id)
-        if policy is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Storage policy not found")
-        return mount, policy
+        return await self.mount_access.read(actor, mount_id)
 
     async def _require_mount_write(self, actor: User, mount_id: int) -> tuple[BucketMount, StoragePolicy]:
-        mount, policy = await self._require_mount_access(actor, mount_id)
-        if not mount.is_enabled or mount.read_only:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bucket mount is read-only")
-        if policy.status != "active":
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Storage policy is inactive")
-        return mount, policy
+        return await self.mount_access.write(actor, mount_id)
 
     async def _resolve_parent_folder(self, mount: BucketMount, parent_id: int | None) -> Node:
         if parent_id is None:

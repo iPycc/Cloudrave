@@ -30,6 +30,7 @@ from schemas.preview import (
     TextContentUpdateRead,
 )
 from security.jwt import AuthError, TokenService
+from security.capabilities import Capability, has_capability, require_capability
 from services.explorer.download import DownloadFileService
 from services.explorer.view.arc import ArcMixin
 from services.explorer.view.base import (
@@ -97,6 +98,10 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
         manifest = await self._build_manifest(request, node, mount, policy)
         if Path(node.name).suffix.lower() == ".zip" and manifest.status == "ready":
             manifest.capabilities.append("extract")
+        if not has_capability(actor, Capability.FILE_EDIT):
+            manifest.capabilities = [item for item in manifest.capabilities if item != "edit"]
+        if not has_capability(actor, Capability.TASK_MANAGE):
+            manifest.capabilities = [item for item in manifest.capabilities if item != "extract"]
         return manifest
 
     async def shared_manifest(
@@ -399,6 +404,7 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
         content: str,
         if_match: str | None,
     ) -> TextContentUpdateRead:
+        require_capability(actor, Capability.FILE_EDIT)
         node, mount, policy = await self.resolver.resolve(actor, node_id)
         if mount.read_only:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bucket mount is read-only")

@@ -27,6 +27,7 @@ from schemas.user import (
     UserProfileUpdateRequest,
 )
 from security.password import PasswordService
+from security.capabilities import Capability, require_capability
 from services.user.response import build_user_response
 from core.cfg import CloudraveConfig
 
@@ -57,6 +58,7 @@ class UserProfileService:
         self.site_settings = site_settings
 
     async def update_profile(self, request: Request, actor: User, payload: UserProfileUpdateRequest):
+        require_capability(actor, Capability.PROFILE_MANAGE)
         user = await self._get_managed_user(actor.uid)
         normalized_email = payload.email.lower()
         normalized_username = payload.username.strip()
@@ -86,6 +88,7 @@ class UserProfileService:
         return build_user_response(user)
 
     async def upload_avatar(self, request: Request, actor: User, file: UploadFile):
+        require_capability(actor, Capability.PROFILE_MANAGE)
         user = await self._get_managed_user(actor.uid)
         if not file.filename:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="请选择头像文件")

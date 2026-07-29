@@ -44,6 +44,7 @@ class UserResponse(AuthSchema):
     created_at: datetime
     password_updated_at: datetime | None = None
     two_factor_enabled: bool = False
+    capabilities: list[str] = Field(default_factory=list)
 
 
 class TokenPairResponse(AuthSchema):

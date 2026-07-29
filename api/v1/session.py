@@ -46,13 +46,9 @@ async def login(
             users=dep.get_user_repository(session),
             sessions=dep.get_session_repository(session),
             audits=dep.get_audit_repository(session),
-            policies=dep.get_policy_repository(session),
             mounts=dep.get_mount_repository(session),
-            nodes=dep.get_node_repository(session),
             password_service=dep.password_service,
             token_service=dep.token_service,
-            storage_manager=dep.storage_manager,
-            config=dep.config,
         )
         result = await service.login(request, payload)
         if result.token:
@@ -129,11 +125,7 @@ async def verify_two_factor(
             users=dep.get_user_repository(session),
             sessions=dep.get_session_repository(session),
             audits=dep.get_audit_repository(session),
-            policies=dep.get_policy_repository(session),
-            mounts=dep.get_mount_repository(session),
-            nodes=dep.get_node_repository(session),
             token_service=dep.token_service,
-            storage_manager=dep.storage_manager,
             config=dep.config,
         )
         result = await service.verify(
@@ -164,6 +156,7 @@ async def refresh_token(
             users=dep.get_user_repository(session),
             sessions=dep.get_session_repository(session),
             audits=dep.get_audit_repository(session),
+            mounts=dep.get_mount_repository(session),
             token_service=dep.token_service,
         )
         result = await service.refresh(request, RefreshRequest(refresh_token=refresh_token_value))

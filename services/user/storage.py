@@ -26,6 +26,10 @@ class UserStorageProvisionService:
         self.storage_manager = storage_manager
 
     async def ensure_default_local_storage(self, user: User) -> None:
+        # Guest storage is provisioned only by an administrator and must stay
+        # inside the selected source mount's isolated prefix.
+        if user.role == UserRole.GUEST:
+            return
         storage_root = f"/upload/{user.uid}/"
         policy_name = f"local-{user.uid}"
         default_extra = {

@@ -9,13 +9,15 @@ from fastapi import HTTPException, status
 from fastapi.requests import Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.enums import UserStatus
+from models.enums import UserRole, UserStatus
+from repositories.mounts import BucketMountRepository
 from repositories.audit_logs import AuditLogRepository
 from repositories.sessions import SessionRepository
 from repositories.users import UserRepository
 from schemas.auth import RefreshRequest, TokenPairResponse
 from security.jwt import AuthError, TokenService
 from core.log import LogOperation, LogOutcome
+from services.user.guest_access import guest_is_available
 
 
 LOGGER = logging.getLogger("cloudrave.auth")
@@ -35,12 +37,14 @@ class RefreshTokenService:
         users: UserRepository,
         sessions: SessionRepository,
         audits: AuditLogRepository,
+        mounts: BucketMountRepository,
         token_service: TokenService,
     ) -> None:
         self.session = session
         self.users = users
         self.sessions = sessions
         self.audits = audits
+        self.mounts = mounts
         self.token_service = token_service
 
     async def refresh(self, request: Request, payload: RefreshRequest) -> TokenPairResponse:
@@ -66,6 +70,12 @@ class RefreshTokenService:
             await self.sessions.revoke_all_for_user(user.id)
             await self.session.commit()
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Account disabled")
+
+        if user.role == UserRole.GUEST:
+            if not await guest_is_available(user, self.mounts):
+                await self.sessions.revoke_all_for_user(user.id)
+                await self.session.commit()
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Guest account expired")
 
         next_version = session_record.token_version + 1
         bundle = self.token_service.issue_token_pair(

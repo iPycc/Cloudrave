@@ -86,6 +86,13 @@ class BucketMountRead(BucketMountBase):
     synced_objects: int = 0
 
 
+class MountUsageRead(CloudraveSchema):
+    mount_id: int
+    used_bytes: int
+    reserved_bytes: int
+    quota_bytes: int | None = None
+
+
 class BucketMountDeletePreview(CloudraveSchema):
     mount_id: int
     mount_name: str

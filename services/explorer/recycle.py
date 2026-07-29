@@ -13,6 +13,7 @@ from repositories.objects import ObjectRepository
 from repositories.policies import StoragePolicyRepository
 from schemas.node import NodeDeleteRequest, NodeRead, NodeRestoreRequest
 from services.explorer.gc import ObjectGc
+from services.explorer.access import MountAccessPolicy
 from store.manager import StorageManager
 
 
@@ -35,6 +36,7 @@ class RecycleBinService:
         self.objects = objects
         self.audits = audits
         self.storage_manager = storage_manager
+        self.mount_access = MountAccessPolicy(mounts=mounts, policies=policies)
 
     async def list_deleted(self, actor: User) -> list[NodeRead]:
         nodes = await self.nodes.list_deleted_for_owner(actor.id)
@@ -47,7 +49,7 @@ class RecycleBinService:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
             if node.owner_id != actor.id:
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Node access denied")
-            await self._require_write(node.mount_id)
+            await self._require_write(actor, node.mount_id)
         restored = await self.nodes.restore(payload.node_ids)
         await self.audits.create(
             actor_id=actor.id,
@@ -69,7 +71,7 @@ class RecycleBinService:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
             if node.owner_id != actor.id:
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Node access denied")
-            await self._require_write(node.mount_id)
+            await self._require_write(actor, node.mount_id)
         deleted_ids = await self.nodes.collect_descendant_ids(payload.node_ids)
         gc = ObjectGc(
             mounts=self.mounts,
@@ -95,9 +97,5 @@ class RecycleBinService:
         await self.session.commit()
         return {"deleted_node_ids": deleted_ids}
 
-    async def _require_write(self, mount_id: int) -> None:
-        mount = await self.mounts.get_by_id(mount_id)
-        if mount is None or not mount.is_enabled:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bucket mount not found")
-        if mount.read_only:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bucket mount is read-only")
+    async def _require_write(self, actor: User, mount_id: int) -> None:
+        await self.mount_access.write(actor, mount_id)

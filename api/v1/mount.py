@@ -6,7 +6,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, sta
 
 from models.enums import UserRole
 from models.tables import User
-from schemas.mount import BucketMountRead
+from schemas.mount import BucketMountRead, MountUsageRead
 from schemas.sync import MountSyncRead, MountSyncRequest
 from schemas.user_mount import (
     UserMountCreate,
@@ -63,6 +63,27 @@ async def list_mounts(request: Request, current_user: User = Depends(get_current
     dep = request.app.state.dep
     async with dep.session_scope() as session:
         return await _service(request, session).list_mounts(current_user)
+
+
+@router.get("/usage", response_model=list[MountUsageRead])
+async def list_mount_usage(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+) -> list[MountUsageRead]:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        mounts = await dep.get_mount_repository(session).list_for_owner(current_user.id)
+        nodes = dep.get_node_repository(session)
+        uploads = dep.get_upload_repository(session)
+        return [
+            MountUsageRead(
+                mount_id=mount.id,
+                used_bytes=await nodes.mount_file_bytes(mount.id),
+                reserved_bytes=await uploads.reserved_bytes_for_mount(mount.id),
+                quota_bytes=mount.quota_bytes,
+            )
+            for mount in mounts
+        ]
 
 
 @router.post("", response_model=UserMountRead, status_code=status.HTTP_201_CREATED)
