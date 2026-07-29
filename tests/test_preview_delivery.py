@@ -9,11 +9,11 @@ from fastapi import HTTPException
 from starlette.datastructures import URL
 from starlette.requests import Request
 
-from app.models.enums import StoragePolicyType
-from app.schemas.preview import PreviewAssetRead, PreviewManifestRead
-from app.services.explorer.preview import PreviewService
-from app.services.explorer.proxy import remote_response
-from app.storage.types import PresignedURL
+from models.enums import StoragePolicyType
+from schemas.preview import PreviewAssetRead, PreviewManifestRead
+from services.explorer.preview import PreviewService
+from services.explorer.proxy import remote_response
+from store.types import PresignedURL
 
 
 class _Request:

@@ -3,9 +3,9 @@ import logging
 from fastapi import FastAPI, HTTPException, status
 from fastapi.testclient import TestClient
 
-from app.exception_handlers import install_exception_handlers
-from app.middleware.logging import LoggingMiddleware
-from app.middleware.request_id import RequestIdMiddleware
+from web.err import install_exception_handlers
+from web.mid.log import LoggingMiddleware
+from web.mid.rid import RequestIdMiddleware
 
 
 def _test_app() -> FastAPI:

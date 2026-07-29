@@ -8,26 +8,26 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.middleware.rate_limit import RateLimitMiddleware
-from app.models.enums import NodeStatus, NodeType, ShareAccess
-from app.models.tables import Node
-from app.repositories.nodes import NodeRepository
-from app.repositories.shares import ShareRepository
-from app.services.explorer.share import ShareService
-from app.services.explorer.file import _decode_page_cursor, _encode_page_cursor
-from app.security.jwt import AuthError, TokenService
+from models.enums import NodeStatus, NodeType, ShareAccess
+from models.tables import Node
+from repositories.nodes import NodeRepository
+from repositories.shares import ShareRepository
+from security.jwt import AuthError, TokenService
+from services.explorer.file import _decode_page_cursor, _encode_page_cursor
+from services.explorer.share import ShareService
+from web.mid.rate import RateLimitMiddleware
 from PIL import Image
 from starlette.datastructures import URL
 
-from app.services.explorer.preview import (
+from services.explorer.preview import (
     PreviewService,
     build_local_preview_response,
     preview_kind,
     preview_version,
     relative_preview_url,
 )
-from config import AuthConfig
-from database import Base
+from core.cfg import AuthConfig
+from db.base import Base
 
 
 def test_page_cursor_round_trip() -> None:
@@ -317,7 +317,7 @@ def test_audio_metadata_and_embedded_cover_are_extracted(tmp_path, monkeypatch) 
 
     raw_audio = SimpleNamespace(tags=RawTags())
     audio_results = iter((easy_audio, raw_audio))
-    monkeypatch.setattr("app.services.explorer.preview.MutagenFile", lambda *_args, **_kwargs: next(audio_results))
+    monkeypatch.setattr("services.explorer.preview.MutagenFile", lambda *_args, **_kwargs: next(audio_results))
 
     service = object.__new__(PreviewService)
     monkeypatch.setattr(service, "_probe_media", lambda *_args: {"audio_codec": "mp3"})
