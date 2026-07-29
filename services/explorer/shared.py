@@ -12,7 +12,7 @@ from models.enums import ShareAccess
 from models.shared import ShareMount
 from models.tables import Node, ShareRecord, User
 from repositories.shared import SharedRepository
-from schemas.shared import SharedCreate, SharedNode, SharedRead
+from schemas.shared import SharedCreate, SharedNode, SharedRead, SharedSummaryRead
 from services.explorer.share import ShareService
 from services.user.response import build_avatar_url
 from security.capabilities import Capability, require_capability
@@ -92,6 +92,47 @@ class SharedService:
             roots = [nodes[node_id] for node_id in ids if node_id in nodes and nodes[node_id].deleted_at is None]
             result.append(self._read(mount, share, roots, owners.get(share.owner_id)) if roots else self._unavailable(mount))
         return result
+
+    async def summary(self, actor: User) -> SharedSummaryRead:
+        require_capability(actor, Capability.SHARED_MOUNT)
+        mounts = await self.shared.list(actor.id)
+        shares = {
+            share.id: share
+            for share in await self.source.shares.list_by_ids([mount.share_id for mount in mounts])
+            if share.owner_id != actor.id
+        }
+        root_ids = {
+            item.node_id
+            for share in shares.values()
+            for item in (share.items or [])
+        }
+        root_ids.update(share.node_id for share in shares.values() if not share.items)
+        nodes = {node.id: node for node in await self.source.nodes.list_by_ids(list(root_ids))}
+        owner_ids: set[int] = set()
+        share_count = 0
+        now = datetime.now(UTC)
+        for mount in mounts:
+            share = shares.get(mount.share_id)
+            if share is None or not share.is_active:
+                continue
+            expires_at = share.expires_at
+            if expires_at is not None and expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
+            if expires_at is not None and expires_at < now:
+                continue
+            try:
+                self._require_grant(mount, share)
+            except HTTPException:
+                continue
+            ids = [item.node_id for item in share.items] or [share.node_id]
+            if not any(node_id in nodes and nodes[node_id].deleted_at is None for node_id in ids):
+                continue
+            owner_ids.add(share.owner_id)
+            share_count += 1
+        return SharedSummaryRead(
+            owner_count=len(owner_ids),
+            share_count=share_count,
+        )
 
     async def get(self, actor: User, mount_id: int) -> SharedRead:
         require_capability(actor, Capability.SHARED_MOUNT)

@@ -39,6 +39,12 @@ class NodePageRead(CloudraveSchema):
     file_count: int = 0
 
 
+class NodePageMetadataRead(CloudraveSchema):
+    total: int = 0
+    folder_count: int = 0
+    file_count: int = 0
+
+
 class NodeSearchResult(CloudraveSchema):
     node: NodeRead
     parent_path: str

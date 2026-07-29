@@ -175,18 +175,33 @@ class UserProfileService:
         payload: UserPreferencesUpdateRequest,
     ) -> UserPreferencesResponse:
         user = await self._get_managed_user(actor.uid)
-        timezone = _normalize_timezone(payload.timezone)
-        user = await self.users.update_timezone(user, timezone)
+        timezone = _normalize_timezone(payload.timezone) if payload.timezone is not None else None
+        user = await self.users.update_preferences(
+            user,
+            timezone=timezone,
+            thumbnails_enabled=payload.thumbnails_enabled,
+        )
+        detail = {
+            **({"timezone": timezone} if timezone is not None else {}),
+            **(
+                {"thumbnails_enabled": payload.thumbnails_enabled}
+                if payload.thumbnails_enabled is not None
+                else {}
+            ),
+        }
         await self.audits.create(
             actor_id=user.id,
             action="preferences_update",
             target=f"user:{user.uid}",
-            detail=json.dumps({"timezone": timezone}, ensure_ascii=False),
+            detail=json.dumps(detail, ensure_ascii=False),
             ip=request.client.host if request.client else None,
             user_agent=request.headers.get("user-agent"),
             request_id=getattr(request.state, "request_id", None),
         )
-        return UserPreferencesResponse(timezone=user.timezone)
+        return UserPreferencesResponse(
+            timezone=user.timezone,
+            thumbnails_enabled=bool(user.thumbnails_enabled),
+        )
 
     async def list_login_activity(self, actor: User, limit: int = 50) -> list[LoginActivityEntry]:
         logs = await self.audits.list_login_events(actor_id=actor.id, identifier=actor.email, limit=limit)

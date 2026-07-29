@@ -10,7 +10,7 @@ from models.tables import User
 from schemas.common import MessageResponse
 from schemas.node import NodeRead
 from schemas.preview import PreviewManifestRead
-from schemas.shared import SharedCreate, SharedNode, SharedRead, SharedSaveRequest
+from schemas.shared import SharedCreate, SharedNode, SharedRead, SharedSaveRequest, SharedSummaryRead
 from services.explorer.download import DownloadFileService
 from services.explorer.preview import PreviewService, relative_preview_url
 from services.explorer.share import ShareService
@@ -102,6 +102,12 @@ async def mount_share(
 async def list_shared(request: Request, current_user: User = Depends(get_current_user)) -> list[SharedRead]:
     async with request.app.state.dep.session_scope() as session:
         return await _service(request, session).list(current_user)
+
+
+@router.get("/summary", response_model=SharedSummaryRead)
+async def shared_summary(request: Request, current_user: User = Depends(get_current_user)) -> SharedSummaryRead:
+    async with request.app.state.dep.session_scope() as session:
+        return await _service(request, session).summary(current_user)
 
 
 @router.get("/{mount_id}", response_model=SharedRead)

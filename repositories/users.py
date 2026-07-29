@@ -112,6 +112,20 @@ class UserRepository:
         await self.session.flush()
         return user
 
+    async def update_preferences(
+        self,
+        user: User,
+        *,
+        timezone: str | None = None,
+        thumbnails_enabled: bool | None = None,
+    ) -> User:
+        if timezone is not None:
+            user.timezone = timezone
+        if thumbnails_enabled is not None:
+            user.thumbnails_enabled = thumbnails_enabled
+        await self.session.flush()
+        return user
+
     async def update_totp(self, user: User, *, secret: str | None, enabled: bool, backup_codes: list[str] | None = None) -> User:
         user.totp_secret = secret
         user.totp_enabled = enabled

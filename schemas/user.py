@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import EmailStr, Field
+from pydantic import EmailStr, Field, model_validator
 
 from schemas.auth import AuthSchema, UserResponse
 
@@ -23,11 +23,19 @@ class PasswordChangeRequest(AuthSchema):
 
 
 class UserPreferencesUpdateRequest(AuthSchema):
-    timezone: str = Field(min_length=1, max_length=64)
+    timezone: str | None = Field(default=None, min_length=1, max_length=64)
+    thumbnails_enabled: bool | None = None
+
+    @model_validator(mode="after")
+    def require_preference(self):
+        if self.timezone is None and self.thumbnails_enabled is None:
+            raise ValueError("At least one preference is required")
+        return self
 
 
 class UserPreferencesResponse(AuthSchema):
     timezone: str
+    thumbnails_enabled: bool
 
 
 class LoginActivityEntry(AuthSchema):

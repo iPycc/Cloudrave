@@ -40,6 +40,7 @@ class UserResponse(AuthSchema):
     role: str
     status: str
     timezone: str
+    thumbnails_enabled: bool = True
     avatar: str | None = None
     created_at: datetime
     password_updated_at: datetime | None = None

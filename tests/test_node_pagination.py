@@ -14,6 +14,7 @@ from repositories.nodes import NodeRepository
 from repositories.shares import ShareRepository
 from security.jwt import AuthError, TokenService
 from services.explorer.file import _decode_page_cursor, _encode_page_cursor
+from schemas.node import NodePageMetadataRead
 from services.explorer.share import ShareService
 from web.mid.rate import RateLimitMiddleware
 from PIL import Image
@@ -40,6 +41,11 @@ def test_invalid_page_cursor_is_rejected() -> None:
     with pytest.raises(HTTPException) as error:
         _decode_page_cursor("not-a-cursor")
     assert error.value.status_code == 400
+
+
+def test_node_metadata_preserves_exact_content_counts() -> None:
+    metadata = NodePageMetadataRead(total=7, folder_count=2, file_count=5)
+    assert metadata.total == metadata.folder_count + metadata.file_count
 
 
 @pytest.mark.asyncio

@@ -31,6 +31,7 @@ from schemas.node import (
     NodeDeleteRequest,
     NodeMoveRequest,
     NodePageRead,
+    NodePageMetadataRead,
     NodeRead,
     NodeRenameRequest,
     NodeSearchResult,
@@ -138,6 +139,27 @@ class FileExplorerService:
             file_count=file_count,
         )
 
+    async def child_metadata(
+        self,
+        actor: User,
+        mount_id: int,
+        parent_id: int | None,
+        *,
+        folders_only: bool,
+    ) -> NodePageMetadataRead:
+        mount, _policy = await self._require_mount_access(actor, mount_id)
+        if parent_id is None:
+            root = await self.nodes.ensure_mount_root(owner_id=mount.owner_id, mount_id=mount.id, name=mount.name)
+            parent_id = root.id
+        folder_count, file_count = await self.nodes.child_content_counts(mount.id, parent_id)
+        if folders_only:
+            file_count = 0
+        return NodePageMetadataRead(
+            total=folder_count + file_count,
+            folder_count=folder_count,
+            file_count=file_count,
+        )
+
     async def list_category_page(
         self,
         actor: User,
@@ -165,6 +187,16 @@ class FileExplorerService:
             folder_count=0,
             file_count=total,
         )
+
+    async def category_metadata(
+        self,
+        actor: User,
+        mount_id: int,
+        category: str,
+    ) -> NodePageMetadataRead:
+        mount, _policy = await self._require_mount_access(actor, mount_id)
+        total = await self.nodes.category_count(mount.id, category)
+        return NodePageMetadataRead(total=total, folder_count=0, file_count=total)
 
     async def search_nodes(
         self,

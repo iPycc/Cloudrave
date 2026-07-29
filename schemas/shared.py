@@ -42,3 +42,8 @@ class SharedRead(CloudraveSchema):
     detail_url: str
     nodes_url: str
     created_at: datetime
+
+
+class SharedSummaryRead(CloudraveSchema):
+    owner_count: int = 0
+    share_count: int = 0
