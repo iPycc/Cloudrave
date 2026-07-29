@@ -46,7 +46,7 @@ jobs:
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 9
+          version: 10
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
@@ -118,7 +118,7 @@ jobs:
           python -m pip install -e ".[dev]"
 
       - name: Compile backend
-        run: python -m compileall -q app
+        run: python -m compileall -q api core db models repositories schemas security services store web main.py
 
       - name: Run backend tests
         run: python -m pytest -q tests
@@ -300,6 +300,20 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout backend release source
+        uses: actions/checkout@v6
+        with:
+          path: Cloudrave
+          fetch-depth: 0
+
+      - name: Checkout pinned frontend history
+        uses: actions/checkout@v6
+        with:
+          repository: iPycc/frontend
+          ref: ${{ needs.frontend.outputs.frontend_sha }}
+          path: Frontend
+          fetch-depth: 0
+
       - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
@@ -312,6 +326,43 @@ jobs:
         run: |
           cd release
           sha256sum cloudrave-* > SHA256SUMS.txt
+
+      - name: Build What's New with linked commits
+        shell: bash
+        env:
+          FRONTEND_SHA: ${{ needs.frontend.outputs.frontend_sha }}
+        run: |
+          previous_tag="$(git -C Cloudrave describe --tags --abbrev=0 "${GITHUB_SHA}^" 2>/dev/null || true)"
+          previous_backend="${previous_tag:-$(git -C Cloudrave rev-list --max-parents=0 HEAD)}"
+          previous_frontend=""
+          if [[ -n "$previous_tag" ]]; then
+            previous_frontend="$(git -C Cloudrave show "$previous_tag:.frontend-ref" 2>/dev/null | tr -d '\r\n' || true)"
+          fi
+          if [[ -z "$previous_frontend" ]]; then
+            previous_frontend="$(git -C Frontend rev-list --max-parents=0 "$FRONTEND_SHA")"
+          fi
+
+          {
+            echo "## What's New"
+            echo
+            echo "### Backend"
+            git -C Cloudrave log --reverse --format='%H%x09%h%x09%s' "$previous_backend..$GITHUB_SHA" | \
+              while IFS=$'\t' read -r full short subject; do
+                printf -- '- [`%s`](https://github.com/%s/commit/%s) %s\n' "$short" "$GITHUB_REPOSITORY" "$full" "$subject"
+              done
+            echo
+            echo "### Frontend"
+            git -C Frontend log --reverse --format='%H%x09%h%x09%s' "$previous_frontend..$FRONTEND_SHA" | \
+              while IFS=$'\t' read -r full short subject; do
+                printf -- '- [`%s`](https://github.com/iPycc/frontend/commit/%s) %s\n' "$short" "$full" "$subject"
+              done
+            echo
+            echo "## 使用提示"
+            echo
+            echo "这是测试版本，升级前请备份现有数据。原生二进制已内嵌前端，只需启动对应平台的可执行文件；其他设备可通过浏览器访问服务器的 1309 端口。"
+            echo
+            printf 'Pinned frontend: [`%s`](https://github.com/iPycc/frontend/commit/%s)\n' "${FRONTEND_SHA:0:7}" "$FRONTEND_SHA"
+          } > release-notes.md
 
       - name: Create GitHub release
         shell: bash
@@ -328,6 +379,5 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --title "Cloudrave $GITHUB_REF_NAME" \
-            --generate-notes \
-            --notes "测试版本，请先备份现有数据。完整二进制已嵌入前端，只需启动对应服务器平台的一个可执行文件；其他设备可通过浏览器访问服务器的 1309 端口。前端提交：$FRONTEND_SHA" \
+            --notes-file release-notes.md \
             "${flags[@]}"
