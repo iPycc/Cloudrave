@@ -86,6 +86,25 @@ class BucketMountRead(BucketMountBase):
     synced_objects: int = 0
 
 
+class BucketMountDeletePreview(CloudraveSchema):
+    mount_id: int
+    mount_name: str
+    provider: str
+    bucket_name: str
+    prefix: str = ""
+    file_count: int = 0
+    folder_count: int = 0
+    active_upload_count: int = 0
+    pending_cleanup_count: int = 0
+    remote_objects: bool | None = None
+    has_contents: bool = False
+
+
+class BucketMountDeleteResult(CloudraveSchema):
+    message: str
+    deleted_objects: int = 0
+
+
 def mount_read(mount, policy=None) -> BucketMountRead:
     result = BucketMountRead.model_validate(mount)
     if policy is None:

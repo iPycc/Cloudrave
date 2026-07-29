@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from sqlalchemy import select, update
+from datetime import UTC, datetime
+
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.enums import UploadMode, UploadState
@@ -50,6 +52,46 @@ class UploadRepository:
     async def get_session(self, upload_session_id: str) -> UploadSessionRecord | None:
         return await self.session.get(UploadSessionRecord, upload_session_id)
 
+    async def list_active_for_mount(self, mount_id: int) -> list[UploadSessionRecord]:
+        terminal = (UploadState.COMPLETED, UploadState.ABORTED, UploadState.EXPIRED)
+        result = await self.session.scalars(
+            select(UploadSessionRecord)
+            .where(
+                UploadSessionRecord.mount_id == mount_id,
+                UploadSessionRecord.state.not_in(terminal),
+            )
+            .order_by(UploadSessionRecord.created_at.asc())
+        )
+        return list(result)
+
+    async def list_cleanup_candidates(
+        self,
+        *,
+        stale_before: datetime,
+        limit: int = 100,
+    ) -> list[UploadSessionRecord]:
+        stale_states = (
+            UploadState.CREATED,
+            UploadState.UPLOADING,
+            UploadState.COMPLETING,
+        )
+        result = await self.session.scalars(
+            select(UploadSessionRecord)
+            .where(
+                or_(
+                    UploadSessionRecord.state.in_((UploadState.FAILED, UploadState.ABORTING)),
+                    and_(
+                        UploadSessionRecord.state.in_(stale_states),
+                        UploadSessionRecord.updated_at <= stale_before,
+                    ),
+                )
+            )
+            .order_by(UploadSessionRecord.updated_at.asc(), UploadSessionRecord.id.asc())
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )
+        return list(result)
+
     async def list_parts(self, upload_session_id: str) -> list[UploadPartRecord]:
         result = await self.session.scalars(
             select(UploadPartRecord)
@@ -87,6 +129,29 @@ class UploadRepository:
         await self.session.flush()
         return record
 
+    async def touch(self, upload_session_id: str) -> UploadSessionRecord | None:
+        record = await self.get_session(upload_session_id)
+        if record is None:
+            return None
+        record.updated_at = datetime.now(UTC)
+        await self.session.flush()
+        return record
+
+    async def touch_active(self, upload_session_id: str) -> bool:
+        result = await self.session.execute(
+            update(UploadSessionRecord)
+            .where(
+                UploadSessionRecord.id == upload_session_id,
+                UploadSessionRecord.state.in_(
+                    (UploadState.CREATED, UploadState.UPLOADING, UploadState.COMPLETING)
+                ),
+            )
+            .values(updated_at=datetime.now(UTC))
+            .execution_options(synchronize_session=False)
+        )
+        await self.session.flush()
+        return result.rowcount == 1
+
     async def transition_state(
         self,
         upload_session_id: str,
@@ -102,7 +167,7 @@ class UploadRepository:
                 UploadSessionRecord.id == upload_session_id,
                 UploadSessionRecord.state.in_(expected),
             )
-            .values(state=target)
+            .values(state=target, updated_at=datetime.now(UTC))
             .execution_options(synchronize_session=False)
         )
         await self.session.flush()

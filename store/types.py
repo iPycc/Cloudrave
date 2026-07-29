@@ -141,6 +141,12 @@ class StorageAdapter(Protocol):
     def delete_object(self, policy: Any, mount: Any, object_key: str, *, hard_delete: bool = False) -> bool:
         ...
 
+    def mount_has_objects(self, policy: Any, mount: Any) -> bool:
+        ...
+
+    def purge_mount(self, policy: Any, mount: Any) -> int:
+        ...
+
     def presign_put(
         self,
         policy: Any,

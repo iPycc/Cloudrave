@@ -47,15 +47,21 @@ class BucketMountRepository:
         return await self.session.scalar(statement)
 
     async def has_pending_gc(self, mount_id: int) -> bool:
+        return bool(await self.pending_gc_count(mount_id))
+
+    async def pending_gc_count(self, mount_id: int) -> int:
         count = await self.session.scalar(
             select(func.count(GcTask.id)).where(
                 GcTask.mount_id == mount_id,
                 GcTask.state.in_(("pending", "processing")),
             )
         )
-        return bool(count)
+        return int(count or 0)
 
     async def has_active_uploads(self, mount_id: int) -> bool:
+        return bool(await self.active_upload_count(mount_id))
+
+    async def active_upload_count(self, mount_id: int) -> int:
         terminal = (UploadState.COMPLETED, UploadState.ABORTED, UploadState.EXPIRED)
         count = await self.session.scalar(
             select(func.count(UploadSessionRecord.id)).where(
@@ -63,7 +69,7 @@ class BucketMountRepository:
                 UploadSessionRecord.state.not_in(terminal),
             )
         )
-        return bool(count)
+        return int(count or 0)
 
     async def create(self, owner_id: int, payload: BucketMountCreate) -> BucketMount:
         values = payload.model_dump(exclude={"owner_id", "mode", "read_only", "legacy_prefixed_keys"})

@@ -15,6 +15,7 @@ from schemas.upload import (
     UploadSessionPlan,
     UploadSessionRead,
 )
+from schemas.common import MessageResponse
 from api.v1.explore.dep import upload_service
 
 
@@ -85,6 +86,19 @@ async def complete_upload(
     async with dep.session_scope() as session:
         service = upload_service(dep, session)
         return await service.complete(request, current_user, session_id, payload)
+
+
+@router.post("/upload/{session_id}/heartbeat", response_model=MessageResponse)
+async def heartbeat_upload(
+    session_id: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+) -> MessageResponse:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = upload_service(dep, session)
+        await service.heartbeat(current_user, session_id)
+        return MessageResponse(message="Upload heartbeat recorded")
 
 
 @router.post("/upload/{session_id}/abort", response_model=UploadSessionRead)

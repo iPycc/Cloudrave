@@ -155,6 +155,29 @@ class LocalFsAdapter(StorageAdapterBase):
         shutil.move(str(source), str(target))
         return True
 
+    def mount_has_objects(self, policy, mount) -> bool:
+        _ = policy
+        mount_root = self._resolve_mount_root(mount)
+        if not mount_root.exists():
+            return False
+        return any(path.is_file() for path in mount_root.rglob("*"))
+
+    def purge_mount(self, policy, mount) -> int:
+        _ = policy
+        mount_root = self._resolve_mount_root(mount)
+        if not mount_root.exists():
+            return 0
+        deleted = sum(1 for path in mount_root.rglob("*") if path.is_file())
+        for directory in ("objects", "trash", ".multipart"):
+            target = self._contained(
+                mount_root,
+                (mount_root / directory).resolve(),
+                directory,
+            )
+            if target.exists():
+                shutil.rmtree(target)
+        return deleted
+
     def presign_put(
         self,
         policy,

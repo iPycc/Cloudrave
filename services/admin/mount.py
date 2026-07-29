@@ -14,7 +14,16 @@ from repositories.audit_logs import AuditLogRepository
 from repositories.mounts import BucketMountRepository
 from repositories.nodes import NodeRepository
 from repositories.policies import StoragePolicyRepository
-from schemas.mount import BucketMountCreate, BucketMountRead, BucketMountUpdate, mount_read
+from repositories.uploads import UploadRepository
+from schemas.mount import (
+    BucketMountCreate,
+    BucketMountDeletePreview,
+    BucketMountDeleteResult,
+    BucketMountRead,
+    BucketMountUpdate,
+    mount_read,
+)
+from services.explorer.upload_cleanup import UploadCleanup
 from store.manager import StorageManager
 from store.call import call_adapter
 from core.log import LogOperation, LogOutcome
@@ -31,6 +40,7 @@ class MountAdminService:
         mounts: BucketMountRepository,
         policies: StoragePolicyRepository,
         nodes: NodeRepository,
+        uploads: UploadRepository,
         audits: AuditLogRepository,
         storage_manager: StorageManager,
     ) -> None:
@@ -38,6 +48,7 @@ class MountAdminService:
         self.mounts = mounts
         self.policies = policies
         self.nodes = nodes
+        self.uploads = uploads
         self.audits = audits
         self.storage_manager = storage_manager
 
@@ -162,24 +173,98 @@ class MountAdminService:
         )
         return mount_read(updated, await self.policies.get_by_id(updated.policy_id))
 
-    async def delete_mount(self, request: Request, actor: User, mount_id: int) -> None:
+    async def delete_preview(self, mount_id: int) -> BucketMountDeletePreview:
+        mount = await self.mounts.get_by_id(mount_id)
+        if mount is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bucket mount not found")
+        policy = await self.policies.get_by_id(mount.policy_id)
+        if policy is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Storage policy not found")
+
+        file_count, folder_count = await self.nodes.mount_content_counts(mount.id)
+        active_upload_count = await self.mounts.active_upload_count(mount.id)
+        pending_cleanup_count = await self.mounts.pending_gc_count(mount.id)
+        remote_objects: bool | None = None
+        try:
+            remote_objects = bool(
+                await call_adapter(
+                    self.storage_manager.get_adapter(policy),
+                    "mount_has_objects",
+                    policy,
+                    mount,
+                )
+            )
+        except Exception as exc:
+            LOGGER.warning("Unable to inspect mount %s before deletion: %s", mount.id, exc)
+
+        prefix = "/".join(
+            part.strip("/\\")
+            for part in (policy.base_prefix, mount.root_path)
+            if part and part.strip("/\\")
+        )
+        has_contents = bool(
+            file_count
+            or folder_count
+            or active_upload_count
+            or pending_cleanup_count
+            or remote_objects
+        )
+        return BucketMountDeletePreview(
+            mount_id=mount.id,
+            mount_name=mount.name,
+            provider=policy.provider.value,
+            bucket_name=policy.bucket_name,
+            prefix=prefix,
+            file_count=file_count,
+            folder_count=folder_count,
+            active_upload_count=active_upload_count,
+            pending_cleanup_count=pending_cleanup_count,
+            remote_objects=remote_objects,
+            has_contents=has_contents,
+        )
+
+    async def delete_mount(
+        self,
+        request: Request,
+        actor: User,
+        mount_id: int,
+        *,
+        delete_objects: bool = False,
+    ) -> BucketMountDeleteResult:
         mount = await self.mounts.get_by_id_for_update(mount_id)
         if mount is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bucket mount not found")
-        has_data = await self.nodes.has_mount_data(mount.id)
-        has_pending_gc = await self.mounts.has_pending_gc(mount.id)
-        has_active_uploads = await self.mounts.has_active_uploads(mount.id)
-        if has_data or has_pending_gc or has_active_uploads:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Mount contains data, active uploads, or pending cleanup; finish them before deleting the mount",
-            )
+        deleted_objects = 0
+        if delete_objects:
+            policy = await self.policies.get_by_id(mount.policy_id)
+            if policy is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Storage policy not found")
+            try:
+                await UploadCleanup(
+                    uploads=self.uploads,
+                    mounts=self.mounts,
+                    policies=self.policies,
+                    storage_manager=self.storage_manager,
+                ).cleanup_mount(mount.id)
+                deleted_objects = int(
+                    await call_adapter(
+                        self.storage_manager.get_adapter(policy),
+                        "purge_mount",
+                        policy,
+                        mount,
+                    )
+                )
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=f"Failed to delete storage objects: {exc}",
+                ) from exc
         await self.mounts.delete(mount)
         await self.audits.create(
             actor_id=actor.id,
             action="mount.delete",
             target=f"mount:{mount_id}",
-            detail=mount.mount_slug,
+            detail=f"{mount.mount_slug}; delete_objects={str(delete_objects).lower()}; deleted={deleted_objects}",
             ip=request.client.host if request.client else None,
             user_agent=request.headers.get("user-agent"),
             request_id=getattr(request.state, "request_id", None),
@@ -194,6 +279,10 @@ class MountAdminService:
                 "ip": request.client.host if request.client else "-",
                 "actor": actor.email,
             },
+        )
+        return BucketMountDeleteResult(
+            message="Bucket mount and storage objects deleted" if delete_objects else "Bucket mount detached",
+            deleted_objects=deleted_objects,
         )
 
     async def configure_cors(self, request: Request, actor: User, mount_id: int) -> dict[str, object]:

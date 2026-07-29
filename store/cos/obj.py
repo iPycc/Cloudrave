@@ -35,6 +35,143 @@ class CosObjectMixin:
     async def avalidate_mount(self, policy: Any, mount: Any) -> dict[str, Any]:
         return await asyncio.to_thread(self.validate_mount, policy, mount)
 
+    def mount_has_objects(self, policy: Any, mount: Any) -> bool:
+        client = self._client_for(policy)
+        bucket = self._bucket(policy)
+        prefix = self._list_prefix(policy, mount)
+        response = client.list_objects(
+            Bucket=bucket,
+            Prefix=prefix,
+            MaxKeys=1,
+        )
+        if response.get("Contents"):
+            return True
+        versions = client.list_objects_versions(Bucket=bucket, Prefix=prefix, MaxKeys=1)
+        if versions.get("Version") or versions.get("DeleteMarker"):
+            return True
+        uploads = client.list_multipart_uploads(Bucket=bucket, Prefix=prefix, MaxUploads=1)
+        return bool(uploads.get("Upload"))
+
+    async def amount_has_objects(self, policy: Any, mount: Any) -> bool:
+        return await asyncio.to_thread(self.mount_has_objects, policy, mount)
+
+    def purge_mount(self, policy: Any, mount: Any) -> int:
+        """Delete object versions, delete markers, and multipart uploads in scope."""
+
+        client = self._client_for(policy)
+        bucket = self._bucket(policy)
+        prefix = self._list_prefix(policy, mount)
+        deleted = self._purge_versions(client, bucket, prefix)
+        deleted += self._purge_current_objects(client, bucket, prefix)
+        deleted += self._purge_multipart_uploads(client, bucket, prefix)
+        return deleted
+
+    @staticmethod
+    def _many(value: Any) -> list[dict[str, Any]]:
+        if not value:
+            return []
+        return [value] if isinstance(value, dict) else list(value)
+
+    def _purge_versions(self, client: Any, bucket: str, prefix: str) -> int:
+        key_marker = ""
+        version_marker = ""
+        deleted = 0
+        while True:
+            response = client.list_objects_versions(
+                Bucket=bucket,
+                Prefix=prefix,
+                KeyMarker=key_marker,
+                VersionIdMarker=version_marker,
+                MaxKeys=1000,
+            )
+            entries = self._many(response.get("Version")) + self._many(response.get("DeleteMarker"))
+            targets = [
+                {
+                    "Key": str(item["Key"]),
+                    **({"VersionId": str(item["VersionId"])} if item.get("VersionId") is not None else {}),
+                }
+                for item in entries
+                if item.get("Key")
+            ]
+            deleted += self._delete_batch(client, bucket, targets)
+
+            truncated = str(response.get("IsTruncated", "false")).lower() == "true"
+            if not truncated:
+                return deleted
+            next_key = str(response.get("NextKeyMarker") or "")
+            next_version = str(response.get("NextVersionIdMarker") or "")
+            if not next_key or (next_key == key_marker and next_version == version_marker):
+                raise RuntimeError("COS returned a truncated version page without usable markers")
+            key_marker, version_marker = next_key, next_version
+
+    def _purge_current_objects(self, client: Any, bucket: str, prefix: str) -> int:
+        marker = ""
+        deleted = 0
+        while True:
+            response = client.list_objects(
+                Bucket=bucket,
+                Prefix=prefix,
+                Marker=marker,
+                MaxKeys=1000,
+            )
+            contents = self._many(response.get("Contents"))
+            keys = [str(item.get("Key", "")) for item in contents if item.get("Key")]
+            deleted += self._delete_batch(client, bucket, [{"Key": key} for key in keys])
+
+            truncated = str(response.get("IsTruncated", "false")).lower() == "true"
+            if not truncated:
+                return deleted
+            next_marker = str(response.get("NextMarker") or (keys[-1] if keys else ""))
+            if not next_marker or next_marker == marker:
+                raise RuntimeError("COS returned a truncated page without a usable next marker")
+            marker = next_marker
+
+    def _purge_multipart_uploads(self, client: Any, bucket: str, prefix: str) -> int:
+        key_marker = ""
+        upload_marker = ""
+        aborted = 0
+        while True:
+            response = client.list_multipart_uploads(
+                Bucket=bucket,
+                Prefix=prefix,
+                KeyMarker=key_marker,
+                UploadIdMarker=upload_marker,
+                MaxUploads=1000,
+            )
+            uploads = self._many(response.get("Upload"))
+            for upload in uploads:
+                key = str(upload.get("Key") or "")
+                upload_id = str(upload.get("UploadId") or "")
+                if key and upload_id:
+                    client.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
+                    aborted += 1
+
+            truncated = str(response.get("IsTruncated", "false")).lower() == "true"
+            if not truncated:
+                return aborted
+            next_key = str(response.get("NextKeyMarker") or "")
+            next_upload = str(response.get("NextUploadIdMarker") or "")
+            if not next_key or (next_key == key_marker and next_upload == upload_marker):
+                raise RuntimeError("COS returned a truncated multipart page without usable markers")
+            key_marker, upload_marker = next_key, next_upload
+
+    @staticmethod
+    def _delete_batch(client: Any, bucket: str, targets: list[dict[str, str]]) -> int:
+        if not targets:
+            return 0
+        result = client.delete_objects(
+            Bucket=bucket,
+            Delete={"Quiet": "true", "Object": targets},
+        )
+        errors = result.get("Error") or []
+        if errors:
+            error_count = 1 if isinstance(errors, dict) else len(errors)
+            raise RuntimeError(f"COS failed to delete {error_count} object(s)")
+        return len(targets)
+
+    async def apurge_mount(self, policy: Any, mount: Any) -> int:
+        return await asyncio.to_thread(self.purge_mount, policy, mount)
+
     def list_objects(
         self,
         policy: Any,

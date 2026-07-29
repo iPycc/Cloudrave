@@ -186,6 +186,24 @@ class NodeRepository:
         )
         return bool(object_count)
 
+    async def mount_content_counts(self, mount_id: int) -> tuple[int, int]:
+        """Return tracked file and non-root folder counts for a mount."""
+
+        file_count = await self.session.scalar(
+            select(func.count(Node.id)).where(
+                Node.mount_id == mount_id,
+                Node.type == NodeType.FILE,
+            )
+        )
+        folder_count = await self.session.scalar(
+            select(func.count(Node.id)).where(
+                Node.mount_id == mount_id,
+                Node.type == NodeType.FOLDER,
+                Node.parent_id.is_not(None),
+            )
+        )
+        return int(file_count or 0), int(folder_count or 0)
+
     async def get_child_any(self, mount_id: int, parent_id: int | None, name: str) -> Node | None:
         """Find a child including a previously missing/deleted imported node."""
 

@@ -186,6 +186,7 @@ class CreateUploadSessionService:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Upload session cannot issue part URLs")
         self._validate_part_number(record, part_number)
         mount, policy = await self._require_mount_write(actor, record.mount_id)
+        await self.uploads.touch(record.id)
         adapter = self.storage_manager.get_adapter(policy)
         if record.mode == UploadMode.SINGLE:
             return await sign_put(
@@ -211,6 +212,15 @@ class CreateUploadSessionService:
             self._build_upload_state(record, policy, mount),
             part_number,
         )
+
+    async def heartbeat(self, actor: User, session_id: str) -> None:
+        record = await self._require_upload_access(actor, session_id)
+        accepted = await self.uploads.touch_active(record.id)
+        if not accepted:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Upload session is no longer active",
+            )
 
     async def record_part(
         self,

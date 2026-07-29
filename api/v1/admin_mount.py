@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Body, Depends, Request, status
+from fastapi import APIRouter, Body, Depends, Query, Request, status
 
 from web.mid.auth import get_current_user
 from models.tables import User
-from schemas.common import MessageResponse
-from schemas.mount import BucketMountCreate, BucketMountRead, BucketMountUpdate
+from schemas.mount import (
+    BucketMountCreate,
+    BucketMountDeletePreview,
+    BucketMountDeleteResult,
+    BucketMountRead,
+    BucketMountUpdate,
+)
 from security.rbac import require_admin
 from services.admin.mount import MountAdminService
 
@@ -25,6 +30,7 @@ async def list_mounts(request: Request, current_user: User = Depends(get_current
             mounts=dep.get_mount_repository(session),
             policies=dep.get_policy_repository(session),
             nodes=dep.get_node_repository(session),
+            uploads=dep.get_upload_repository(session),
             audits=dep.get_audit_repository(session),
             storage_manager=dep.storage_manager,
         )
@@ -41,6 +47,7 @@ async def get_mount(mount_id: int, request: Request, current_user: User = Depend
             mounts=dep.get_mount_repository(session),
             policies=dep.get_policy_repository(session),
             nodes=dep.get_node_repository(session),
+            uploads=dep.get_upload_repository(session),
             audits=dep.get_audit_repository(session),
             storage_manager=dep.storage_manager,
         )
@@ -61,6 +68,7 @@ async def create_mount(
             mounts=dep.get_mount_repository(session),
             policies=dep.get_policy_repository(session),
             nodes=dep.get_node_repository(session),
+            uploads=dep.get_upload_repository(session),
             audits=dep.get_audit_repository(session),
             storage_manager=dep.storage_manager,
         )
@@ -82,14 +90,19 @@ async def update_mount(
             mounts=dep.get_mount_repository(session),
             policies=dep.get_policy_repository(session),
             nodes=dep.get_node_repository(session),
+            uploads=dep.get_upload_repository(session),
             audits=dep.get_audit_repository(session),
             storage_manager=dep.storage_manager,
         )
         return await service.update_mount(request, current_user, mount_id, payload)
 
 
-@router.delete("/{mount_id}", response_model=MessageResponse)
-async def delete_mount(mount_id: int, request: Request, current_user: User = Depends(get_current_user)) -> MessageResponse:
+@router.get("/{mount_id}/delete-preview", response_model=BucketMountDeletePreview)
+async def get_delete_preview(
+    mount_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+) -> BucketMountDeletePreview:
     require_admin(current_user)
     dep = request.app.state.dep
     async with dep.session_scope() as session:
@@ -98,11 +111,38 @@ async def delete_mount(mount_id: int, request: Request, current_user: User = Dep
             mounts=dep.get_mount_repository(session),
             policies=dep.get_policy_repository(session),
             nodes=dep.get_node_repository(session),
+            uploads=dep.get_upload_repository(session),
             audits=dep.get_audit_repository(session),
             storage_manager=dep.storage_manager,
         )
-        await service.delete_mount(request, current_user, mount_id)
-        return MessageResponse(message="Bucket mount deleted")
+        return await service.delete_preview(mount_id)
+
+
+@router.delete("/{mount_id}", response_model=BucketMountDeleteResult)
+async def delete_mount(
+    mount_id: int,
+    request: Request,
+    delete_objects: bool = Query(default=False),
+    current_user: User = Depends(get_current_user),
+) -> BucketMountDeleteResult:
+    require_admin(current_user)
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = MountAdminService(
+            session=session,
+            mounts=dep.get_mount_repository(session),
+            policies=dep.get_policy_repository(session),
+            nodes=dep.get_node_repository(session),
+            uploads=dep.get_upload_repository(session),
+            audits=dep.get_audit_repository(session),
+            storage_manager=dep.storage_manager,
+        )
+        return await service.delete_mount(
+            request,
+            current_user,
+            mount_id,
+            delete_objects=delete_objects,
+        )
 
 
 @router.post("/{mount_id}/cors/apply", response_model=dict[str, object])
@@ -115,6 +155,7 @@ async def apply_mount_cors(mount_id: int, request: Request, current_user: User =
             mounts=dep.get_mount_repository(session),
             policies=dep.get_policy_repository(session),
             nodes=dep.get_node_repository(session),
+            uploads=dep.get_upload_repository(session),
             audits=dep.get_audit_repository(session),
             storage_manager=dep.storage_manager,
         )
