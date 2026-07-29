@@ -52,6 +52,7 @@ from services.user.response import build_user_response
 from services.user.storage import UserStorageProvisionService
 from store.manager import StorageManager
 from core.cfg import CloudraveConfig
+from web.client_ip import get_client_ip
 
 
 def _trim_to_seconds(value: datetime | None) -> datetime | None:
@@ -371,7 +372,7 @@ class PasskeyService:
                 },
                 ensure_ascii=False,
             ),
-            ip=request.client.host if request.client else None,
+            ip=get_client_ip(request),
             user_agent=request.headers.get("user-agent"),
             request_id=getattr(request.state, "request_id", None),
         )

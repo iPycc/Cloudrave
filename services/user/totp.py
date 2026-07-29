@@ -19,6 +19,7 @@ from repositories.users import UserRepository
 from security.jwt import TokenService
 from security.password import PasswordService
 from core.cfg import CloudraveConfig
+from web.client_ip import get_client_ip
 
 
 def _derive_fernet_key(secret: str) -> bytes:
@@ -318,7 +319,7 @@ class TOTPService:
                 action="login",
                 target=user.email,
                 detail=f"两步验证失败 ({login_method})",
-                ip=request.client.host if request.client else None,
+                ip=get_client_ip(request),
                 user_agent=request.headers.get("user-agent"),
                 request_id=getattr(request.state, "request_id", None),
             )

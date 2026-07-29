@@ -22,6 +22,7 @@ from services.user.storage import UserStorageProvisionService
 from services.user.totp import TOTPService
 from store.manager import StorageManager
 from core.cfg import CloudraveConfig
+from web.client_ip import get_client_ip
 
 
 class TwoFactorLoginService:
@@ -109,7 +110,7 @@ class TwoFactorLoginService:
                 },
                 ensure_ascii=False,
             ),
-            ip=request.client.host if request.client else None,
+            ip=get_client_ip(request),
             user_agent=request.headers.get("user-agent"),
             request_id=getattr(request.state, "request_id", None),
         )
