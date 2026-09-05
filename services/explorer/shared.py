@@ -6,13 +6,14 @@ import hashlib
 from datetime import UTC, datetime
 
 from fastapi import HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from models.enums import ShareAccess
 from models.shared import ShareMount
 from models.tables import Node, ShareRecord, User
 from repositories.shared import SharedRepository
-from schemas.shared import SharedCreate, SharedNode, SharedRead, SharedSummaryRead
+from schemas.shared import SharedCreate, SharedNode, SharedRead, SharedSummaryRead, SharedOwnerRead
 from services.explorer.share import ShareService
 from services.user.response import build_avatar_url
 from security.capabilities import Capability, require_capability
@@ -93,7 +94,7 @@ class SharedService:
             result.append(self._read(mount, share, roots, owners.get(share.owner_id)) if roots else self._unavailable(mount))
         return result
 
-    async def summary(self, actor: User) -> SharedSummaryRead:
+    async def owners(self, actor: User) -> list[SharedOwnerRead]:
         require_capability(actor, Capability.SHARED_MOUNT)
         mounts = await self.shared.list(actor.id)
         shares = {
@@ -108,8 +109,7 @@ class SharedService:
         }
         root_ids.update(share.node_id for share in shares.values() if not share.items)
         nodes = {node.id: node for node in await self.source.nodes.list_by_ids(list(root_ids))}
-        owner_ids: set[int] = set()
-        share_count = 0
+        groups: dict[int, SharedOwnerRead] = {}
         now = datetime.now(UTC)
         for mount in mounts:
             share = shares.get(mount.share_id)
@@ -127,11 +127,28 @@ class SharedService:
             ids = [item.node_id for item in share.items] or [share.node_id]
             if not any(node_id in nodes and nodes[node_id].deleted_at is None for node_id in ids):
                 continue
-            owner_ids.add(share.owner_id)
-            share_count += 1
+            group = groups.get(share.owner_id)
+            if group is None:
+                groups[share.owner_id] = SharedOwnerRead(
+                    id=share.owner_id, name=f"用户 #{share.owner_id}",
+                    share_count=1, latest_shared_at=mount.created_at,
+                )
+            else:
+                group.share_count += 1
+                group.latest_shared_at = max(group.latest_shared_at, mount.created_at)
+        if not groups:
+            return []
+        owners = await self.shared.session.scalars(select(User).where(User.id.in_(groups)))
+        for owner in owners:
+            groups[owner.id].name = owner.username
+            groups[owner.id].avatar = build_avatar_url(owner)
+        return sorted(groups.values(), key=lambda group: (group.latest_shared_at, group.id), reverse=True)
+
+    async def summary(self, actor: User) -> SharedSummaryRead:
+        owners = await self.owners(actor)
         return SharedSummaryRead(
-            owner_count=len(owner_ids),
-            share_count=share_count,
+            owner_count=len(owners),
+            share_count=sum(owner.share_count for owner in owners),
         )
 
     async def get(self, actor: User, mount_id: int) -> SharedRead:
