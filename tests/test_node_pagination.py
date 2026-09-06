@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from io import BytesIO
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import FastAPI, HTTPException, Request
@@ -13,8 +15,8 @@ from models.tables import Node
 from repositories.nodes import NodeRepository
 from repositories.shares import ShareRepository
 from security.jwt import AuthError, TokenService
-from services.explorer.file import _decode_page_cursor, _encode_page_cursor
-from schemas.node import NodePageMetadataRead
+from services.explorer.file import FileExplorerService, _decode_page_cursor, _encode_page_cursor
+from schemas.node import FolderCreateRequest, NodePageMetadataRead
 from services.explorer.share import ShareService
 from web.mid.rate import RateLimitMiddleware
 from PIL import Image
@@ -157,6 +159,55 @@ async def test_node_pages_are_folder_first_and_filterable() -> None:
 
         search_results = await repository.search(1, "PHOTO", limit=20)
         assert [node.name for node in search_results] == ["photo.JPG"]
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_create_folder_auto_suffix_skips_recycle_bin_names() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as session:
+        root = Node(owner_id=1, mount_id=1, parent_id=None, type=NodeType.FOLDER, status=NodeStatus.ACTIVE, name="root")
+        session.add(root)
+        await session.flush()
+        session.add_all(
+            [
+                Node(owner_id=1, mount_id=1, parent_id=root.id, type=NodeType.FOLDER, status=NodeStatus.ACTIVE, name="新建文件夹"),
+                Node(
+                    owner_id=1,
+                    mount_id=1,
+                    parent_id=root.id,
+                    type=NodeType.FOLDER,
+                    status=NodeStatus.ACTIVE,
+                    name="新建文件夹 (2)",
+                    deleted_at=datetime.now(UTC),
+                ),
+            ]
+        )
+        await session.flush()
+
+        service = object.__new__(FileExplorerService)
+        service.session = session
+        service.nodes = NodeRepository(session)
+        service.audits = SimpleNamespace(create=AsyncMock())
+
+        async def require_mount_write(_actor, _mount_id):
+            return SimpleNamespace(id=1, owner_id=1, name="root"), None
+
+        service._require_mount_write = require_mount_write
+        request = Request({"type": "http", "headers": [], "client": ("127.0.0.1", 1)})
+        actor = SimpleNamespace(id=1, email="owner@example.test")
+        created = await service.create_folder(
+            request,
+            actor,
+            FolderCreateRequest(mount_id=1, parent_id=root.id, name="新建文件夹"),
+        )
+
+        assert created.name == "新建文件夹 (3)"
 
     await engine.dispose()
 

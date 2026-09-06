@@ -67,6 +67,19 @@ def _encode_page_cursor(offset: int) -> str:
     return base64.urlsafe_b64encode(str(offset).encode("ascii")).decode("ascii").rstrip("=")
 
 
+def _next_folder_name(name: str, existing_names: set[str]) -> str:
+    """Return a sibling-safe folder name using the familiar ``(2)`` suffix."""
+
+    if name not in existing_names:
+        return name
+
+    base = re.sub(r"\s*\(\d+\)$", "", name)
+    counter = 2
+    while f"{base} ({counter})" in existing_names:
+        counter += 1
+    return f"{base} ({counter})"
+
+
 class FileExplorerService:
     def __init__(
         self,
@@ -273,23 +286,31 @@ class FileExplorerService:
         else:
             parent = await self.nodes.ensure_mount_root(owner_id=mount.owner_id, mount_id=mount.id, name=mount.name)
 
-        # Resolve unique folder name: append (2), (3), ... if conflict
-        folder_name = payload.name
-        siblings = await self.nodes.list_children(mount.id, parent.id if parent else None, include_deleted=False)
-        sibling_names = {s.name for s in siblings}
-        if folder_name in sibling_names:
-            base = re.sub(r"\s*\(\d+\)$", "", folder_name)
-            counter = 2
-            while f"{base} ({counter})" in sibling_names:
-                counter += 1
-            folder_name = f"{base} ({counter})"
-
-        node = await self.nodes.create_folder(
-            owner_id=mount.owner_id,
-            mount_id=mount.id,
-            parent_id=parent.id if parent else None,
-            name=folder_name,
-        )
+        # Deleted nodes still participate in the database's sibling-name unique
+        # constraint. Include them here so creating a folder never fails merely
+        # because the same name exists in the recycle bin.
+        parent_id = parent.id if parent else None
+        for _attempt in range(5):
+            siblings = await self.nodes.list_children(mount.id, parent_id, include_deleted=True)
+            folder_name = _next_folder_name(payload.name, {sibling.name for sibling in siblings})
+            try:
+                # The savepoint keeps the outer request transaction usable if a
+                # simultaneous create wins the race for the same suffix.
+                async with self.session.begin_nested():
+                    node = await self.nodes.create_folder(
+                        owner_id=mount.owner_id,
+                        mount_id=mount.id,
+                        parent_id=parent_id,
+                        name=folder_name,
+                    )
+                break
+            except IntegrityError:
+                continue
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Unable to allocate a unique folder name",
+            )
         await self.audits.create(
             actor_id=actor.id,
             action="node.create_folder",
