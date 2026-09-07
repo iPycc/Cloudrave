@@ -61,6 +61,7 @@ class User(Base, TimestampMixin):
     mounts: Mapped[list["BucketMount"]] = relationship(back_populates="owner")
     passkeys: Mapped[list["PasskeyCredential"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     passkey_ceremonies: Mapped[list["PasskeyCeremony"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    oauth_identities: Mapped[list["OAuthIdentity"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     shares: Mapped[list["ShareRecord"]] = relationship(back_populates="owner", cascade="all, delete-orphan")
 
 
@@ -82,6 +83,25 @@ class Session(Base):
     user: Mapped[User] = relationship(back_populates="sessions")
 
     __table_args__ = (Index("ix_sessions_user_status", "user_id", "status"),)
+
+
+class OAuthIdentity(Base, TimestampMixin):
+    __tablename__ = "oauth_identities"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    provider: Mapped[str] = mapped_column(String(32))
+    subject: Mapped[str] = mapped_column(String(255))
+    provider_username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    provider_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    last_used_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    user: Mapped[User] = relationship(back_populates="oauth_identities")
+
+    __table_args__ = (
+        UniqueConstraint("provider", "subject", name="uq_oauth_identities_provider_subject"),
+        UniqueConstraint("user_id", "provider", name="uq_oauth_identities_user_provider"),
+    )
 
 
 class PasskeyCredential(Base, TimestampMixin):

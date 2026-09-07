@@ -8,6 +8,7 @@ from api.v1.admin_policy import router as admin_policy_router
 from api.v1.admin_sync import router as admin_sync_router
 from api.v1.explorer import router as explorer_router
 from api.v1.mount import router as mount_router
+from api.v1.oauth import router as oauth_router
 from api.v1.recycle import router as recycle_router
 from api.v1.session import router as session_router
 from api.v1.shared import router as shared_router
@@ -21,6 +22,7 @@ router.include_router(session_router)
 router.include_router(user_router)
 router.include_router(explorer_router)
 router.include_router(mount_router)
+router.include_router(oauth_router)
 router.include_router(share_router)
 router.include_router(shared_router)
 router.include_router(site_router)

@@ -82,7 +82,7 @@ class TwoFactorLoginService:
             target=user.email,
             detail=json.dumps(
                 {
-                    "method": f"{login_method}两步验证登录",
+                    "method": f"{_login_method_label(login_method)}两步验证登录",
                     "result": result,
                     "identifier": user.email,
                     "device_fingerprint": _build_device_fingerprint(request),
@@ -94,6 +94,14 @@ class TwoFactorLoginService:
             user_agent=request.headers.get("user-agent"),
             request_id=getattr(request.state, "request_id", None),
         )
+
+
+def _login_method_label(value: str) -> str:
+    return {
+        "password": "密码",
+        "passkey": "通行密钥",
+        "github": "GitHub ",
+    }.get(value, value)
 
 
 def _build_device_fingerprint(request: Request) -> str:
