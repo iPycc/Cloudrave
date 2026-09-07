@@ -65,7 +65,7 @@ class TwoFactorChallengeResponse(AuthSchema):
 class TwoFactorVerifyRequest(AuthSchema):
     two_factor_token: str | None = Field(default=None, min_length=20, max_length=512)
     code: str = Field(min_length=6, max_length=8)
-    method: Literal["password", "passkey", "github", "google"] = "password"
+    method: Literal["password", "passkey", "github", "google", "qq"] = "password"
 
 
 class LoginResponse(AuthSchema):

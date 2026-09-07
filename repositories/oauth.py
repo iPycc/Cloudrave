@@ -12,6 +12,7 @@ from models.tables import OAuthIdentity, SystemMeta, utcnow
 
 GITHUB_OAUTH_SETTINGS_KEY = "oauth.github.settings"
 GOOGLE_OAUTH_SETTINGS_KEY = "oauth.google.settings"
+QQ_OAUTH_SETTINGS_KEY = "oauth.qq.settings"
 
 
 class GitHubOAuthSettingsRepository:
@@ -66,6 +67,35 @@ class GoogleOAuthSettingsRepository:
         serialized = json.dumps(value, ensure_ascii=False)
         if row is None:
             self.session.add(SystemMeta(key=GOOGLE_OAUTH_SETTINGS_KEY, value=serialized))
+        else:
+            row.value = serialized
+        await self.session.flush()
+        return value
+
+
+class QQOAuthSettingsRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def get(self) -> dict[str, object]:
+        row = await self.session.scalar(
+            select(SystemMeta).where(SystemMeta.key == QQ_OAUTH_SETTINGS_KEY)
+        )
+        if row is None or not row.value:
+            return {}
+        try:
+            value = json.loads(row.value)
+        except json.JSONDecodeError:
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    async def update(self, value: dict[str, object]) -> dict[str, object]:
+        row = await self.session.scalar(
+            select(SystemMeta).where(SystemMeta.key == QQ_OAUTH_SETTINGS_KEY)
+        )
+        serialized = json.dumps(value, ensure_ascii=False)
+        if row is None:
+            self.session.add(SystemMeta(key=QQ_OAUTH_SETTINGS_KEY, value=serialized))
         else:
             row.value = serialized
         await self.session.flush()

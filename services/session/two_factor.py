@@ -102,6 +102,7 @@ def _login_method_label(value: str) -> str:
         "passkey": "通行密钥",
         "github": "GitHub ",
         "google": "Google ",
+        "qq": "QQ ",
     }.get(value, value)
 
 
