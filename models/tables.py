@@ -94,6 +94,7 @@ class OAuthIdentity(Base, TimestampMixin):
     subject: Mapped[str] = mapped_column(String(255))
     provider_username: Mapped[str | None] = mapped_column(String(255), nullable=True)
     provider_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    provider_avatar_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     last_used_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     user: Mapped[User] = relationship(back_populates="oauth_identities")

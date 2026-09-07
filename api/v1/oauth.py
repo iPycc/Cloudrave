@@ -11,7 +11,7 @@ import time
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from fastapi.responses import RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse
 
 from core.log import LogOperation, LogOutcome, get_logger
 from models.enums import UserRole, UserStatus
@@ -36,6 +36,7 @@ from services.oauth.github import (
 from services.session.issue import IssueSessionService
 from services.session.two_factor_token import TwoFactorTokenService
 from services.site.settings import WebsiteSettingsService
+from services.oauth.avatar_cache import OAuthAvatarCacheService
 from web.client_ip import get_client_ip
 from web.mid.auth import get_current_user
 from web.mid.rate import login_rate_limit
@@ -55,6 +56,39 @@ def _github_avatar_url(subject: str | None) -> str | None:
     if not github_user_id.isdigit():
         return None
     return f"https://avatars.githubusercontent.com/u/{github_user_id}?v=4"
+
+
+async def _cache_github_avatar(dep, profile) -> str | None:
+    external = _github_avatar_url(profile.subject)
+    if not external:
+        return None
+    cache = OAuthAvatarCacheService(config=dep.config)
+    return (await cache.cache(provider="github", subject=profile.subject, external_url=external)) or external
+
+
+async def _resolve_github_avatar(session, repository, identity, config) -> str | None:
+    if identity is None:
+        return None
+    current = identity.provider_avatar_url
+    if current and current.startswith("/api/v1/oauth/"):
+        return current
+    external = _github_avatar_url(identity.subject)
+    local = await OAuthAvatarCacheService(config=config).cache(
+        provider="github", subject=identity.subject, external_url=external
+    )
+    if local:
+        await repository.set_provider_avatar_url(identity, local)
+        return local
+    return current or external
+
+
+@router.get("/github/avatar/{filename}", response_class=FileResponse)
+async def get_github_oauth_avatar(request: Request, filename: str) -> FileResponse:
+    dep = request.app.state.dep
+    try:
+        return OAuthAvatarCacheService(config=dep.config).get_avatar_file("github", filename)
+    except FileNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="头像不存在")
 
 
 async def _settings_service(request: Request, session) -> GitHubOAuthSettingsService:
@@ -83,12 +117,14 @@ async def get_github_oauth_connection(
     dep = request.app.state.dep
     async with dep.session_scope() as session:
         settings = await (await _settings_service(request, session)).get_public()
-        identity = await OAuthIdentityRepository(session).get_for_user(current_user.id, "github")
+        repository = OAuthIdentityRepository(session)
+        identity = await repository.get_for_user(current_user.id, "github")
+        avatar_url = await _resolve_github_avatar(session, repository, identity, dep.config)
         return GitHubOAuthConnection(
             enabled=settings.enabled,
             linked=identity is not None,
             provider_username=identity.provider_username if identity else None,
-            provider_avatar_url=_github_avatar_url(identity.subject if identity else None),
+            provider_avatar_url=avatar_url,
         )
 
 
@@ -235,6 +271,7 @@ async def finish_github_oauth(
             )
             return _clear_flow_cookies(error_redirect("provider_error"), request, dep.config)
 
+        avatar_url = await _cache_github_avatar(dep, profile)
         identities = OAuthIdentityRepository(session)
         users = dep.get_user_repository(session)
         identity_service = GitHubOAuthIdentityService(identities=identities, users=users)
@@ -246,7 +283,7 @@ async def finish_github_oauth(
             if user.role == UserRole.GUEST:
                 return _clear_flow_cookies(_link_redirect("guest_not_supported"), request, dep.config)
             try:
-                await identity_service.link(user, profile)
+                await identity_service.link(user, profile, provider_avatar_url=avatar_url)
             except GitHubIdentityConflictError:
                 return _clear_flow_cookies(_link_redirect("identity_conflict"), request, dep.config)
             await dep.get_audit_repository(session).create(
@@ -267,7 +304,7 @@ async def finish_github_oauth(
             return _clear_flow_cookies(_link_redirect("success"), request, dep.config)
 
         try:
-            user = await identity_service.resolve_login(profile)
+            user = await identity_service.resolve_login(profile, provider_avatar_url=avatar_url)
         except GitHubIdentityNotLinkedError:
             await _record_login(
                 request,

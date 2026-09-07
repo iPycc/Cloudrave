@@ -72,7 +72,7 @@ class GitHubOAuthIdentityService:
         await self.identities.delete(identity)
         return identity
 
-    async def link(self, user: User, profile: GitHubIdentityProfile) -> OAuthIdentity:
+    async def link(self, user: User, profile: GitHubIdentityProfile, *, provider_avatar_url: str | None = None) -> OAuthIdentity:
         identity = await self.identities.get("github", profile.subject)
         existing_for_user = await self.identities.get_for_user(user.id, "github")
 
@@ -89,14 +89,16 @@ class GitHubOAuthIdentityService:
                 subject=profile.subject,
                 provider_username=profile.login,
                 provider_email=profile.email,
+                provider_avatar_url=provider_avatar_url,
             )
         return await self.identities.touch(
             linked_identity,
             provider_username=profile.login,
             provider_email=profile.email,
+            provider_avatar_url=provider_avatar_url,
         )
 
-    async def resolve_login(self, profile: GitHubIdentityProfile) -> User:
+    async def resolve_login(self, profile: GitHubIdentityProfile, *, provider_avatar_url: str | None = None) -> User:
         identity = await self.identities.get("github", profile.subject)
         if identity is None:
             raise GitHubIdentityNotLinkedError("GitHub identity is not linked")
@@ -109,6 +111,7 @@ class GitHubOAuthIdentityService:
             identity,
             provider_username=profile.login,
             provider_email=profile.email,
+            provider_avatar_url=provider_avatar_url,
         )
         return user
 
