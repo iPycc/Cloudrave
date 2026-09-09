@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.enums import UploadMode, UploadState
@@ -89,9 +89,9 @@ class UploadRepository:
             select(UploadSessionRecord)
             .where(
                 or_(
-                    UploadSessionRecord.state.in_((UploadState.FAILED, UploadState.ABORTING)),
+                    UploadSessionRecord.state == UploadState.ABORTING,
                     and_(
-                        UploadSessionRecord.state.in_(stale_states),
+                        UploadSessionRecord.state.in_((*stale_states, UploadState.FAILED)),
                         UploadSessionRecord.updated_at <= stale_before,
                     ),
                 )
@@ -109,6 +109,30 @@ class UploadRepository:
             .order_by(UploadPartRecord.part_number.asc())
         )
         return list(result)
+
+    async def sync_parts(
+        self,
+        upload_session_id: str,
+        parts: list[tuple[int, str | None, int]],
+    ) -> list[UploadPartRecord]:
+        """Replace recorded parts with the storage provider's authoritative list."""
+
+        part_numbers = {part_number for part_number, _etag, _size in parts}
+        stale = delete(UploadPartRecord).where(
+            UploadPartRecord.upload_session_id == upload_session_id
+        )
+        if part_numbers:
+            stale = stale.where(UploadPartRecord.part_number.not_in(part_numbers))
+        await self.session.execute(stale)
+        for part_number, etag, size in parts:
+            await self.upsert_part(
+                upload_session_id=upload_session_id,
+                part_number=part_number,
+                etag=etag,
+                size=size,
+            )
+        await self.session.flush()
+        return await self.list_parts(upload_session_id)
 
     async def upsert_part(self, *, upload_session_id: str, part_number: int, etag: str | None, size: int) -> UploadPartRecord:
         record = await self.session.scalar(
@@ -153,7 +177,7 @@ class UploadRepository:
             .where(
                 UploadSessionRecord.id == upload_session_id,
                 UploadSessionRecord.state.in_(
-                    (UploadState.CREATED, UploadState.UPLOADING, UploadState.COMPLETING)
+                    (UploadState.CREATED, UploadState.UPLOADING, UploadState.COMPLETING, UploadState.FAILED)
                 ),
             )
             .values(updated_at=datetime.now(UTC))

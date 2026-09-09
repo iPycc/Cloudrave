@@ -189,11 +189,35 @@ class CreateUploadSessionService:
 
     async def get(self, actor: User, session_id: str) -> UploadSessionRead:
         record = await self._require_upload_access(actor, session_id)
+        if record.mode == UploadMode.MULTIPART and record.state in (
+            UploadState.CREATED,
+            UploadState.UPLOADING,
+            UploadState.FAILED,
+        ):
+            mount, policy = await self._require_mount_access(actor, record.mount_id)
+            adapter = self.storage_manager.get_adapter(policy)
+            storage_parts = await call_adapter(
+                adapter,
+                "list_parts",
+                policy,
+                mount,
+                self._build_upload_state(record, policy, mount),
+            )
+            reconciled: list[tuple[int, str | None, int]] = []
+            for part in storage_parts:
+                try:
+                    expected_size = self._expected_part_size(record, part.part_number)
+                except HTTPException:
+                    continue
+                if part.etag and part.size == expected_size:
+                    reconciled.append((part.part_number, part.etag, part.size))
+            await self.uploads.sync_parts(record.id, reconciled)
+            await self.uploads.touch(record.id)
         return await self._to_read(record)
 
     async def part_url(self, actor: User, session_id: str, part_number: int) -> UploadPartPlan:
         record = await self._require_upload_access(actor, session_id)
-        if record.state not in (UploadState.CREATED, UploadState.UPLOADING):
+        if record.state not in (UploadState.CREATED, UploadState.UPLOADING, UploadState.FAILED):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Upload session cannot issue part URLs")
         self._validate_part_number(record, part_number)
         mount, policy = await self._require_mount_write(actor, record.mount_id)
@@ -243,7 +267,7 @@ class CreateUploadSessionService:
         size: int,
     ) -> UploadPartRead:
         record = await self._require_upload_access(actor, session_id)
-        if record.state not in (UploadState.CREATED, UploadState.UPLOADING):
+        if record.state not in (UploadState.CREATED, UploadState.UPLOADING, UploadState.FAILED):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Upload session cannot accept parts")
         expected_size = self._expected_part_size(record, part_number)
         mount, policy = await self._require_mount_write(actor, record.mount_id)
@@ -277,7 +301,7 @@ class CreateUploadSessionService:
 
         accepted = await self.uploads.transition_state(
             record.id,
-            expected=(UploadState.CREATED, UploadState.UPLOADING),
+            expected=(UploadState.CREATED, UploadState.UPLOADING, UploadState.FAILED),
             target=UploadState.UPLOADING,
         )
         if not accepted:
