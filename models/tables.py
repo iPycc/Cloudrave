@@ -50,7 +50,7 @@ class User(Base, TimestampMixin):
     avatar_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
     role: Mapped[UserRole] = mapped_column(Enum(UserRole, native_enum=False), default=UserRole.USER)
     status: Mapped[UserStatus] = mapped_column(Enum(UserStatus, native_enum=False), default=UserStatus.ACTIVE)
-    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai")
+    timezone: Mapped[str] = mapped_column(String(64), default="UTC")
     thumbnails_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     password_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     totp_secret: Mapped[str | None] = mapped_column(String(255), nullable=True)

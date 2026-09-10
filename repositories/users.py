@@ -39,7 +39,14 @@ class UserRepository:
         result = await self.session.scalars(select(User).where(User.role == role).order_by(User.id.asc()))
         return list(result)
 
-    async def create_guest(self, *, email: str, username: str, password_hash: str) -> User:
+    async def create_guest(
+        self,
+        *,
+        email: str,
+        username: str,
+        password_hash: str,
+        timezone: str = "UTC",
+    ) -> User:
         user = User(
             uid=await self._generate_unique_uid(),
             email=email.lower(),
@@ -48,6 +55,7 @@ class UserRepository:
             avatar_path=None,
             role=UserRole.GUEST,
             status=UserStatus.ACTIVE,
+            timezone=timezone,
             password_updated_at=utcnow(),
         )
         self.session.add(user)
@@ -59,7 +67,13 @@ class UserRepository:
         await self.session.flush()
         return user
 
-    async def create_first_admin_aware(self, email: str, username: str, password_hash: str) -> User:
+    async def create_first_admin_aware(
+        self,
+        email: str,
+        username: str,
+        password_hash: str,
+        timezone: str = "UTC",
+    ) -> User:
         admin_state = await self.session.scalar(
             select(SystemMeta)
             .where(SystemMeta.key == "auth.first_admin_user_id")
@@ -79,6 +93,7 @@ class UserRepository:
             avatar_path=None,
             role=role,
             status=UserStatus.ACTIVE,
+            timezone=timezone,
             password_updated_at=utcnow(),
         )
         self.session.add(user)

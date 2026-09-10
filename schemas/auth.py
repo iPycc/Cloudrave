@@ -4,18 +4,32 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import EmailStr, Field, field_validator
+
+from schemas.common import CloudraveSchema
 
 
-class AuthSchema(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+class AuthSchema(CloudraveSchema):
+    pass
 
 
 class RegisterRequest(AuthSchema):
     email: EmailStr
     username: str = Field(min_length=2, max_length=64)
     password: str = Field(min_length=8, max_length=128)
+    timezone: str = Field(default="UTC", min_length=1, max_length=64)
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str) -> str:
+        normalized = value.strip()
+        try:
+            ZoneInfo(normalized)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("Invalid timezone") from exc
+        return normalized
 
 
 class LoginRequest(AuthSchema):

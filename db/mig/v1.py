@@ -75,7 +75,7 @@ def _users(connection: Connection, inspector) -> None:
         if row.get("password_updated_at") is None:
             updates["password_updated_at"] = row.get("created_at")
         if not row.get("timezone"):
-            updates["timezone"] = "Asia/Shanghai"
+            updates["timezone"] = "UTC"
 
         if updates:
             updates["id"] = row["id"]

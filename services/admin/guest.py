@@ -85,6 +85,7 @@ class GuestAdminService:
             email=email,
             username=username,
             password_hash=self.password_service.hash_password(password),
+            timezone=actor.timezone or "UTC",
         )
         prefix = "/".join(part for part in (source.root_path.strip("/"), "guest", guest.uid) if part)
         workspace = await self.mounts.create_guest_workspace(

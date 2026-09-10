@@ -61,6 +61,7 @@ class UserRegisterService:
                 email=payload.email,
                 username=payload.username,
                 password_hash=self.password_service.hash_password(payload.password),
+                timezone=payload.timezone,
             )
         except IntegrityError as exc:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="邮箱或用户名已存在") from exc

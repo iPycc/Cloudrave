@@ -26,7 +26,7 @@ class AppConfig:
     office_source_ttl_seconds: int = 900
     text_preview_max_bytes: int = 5 * 1024 * 1024
     request_id_header: str = "X-Request-ID"
-    default_timezone: str = "Asia/Shanghai"
+    default_timezone: str = "UTC"
 
 
 @dataclass(slots=True)
@@ -111,7 +111,7 @@ def default_config_parser() -> ConfigParser:
         "office_source_ttl_seconds": "900",
         "text_preview_max_bytes": str(5 * 1024 * 1024),
         "request_id_header": "X-Request-ID",
-        "default_timezone": "Asia/Shanghai",
+        "default_timezone": "UTC",
     }
     parser["database"] = {
         "database": "sqlite",
@@ -189,7 +189,7 @@ def load_config(root_dir: Path) -> CloudraveConfig:
         office_source_ttl_seconds=parser.getint("app", "office_source_ttl_seconds", fallback=900),
         text_preview_max_bytes=parser.getint("app", "text_preview_max_bytes", fallback=5 * 1024 * 1024),
         request_id_header=parser.get("app", "request_id_header", fallback="X-Request-ID"),
-        default_timezone=parser.get("app", "default_timezone", fallback="Asia/Shanghai"),
+        default_timezone=parser.get("app", "default_timezone", fallback="UTC"),
     )
     database_backend = parser.get("database", "database", fallback="sqlite").strip().lower() or "sqlite"
     database_url = _resolve_database_url(parser, root_dir, database_backend)
