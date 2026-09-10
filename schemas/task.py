@@ -12,6 +12,7 @@ from schemas.common import CloudraveSchema
 
 class ArchiveExtractRequest(CloudraveSchema):
     target_parent_id: int | None = None
+    paths: list[str] | None = Field(default=None, max_length=500)
 
 
 class BackgroundTaskRead(CloudraveSchema):

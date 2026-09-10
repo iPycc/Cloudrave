@@ -8,7 +8,8 @@ import tempfile
 from pathlib import Path
 
 from fastapi import HTTPException, status
-from PIL import Image, ImageOps
+from PIL import ExifTags, Image, ImageOps
+from pillow_heif import register_heif_opener
 
 from models.tables import BucketMount, Node, StoragePolicy, User
 from services.explorer.view.base import (
@@ -18,6 +19,42 @@ from services.explorer.view.base import (
     preview_kind,
     preview_version,
 )
+
+
+register_heif_opener()
+
+_EXIF_FIELDS = {
+    "Make": "camera_make",
+    "Model": "camera_model",
+    "DateTimeOriginal": "captured_at",
+    "LensModel": "lens_model",
+    "FocalLength": "focal_length",
+    "FNumber": "aperture",
+    "ExposureTime": "exposure_time",
+    "PhotographicSensitivity": "iso",
+    "ISOSpeedRatings": "iso",
+    "Software": "software",
+}
+
+
+def _safe_exif(image: Image.Image) -> dict[str, object]:
+    """Return a small JSON-safe EXIF subset; GPS is deliberately excluded."""
+
+    values: dict[str, object] = {}
+    try:
+        exif = image.getexif()
+    except (AttributeError, OSError, TypeError, ValueError):
+        return values
+    for tag_id, value in exif.items():
+        name = ExifTags.TAGS.get(tag_id, str(tag_id))
+        output_name = _EXIF_FIELDS.get(name)
+        if output_name is None or value is None or value == "":
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            values[output_name] = value
+        else:
+            values[output_name] = str(value)
+    return values
 
 
 class ImageMixin:
@@ -74,13 +111,17 @@ class ImageMixin:
         with self._open_seekable(node, mount, policy) as stream:
             with Image.open(stream) as image:
                 oriented = ImageOps.exif_transpose(image)
-                return {
+                metadata: dict[str, object] = {
                     "width": oriented.width,
                     "height": oriented.height,
                     "format": image.format or "",
                     "mode": image.mode,
                     "frames": int(getattr(image, "n_frames", 1)),
                 }
+                exif = _safe_exif(image)
+                if exif:
+                    metadata["exif"] = exif
+                return metadata
 
     def _generate_image_variant(
         self,

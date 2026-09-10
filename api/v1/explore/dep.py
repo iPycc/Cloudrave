@@ -48,6 +48,7 @@ def preview_service(dep, session) -> PreviewService:
         nodes=dep.get_node_repository(session),
         objects=dep.get_object_repository(session),
         audits=dep.get_audit_repository(session),
+        annotations=dep.get_preview_annotation_repository(session),
         storage_manager=dep.storage_manager,
         token_service=dep.token_service,
         cache_root=dep.config.preview_cache_root_path,

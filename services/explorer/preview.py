@@ -7,9 +7,8 @@ import hashlib
 import json
 import mimetypes
 import shutil
-import tarfile
 import tempfile
-import zipfile
+from io import BytesIO
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, BinaryIO, Callable
@@ -23,8 +22,12 @@ from models.enums import StoragePolicyType
 from models.tables import BucketMount, Node, StoragePolicy, User
 from repositories.audit_logs import AuditLogRepository
 from repositories.nodes import NodeRepository
+from repositories.nodes import _unique_name
 from repositories.objects import ObjectRepository
+from repositories.preview_annotations import PreviewAnnotationRepository
 from schemas.preview import (
+    PdfAnnotationDocument,
+    PdfAnnotationItem,
     PreviewAssetRead,
     PreviewManifestRead,
     TextContentUpdateRead,
@@ -32,7 +35,7 @@ from schemas.preview import (
 from security.jwt import AuthError, TokenService
 from security.capabilities import Capability, has_capability, require_capability
 from services.explorer.download import DownloadFileService
-from services.explorer.view.arc import ArcMixin
+from services.explorer.view.arc import ARCHIVE_READ_ERRORS, ArcMixin
 from services.explorer.view.base import (
     DERIVED_CACHE_CONTROL,
     IMAGE_VARIANTS,
@@ -69,6 +72,7 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
         nodes: NodeRepository,
         objects: ObjectRepository,
         audits: AuditLogRepository,
+        annotations: PreviewAnnotationRepository,
         storage_manager: StorageManager,
         token_service: TokenService,
         cache_root: Path,
@@ -80,6 +84,7 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
         self.nodes = nodes
         self.objects = objects
         self.audits = audits
+        self.annotations = annotations
         self.storage_manager = storage_manager
         self.token_service = token_service
         self.cache_root = cache_root
@@ -96,8 +101,10 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
     async def manifest(self, request: Request, actor: User, node_id: int) -> PreviewManifestRead:
         node, mount, policy = await self.resolver.resolve(actor, node_id)
         manifest = await self._build_manifest(request, node, mount, policy)
-        if Path(node.name).suffix.lower() == ".zip" and manifest.status == "ready":
+        if Path(node.name).suffix.lower() in {".zip", ".7z"} and manifest.status == "ready":
             manifest.capabilities.append("extract")
+        if manifest.kind == "pdf" and manifest.status == "ready":
+            manifest.capabilities.append("annotate-personal")
         if not has_capability(actor, Capability.FILE_EDIT):
             manifest.capabilities = [item for item in manifest.capabilities if item != "edit"]
         if not has_capability(actor, Capability.TASK_MANAGE):
@@ -147,7 +154,7 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
                 "capabilities": [
                     capability
                     for capability in manifest.capabilities
-                    if capability not in {"edit", "extract"}
+                    if capability not in {"edit", "extract", "annotate-personal"}
                 ],
             }
         )
@@ -175,7 +182,7 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
         preparation_available = shutil.which("ffmpeg") is not None
 
         if kind == "image":
-            capabilities.extend(["zoom", "pan", "rotate", "actual-size"])
+            capabilities.extend(["zoom", "pan", "rotate", "actual-size", "edit"])
             try:
                 image_metadata = await self._cached_json(
                     node,
@@ -305,13 +312,14 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
             try:
                 entries = await self._cached_json(
                     node,
-                    "archive-entries",
+                    "archive-entries-v2",
                     lambda: self._archive_entries(node, mount, policy),
                 )
-                metadata["entries"] = entries
+                metadata["entries"] = entries[:200]
                 metadata["entry_count"] = len(entries)
-                metadata["entries_truncated"] = len(entries) == 200
-            except (OSError, tarfile.TarError, zipfile.BadZipFile) as exc:
+                metadata["entries_truncated"] = len(entries) > 200
+                metadata["entry_count_capped"] = len(entries) >= 10_001
+            except ARCHIVE_READ_ERRORS as exc:
                 manifest_status = "unsupported"
                 error = str(exc)
         else:
@@ -332,6 +340,83 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
             requires_preparation=requires_preparation,
             preparation_available=preparation_available,
             error=error,
+        )
+
+    async def get_pdf_annotations(self, actor: User, node_id: int) -> PdfAnnotationDocument:
+        node, _mount, _policy = await self.resolver.resolve(actor, node_id)
+        if preview_kind(node.name) != "pdf":
+            raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="File is not a PDF")
+        current_version = preview_version(node)
+        row = await self.annotations.get(actor.id, node.id)
+        if row is None:
+            return PdfAnnotationDocument(
+                source_version=current_version,
+                revision=0,
+                annotations=[],
+                stale=False,
+            )
+        return PdfAnnotationDocument(
+            source_version=row.source_version,
+            revision=row.revision,
+            annotations=[PdfAnnotationItem.model_validate(item) for item in row.payload],
+            stale=row.source_version != current_version,
+        )
+
+    async def save_pdf_annotations(
+        self,
+        actor: User,
+        node_id: int,
+        *,
+        source_version: str,
+        annotations: list[PdfAnnotationItem],
+        if_match: str | None,
+    ) -> PdfAnnotationDocument:
+        node, _mount, _policy = await self.resolver.resolve(actor, node_id)
+        if preview_kind(node.name) != "pdf":
+            raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="File is not a PDF")
+        current_version = preview_version(node)
+        if source_version != current_version:
+            raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="PDF changed since annotations were opened")
+        if if_match is None:
+            raise HTTPException(status_code=status.HTTP_428_PRECONDITION_REQUIRED, detail="If-Match is required when saving annotations")
+        try:
+            expected_revision = int(_normalize_etag(if_match))
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid annotation revision") from exc
+
+        row = await self.annotations.get_for_update(actor.id, node.id)
+        payload = [item.model_dump(mode="json") for item in annotations]
+        if row is None:
+            if expected_revision != 0:
+                raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="Annotations changed since they were opened")
+            row = await self.annotations.create(
+                owner_id=actor.id,
+                node_id=node.id,
+                source_version=current_version,
+                payload=payload,
+            )
+        else:
+            if row.revision != expected_revision:
+                raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="Annotations changed since they were opened")
+            row.source_version = current_version
+            row.payload = payload
+            row.revision += 1
+            await self.annotations.session.flush()
+
+        await self.audits.create(
+            actor_id=actor.id,
+            action="pdf.annotate",
+            target=f"node:{node.id}",
+            detail=f"revision={row.revision};items={len(payload)}",
+            ip=None,
+            user_agent=None,
+            request_id=None,
+        )
+        return PdfAnnotationDocument(
+            source_version=row.source_version,
+            revision=row.revision,
+            annotations=[PdfAnnotationItem.model_validate(item) for item in row.payload],
+            stale=False,
         )
 
     async def _source_assets(
@@ -484,6 +569,95 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
             request_id=None,
         )
         return TextContentUpdateRead(version=preview_version(node), size=len(payload))
+
+    async def save_image_as(
+        self,
+        actor: User,
+        node_id: int,
+        *,
+        filename: str,
+        payload: bytes,
+        mime_type: str,
+    ) -> Node:
+        require_capability(actor, Capability.FILE_EDIT)
+        source, mount, policy = await self.resolver.resolve(actor, node_id)
+        if mount.read_only:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bucket mount is read-only")
+        if preview_kind(source.name) != "image":
+            raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="File is not an image")
+        if len(payload) > 64 * 1024 * 1024:
+            raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail="Edited image exceeds 64 MB")
+        if mime_type not in {"image/png", "image/jpeg", "image/webp"}:
+            raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="Edited image format is not supported")
+        safe_name = Path(filename).name.strip()
+        if not safe_name or safe_name in {".", ".."} or safe_name != filename.strip():
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Invalid output filename")
+        expected_suffixes = {
+            "image/png": {".png"},
+            "image/jpeg": {".jpg", ".jpeg"},
+            "image/webp": {".webp"},
+        }[mime_type]
+        if Path(safe_name).suffix.lower() not in expected_suffixes:
+            suffix = ".png" if mime_type == "image/png" else sorted(expected_suffixes)[0]
+            safe_name = f"{safe_name}{suffix}"
+        if len(safe_name) > 255:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Output filename is too long")
+        try:
+            with Image.open(BytesIO(payload)) as image:
+                image.verify()
+        except (OSError, UnidentifiedImageError) as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Edited image payload is invalid") from exc
+
+        existing = await self.nodes.get_child_names(source.mount_id, source.parent_id)
+        target_name = _unique_name(safe_name, existing)
+        adapter = self.storage_manager.get_adapter(policy)
+        object_key = managed_key(
+            actor.id,
+            target_name,
+            style=str((mount.extra or {}).get("object_key_style", "readable")),
+        )
+        stored = await call_adapter(
+            adapter,
+            "put_object",
+            policy,
+            mount,
+            object_key,
+            payload,
+            mime_type=mime_type,
+            metadata={"origin": "preview_image_edit", "source_node_id": str(source.id)},
+        )
+        created = await self.nodes.create_file(
+            owner_id=actor.id,
+            mount_id=source.mount_id,
+            parent_id=source.parent_id,
+            name=target_name,
+            blob_path=object_key,
+            size=len(payload),
+        )
+        await self.objects.create_or_update(
+            node_id=created.id,
+            policy_id=policy.id,
+            blob_path=object_key,
+            physical_id=adapter.physical_id(policy, mount, object_key),
+            revive_physical=True,
+            checksum=hashlib.sha256(payload).hexdigest(),
+            content_type=mime_type,
+            extra={
+                "origin": "preview_image_edit",
+                "source_node_id": source.id,
+                "etag": getattr(stored, "etag", None),
+            },
+        )
+        await self.audits.create(
+            actor_id=actor.id,
+            action="image.save_as",
+            target=f"node:{created.id}",
+            detail=f"source_node:{source.id}",
+            ip=None,
+            user_agent=None,
+            request_id=None,
+        )
+        return created
 
     def validate_office_token(self, token: str, node: Node) -> None:
         try:

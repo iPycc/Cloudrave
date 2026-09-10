@@ -33,7 +33,7 @@ TEXT_EXTENSIONS = {
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif", "ico", "heic", "tif", "tiff"}
 VIDEO_EXTENSIONS = {"mp4", "mov", "mkv", "avi", "webm", "flv", "m4v", "wmv"}
 AUDIO_EXTENSIONS = {"mp3", "wav", "flac", "ogg", "m4a", "aac", "opus"}
-ARCHIVE_EXTENSIONS = {"zip", "tar", "gz", "bz2", "xz"}
+ARCHIVE_EXTENSIONS = {"zip", "7z", "tar", "gz", "bz2", "xz"}
 
 SEEKABLE_MAX_BYTES = 512 * 1024 * 1024
 OFFICE_CARD_MAX_BYTES = 96 * 1024 * 1024

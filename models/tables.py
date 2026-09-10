@@ -254,6 +254,23 @@ class ObjectRecord(Base, TimestampMixin):
     extra: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class PreviewAnnotation(Base, TimestampMixin):
+    """Private, per-user sidecar data for non-destructive preview annotations."""
+
+    __tablename__ = "preview_annotations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id", ondelete="CASCADE"), index=True)
+    source_version: Mapped[str] = mapped_column(String(64))
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    payload: Mapped[list[dict]] = mapped_column(JSON, default=list)
+
+    __table_args__ = (
+        UniqueConstraint("owner_id", "node_id", name="uq_preview_annotations_owner_node"),
+    )
+
+
 class ShareRecord(Base, TimestampMixin):
     __tablename__ = "shares"
 

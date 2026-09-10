@@ -5,7 +5,7 @@ from __future__ import annotations
 import mimetypes
 from pathlib import Path
 
-from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Body, Depends, File, Form, Header, HTTPException, Request, UploadFile, status
 from fastapi.responses import Response
 
 from web.mid.auth import get_current_user
@@ -13,11 +13,15 @@ from models.enums import StoragePolicyType
 from models.tables import User
 from schemas.preview import (
     OfficeCardPreviewRead,
+    ArchiveEntryPageRead,
+    PdfAnnotationDocument,
+    PdfAnnotationUpdate,
     PreviewManifestRead,
     PreviewPrepareRead,
     TextContentUpdate,
     TextContentUpdateRead,
 )
+from schemas.node import NodeRead
 from schemas.task import ArchiveExtractRequest, BackgroundTaskRead
 from services.explorer.extract import list_tasks, start_extract
 from services.explorer.preview import (
@@ -44,6 +48,36 @@ async def preview_manifest(
         return await preview_service(dep, session).manifest(request, current_user, node_id)
 
 
+@router.get("/preview/{node_id}/annotations", response_model=PdfAnnotationDocument)
+async def get_preview_annotations(
+    node_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+) -> PdfAnnotationDocument:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        return await preview_service(dep, session).get_pdf_annotations(current_user, node_id)
+
+
+@router.put("/preview/{node_id}/annotations", response_model=PdfAnnotationDocument)
+async def update_preview_annotations(
+    node_id: int,
+    payload: PdfAnnotationUpdate,
+    request: Request,
+    if_match: str | None = Header(default=None, alias="If-Match"),
+    current_user: User = Depends(get_current_user),
+) -> PdfAnnotationDocument:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        return await preview_service(dep, session).save_pdf_annotations(
+            current_user,
+            node_id,
+            source_version=payload.source_version,
+            annotations=payload.annotations,
+            if_match=if_match,
+        )
+
+
 @router.post("/archive/{node_id}/extract", response_model=BackgroundTaskRead, status_code=202)
 async def extract_archive(
     node_id: int,
@@ -56,6 +90,7 @@ async def extract_archive(
         current_user.id,
         node_id,
         payload.target_parent_id,
+        payload.paths,
     )
 
 
@@ -92,6 +127,27 @@ async def preview_archive_entry(
     )
 
 
+@router.get("/preview/{node_id}/archive/entries", response_model=ArchiveEntryPageRead)
+async def preview_archive_entries(
+    node_id: int,
+    request: Request,
+    offset: int = 0,
+    limit: int = 200,
+    current_user: User = Depends(get_current_user),
+) -> ArchiveEntryPageRead:
+    if offset < 0 or limit < 1 or limit > 500:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Invalid archive page")
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        items, total, has_more = await preview_service(dep, session).archive_entries_page(
+            current_user,
+            node_id,
+            offset=offset,
+            limit=limit,
+        )
+        return ArchiveEntryPageRead(items=items, total=total, has_more=has_more)
+
+
 @router.get("/preview/{node_id}/image/{variant}", name="preview_image_asset")
 async def preview_image_asset(
     node_id: int,
@@ -108,6 +164,26 @@ async def preview_image_asset(
             filename=filename,
             media_type="image/webp",
             cache_control=DERIVED_CACHE_CONTROL,
+        )
+
+
+@router.post("/preview/{node_id}/image/save-as", response_model=NodeRead, status_code=status.HTTP_201_CREATED)
+async def save_preview_image_as(
+    node_id: int,
+    request: Request,
+    name: str = Form(..., min_length=1, max_length=255),
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+) -> NodeRead:
+    payload = await file.read(64 * 1024 * 1024 + 1)
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        return await preview_service(dep, session).save_image_as(
+            current_user,
+            node_id,
+            filename=name,
+            payload=payload,
+            mime_type=file.content_type or "application/octet-stream",
         )
 
 

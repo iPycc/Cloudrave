@@ -2,18 +2,66 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from io import BytesIO
+from pathlib import Path
 from types import MethodType, SimpleNamespace
 
 import pytest
+import py7zr
 from fastapi import HTTPException
+from PIL import Image
+from pydantic import ValidationError
 from starlette.datastructures import URL
 from starlette.requests import Request
 
 from models.enums import StoragePolicyType
 from schemas.preview import PreviewAssetRead, PreviewManifestRead
+from schemas.preview import PdfAnnotationItem
+from services.explorer.extract import _is_selected
 from services.explorer.preview import PreviewService
 from services.explorer.proxy import remote_response
+from services.explorer.view.arc import ArcMixin
+from services.explorer.view.img import _safe_exif
 from store.types import PresignedURL
+
+
+class _RouteDep:
+    def __init__(self) -> None:
+        self.storage_manager = object()
+        self.token_service = object()
+        self.share_signing_key = b"test-signing-key"
+        self.annotation_repository = object()
+        self.config = SimpleNamespace(
+            preview_cache_root_path=Path("."),
+            app=SimpleNamespace(
+                public_base_url="https://cloudrave.test",
+                office_source_ttl_seconds=900,
+                text_preview_max_bytes=1024,
+            ),
+        )
+
+    def __getattr__(self, name: str):
+        if not (name.startswith("get_") and name.endswith("_repository")):
+            raise AttributeError(name)
+        repository = self.annotation_repository if name == "get_preview_annotation_repository" else object()
+        return lambda _session: repository
+
+
+def test_route_factories_inject_annotations_only_into_preview_services() -> None:
+    from api.v1.explore.dep import node_service, preview_service
+    from api.v1.share import _build_preview_service, _build_share_service
+    from api.v1.shared import _preview, _service
+
+    dep = _RouteDep()
+    session = object()
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(dep=dep)))
+
+    assert node_service(dep, session).storage_manager is dep.storage_manager
+    assert preview_service(dep, session).annotations is dep.annotation_repository
+    assert _build_share_service(request, session).share_signing_key is dep.share_signing_key
+    assert _build_preview_service(request, session).annotations is dep.annotation_repository
+    assert _service(request, session).source.share_signing_key is dep.share_signing_key
+    assert _preview(request, session).annotations is dep.annotation_repository
 
 
 class _Request:
@@ -230,3 +278,55 @@ def test_preview_manifest_maps_missing_cos_object_to_404() -> None:
 
     assert captured.value.status_code == 404
     assert captured.value.detail == "预览源文件在存储中不存在"
+
+
+def test_7z_entries_and_entry_preview() -> None:
+    stream = BytesIO()
+    with py7zr.SevenZipFile(stream, mode="w") as archive:
+        archive.writestr(b"Cloudrave preview", "docs/readme.txt")
+    payload = stream.getvalue()
+
+    service = object.__new__(ArcMixin)
+    service._open_seekable = lambda *_args: BytesIO(payload)
+    node = SimpleNamespace(name="sample.7z")
+
+    entries = service._archive_entries(node, SimpleNamespace(), SimpleNamespace())
+    assert entries[0]["name"] == "docs/readme.txt"
+    assert entries[0]["size"] == 17
+    assert entries[0]["directory"] is False
+    assert service._read_archive_entry(
+        node,
+        SimpleNamespace(),
+        SimpleNamespace(),
+        "docs/readme.txt",
+    ) == b"Cloudrave preview"
+
+
+def test_private_preview_exif_omits_gps() -> None:
+    image = Image.new("RGB", (10, 10))
+    exif = image.getexif()
+    exif[271] = "Cloudrave Camera"
+    exif[34853] = {1: "N", 2: (31.0, 12.0, 0.0)}
+
+    metadata = _safe_exif(image)
+
+    assert metadata == {"camera_make": "Cloudrave Camera"}
+
+
+def test_pdf_annotation_coordinates_are_normalized() -> None:
+    with pytest.raises(ValidationError):
+        PdfAnnotationItem(
+            id="outside-page",
+            page=1,
+            kind="pen",
+            x=0.5,
+            y=0.5,
+            points=[[1.1, 0.5]],
+        )
+
+
+def test_archive_selection_includes_descendants() -> None:
+    selected = ["docs"]
+    assert _is_selected("docs/readme.txt", selected)
+    assert _is_selected("docs", selected)
+    assert not _is_selected("images/cover.png", selected)
