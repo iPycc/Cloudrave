@@ -31,17 +31,20 @@ from schemas.node import (
     NodeDeleteRequest,
     NodeMoveRequest,
     NodePageRead,
+    NodePageMetadataRead,
     NodeRead,
     NodeRenameRequest,
     NodeSearchResult,
 )
 from services.explorer.archive import ArchiveDownloadService
+from services.explorer.access import MountAccessPolicy
 from services.explorer.gc import ObjectGc
 from services.user.response import build_avatar_url
 from store.call import call_adapter
 from store.key import managed_key
 from store.manager import StorageManager
 from core.log import LogOperation, LogOutcome
+from security.capabilities import Capability, require_capability
 
 
 LOGGER = logging.getLogger("cloudrave.explorer")
@@ -64,6 +67,19 @@ def _encode_page_cursor(offset: int) -> str:
     return base64.urlsafe_b64encode(str(offset).encode("ascii")).decode("ascii").rstrip("=")
 
 
+def _next_folder_name(name: str, existing_names: set[str]) -> str:
+    """Return a sibling-safe folder name using the familiar ``(2)`` suffix."""
+
+    if name not in existing_names:
+        return name
+
+    base = re.sub(r"\s*\(\d+\)$", "", name)
+    counter = 2
+    while f"{base} ({counter})" in existing_names:
+        counter += 1
+    return f"{base} ({counter})"
+
+
 class FileExplorerService:
     def __init__(
         self,
@@ -83,6 +99,7 @@ class FileExplorerService:
         self.objects = objects
         self.audits = audits
         self.storage_manager = storage_manager
+        self.mount_access = MountAccessPolicy(mounts=mounts, policies=policies)
 
     async def list_mounts(self, actor: User) -> list[BucketMountRead]:
         mounts = await self.mounts.list_for_owner(actor.id)
@@ -124,9 +141,36 @@ class FileExplorerService:
             sort=sort,
             folders_only=folders_only,
         )
+        folder_count, file_count = await self.nodes.child_content_counts(mount.id, parent_id)
+        if folders_only:
+            file_count = 0
         return NodePageRead(
             items=[NodeRead.model_validate(node) for node in nodes],
             next_cursor=_encode_page_cursor(offset + limit) if has_more else None,
+            total=folder_count + file_count,
+            folder_count=folder_count,
+            file_count=file_count,
+        )
+
+    async def child_metadata(
+        self,
+        actor: User,
+        mount_id: int,
+        parent_id: int | None,
+        *,
+        folders_only: bool,
+    ) -> NodePageMetadataRead:
+        mount, _policy = await self._require_mount_access(actor, mount_id)
+        if parent_id is None:
+            root = await self.nodes.ensure_mount_root(owner_id=mount.owner_id, mount_id=mount.id, name=mount.name)
+            parent_id = root.id
+        folder_count, file_count = await self.nodes.child_content_counts(mount.id, parent_id)
+        if folders_only:
+            file_count = 0
+        return NodePageMetadataRead(
+            total=folder_count + file_count,
+            folder_count=folder_count,
+            file_count=file_count,
         )
 
     async def list_category_page(
@@ -148,10 +192,24 @@ class FileExplorerService:
             offset=offset,
             sort=sort,
         )
+        total = await self.nodes.category_count(mount.id, category)
         return NodePageRead(
             items=[NodeRead.model_validate(node) for node in nodes],
             next_cursor=_encode_page_cursor(offset + limit) if has_more else None,
+            total=total,
+            folder_count=0,
+            file_count=total,
         )
+
+    async def category_metadata(
+        self,
+        actor: User,
+        mount_id: int,
+        category: str,
+    ) -> NodePageMetadataRead:
+        mount, _policy = await self._require_mount_access(actor, mount_id)
+        total = await self.nodes.category_count(mount.id, category)
+        return NodePageMetadataRead(total=total, folder_count=0, file_count=total)
 
     async def search_nodes(
         self,
@@ -228,23 +286,31 @@ class FileExplorerService:
         else:
             parent = await self.nodes.ensure_mount_root(owner_id=mount.owner_id, mount_id=mount.id, name=mount.name)
 
-        # Resolve unique folder name: append (2), (3), ... if conflict
-        folder_name = payload.name
-        siblings = await self.nodes.list_children(mount.id, parent.id if parent else None, include_deleted=False)
-        sibling_names = {s.name for s in siblings}
-        if folder_name in sibling_names:
-            base = re.sub(r"\s*\(\d+\)$", "", folder_name)
-            counter = 2
-            while f"{base} ({counter})" in sibling_names:
-                counter += 1
-            folder_name = f"{base} ({counter})"
-
-        node = await self.nodes.create_folder(
-            owner_id=mount.owner_id,
-            mount_id=mount.id,
-            parent_id=parent.id if parent else None,
-            name=folder_name,
-        )
+        # Deleted nodes still participate in the database's sibling-name unique
+        # constraint. Include them here so creating a folder never fails merely
+        # because the same name exists in the recycle bin.
+        parent_id = parent.id if parent else None
+        for _attempt in range(5):
+            siblings = await self.nodes.list_children(mount.id, parent_id, include_deleted=True)
+            folder_name = _next_folder_name(payload.name, {sibling.name for sibling in siblings})
+            try:
+                # The savepoint keeps the outer request transaction usable if a
+                # simultaneous create wins the race for the same suffix.
+                async with self.session.begin_nested():
+                    node = await self.nodes.create_folder(
+                        owner_id=mount.owner_id,
+                        mount_id=mount.id,
+                        parent_id=parent_id,
+                        name=folder_name,
+                    )
+                break
+            except IntegrityError:
+                continue
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Unable to allocate a unique folder name",
+            )
         await self.audits.create(
             actor_id=actor.id,
             action="node.create_folder",
@@ -268,6 +334,7 @@ class FileExplorerService:
         return NodeRead.model_validate(node)
 
     async def create_file(self, request: Request, actor: User, payload: FileCreateRequest) -> NodeRead:
+        require_capability(actor, Capability.FILE_EDIT)
         mount, policy = await self._require_mount_write(actor, payload.mount_id)
         parent = await self._resolve_parent_folder(mount, payload.parent_id)
         requested_name = payload.name.strip()
@@ -493,6 +560,7 @@ class FileExplorerService:
         return [NodeRead.model_validate(node) for node in moved]
 
     async def copy_nodes(self, request: Request, actor: User, payload: NodeCopyRequest) -> list[NodeRead]:
+        require_capability(actor, Capability.FILE_COPY)
         nodes = [await self._require_node_access(actor, node_id) for node_id in payload.node_ids]
         if not nodes:
             return []
@@ -583,23 +651,10 @@ class FileExplorerService:
         return response
 
     async def _require_mount_access(self, actor: User, mount_id: int) -> tuple[BucketMount, StoragePolicy]:
-        mount = await self.mounts.get_by_id(mount_id)
-        if mount is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bucket mount not found")
-        if mount.owner_id != actor.id:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Mount access denied")
-        policy = await self.policies.get_by_id(mount.policy_id)
-        if policy is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Storage policy not found")
-        return mount, policy
+        return await self.mount_access.read(actor, mount_id)
 
     async def _require_mount_write(self, actor: User, mount_id: int) -> tuple[BucketMount, StoragePolicy]:
-        mount, policy = await self._require_mount_access(actor, mount_id)
-        if not mount.is_enabled or mount.read_only:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bucket mount is read-only")
-        if policy.status != "active":
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Storage policy is inactive")
-        return mount, policy
+        return await self.mount_access.write(actor, mount_id)
 
     async def _resolve_parent_folder(self, mount: BucketMount, parent_id: int | None) -> Node:
         if parent_id is None:

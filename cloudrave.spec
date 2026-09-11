@@ -77,12 +77,16 @@ a = Analysis(
         "repositories.objects",
         "repositories.passkeys",
         "repositories.policies",
+        "repositories.preview_annotations",
         "repositories.sessions",
         "repositories.shared",
         "repositories.shares",
         "repositories.site_settings",
         "repositories.uploads",
         "repositories.users",
+        # Preview codecs
+        *collect_submodules("pillow_heif"),
+        *collect_submodules("py7zr"),
         # Services referenced dynamically
         "services.admin.ids",
         "services.admin.mount",

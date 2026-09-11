@@ -14,7 +14,10 @@ from services.explorer.up_check import build_upload_state
 from store.manager import StorageManager
 
 
-UPLOAD_INACTIVITY_TIMEOUT = timedelta(minutes=15)
+# Paused browser uploads must outlive a tab refresh or a return on another day.
+# Fresh presigned URLs are issued when the client resumes, so retaining the
+# multipart session does not retain expired credentials.
+UPLOAD_INACTIVITY_TIMEOUT = timedelta(days=7)
 
 
 class UploadCleanup:

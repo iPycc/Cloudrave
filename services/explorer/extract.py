@@ -17,6 +17,7 @@ from typing import Any, BinaryIO
 from uuid import uuid4
 
 from fastapi import HTTPException, status
+import py7zr
 
 from models.enums import NodeType
 from repositories.nodes import _unique_name
@@ -83,7 +84,13 @@ def list_tasks(owner_id: int) -> list[BackgroundTaskRead]:
     ]
 
 
-async def start_extract(dep, actor_id: int, node_id: int, target_parent_id: int | None) -> BackgroundTaskRead:
+async def start_extract(
+    dep,
+    actor_id: int,
+    node_id: int,
+    target_parent_id: int | None,
+    selected_paths: list[str] | None = None,
+) -> BackgroundTaskRead:
     async with dep.session_scope() as session:
         node = await dep.get_node_repository(session).get_by_id(node_id)
         if (
@@ -91,9 +98,9 @@ async def start_extract(dep, actor_id: int, node_id: int, target_parent_id: int 
             or node.owner_id != actor_id
             or node.type != NodeType.FILE
             or node.deleted_at is not None
-            or Path(node.name).suffix.lower() != ".zip"
+            or Path(node.name).suffix.lower() not in {".zip", ".7z"}
         ):
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="ZIP file not found")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Archive file not found")
         if target_parent_id is not None:
             parent = await dep.get_node_repository(session).get_by_id(target_parent_id)
             if (
@@ -103,6 +110,10 @@ async def start_extract(dep, actor_id: int, node_id: int, target_parent_id: int 
                 or parent.type != NodeType.FOLDER
             ):
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target folder not found")
+        if selected_paths:
+            if any(_safe_parts(path) is None for path in selected_paths):
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid archive entry path")
+            selected_paths = list(dict.fromkeys(path.replace("\\", "/").strip("/") for path in selected_paths))
 
     now = datetime.now(UTC)
     task = _Task(
@@ -118,7 +129,7 @@ async def start_extract(dep, actor_id: int, node_id: int, target_parent_id: int 
     )
     _tasks[task.id] = task
     runner = asyncio.create_task(
-        _run_extract(dep, task, node_id, target_parent_id),
+        _run_extract(dep, task, node_id, target_parent_id, selected_paths),
         name=f"archive-extract-{task.id}",
     )
     _running.add(runner)
@@ -138,6 +149,13 @@ def _safe_parts(filename: str) -> tuple[str, ...] | None:
     if not parts or any(part == ".." for part in parts):
         return None
     return parts
+
+
+def _is_selected(filename: str, selected_paths: list[str] | None) -> bool:
+    if not selected_paths:
+        return True
+    normalized = filename.replace("\\", "/").strip("/")
+    return any(normalized == path or normalized.startswith(f"{path}/") for path in selected_paths)
 
 
 async def _call_stream_method(method: Callable[..., Any], *args: Any) -> Any:
@@ -304,8 +322,136 @@ async def _write_extract_audit(
         )
 
 
-async def _run_extract(dep, task: _Task, node_id: int, target_parent_id: int | None) -> None:
-    _update(task, status="running", detail="读取 ZIP 目录")
+async def _run_extract_7z(
+    dep,
+    task: _Task,
+    *,
+    node_id: int,
+    source_info: _ExtractSource,
+    adapter,
+    spool,
+    selected_paths: list[str] | None,
+) -> None:
+    with py7zr.SevenZipFile(spool, mode="r") as archive:
+        infos = [
+            info for info in archive.list()
+            if _safe_parts(info.filename) and _is_selected(info.filename, selected_paths)
+        ]
+        if len(infos) > MAX_ENTRIES:
+            raise ValueError("7Z 条目过多")
+        file_infos = [info for info in infos if info.is_file and not info.is_symlink]
+        total_bytes = sum(int(info.uncompressed or 0) for info in file_infos)
+        if total_bytes > MAX_TOTAL_BYTES:
+            raise ValueError("7Z 解压后总体积过大")
+        for info in file_infos:
+            size = int(info.uncompressed or 0)
+            compressed = int(info.compressed or 0)
+            if size > MAX_ENTRY_BYTES:
+                raise ValueError(f"{info.filename} 超过单文件解压限制")
+            if compressed and size / compressed > MAX_COMPRESSION_RATIO:
+                raise ValueError(f"{info.filename} 压缩率异常")
+
+        root_id = await _create_extract_root(dep, task, source_info)
+        task.result_node_id = root_id
+        folder_ids: dict[tuple[str, ...], int] = {(): root_id}
+        directory_paths = {
+            parts
+            for info in infos
+            if info.is_directory and (parts := _safe_parts(info.filename))
+        }
+        directory_paths.update(
+            parts[:-1]
+            for info in file_infos
+            if (parts := _safe_parts(info.filename)) and parts[:-1]
+        )
+        for folder_path in sorted(directory_paths, key=lambda parts: (len(parts), parts)):
+            await _ensure_folder_path(
+                dep,
+                task,
+                mount_id=source_info.mount.id,
+                folder_ids=folder_ids,
+                parts=folder_path,
+            )
+
+        written = 0
+        with tempfile.TemporaryDirectory(prefix="cloudrave-7z-extract-") as target_dir:
+            archive.extract(path=target_dir, targets=[info.filename for info in file_infos])
+            extraction_root = Path(target_dir).resolve()
+            for index, info in enumerate(file_infos):
+                parts = _safe_parts(info.filename)
+                if not parts:
+                    continue
+                folder_parts, filename = parts[:-1], parts[-1]
+                payload_path = (extraction_root.joinpath(*parts)).resolve()
+                if extraction_root not in payload_path.parents or not payload_path.is_file():
+                    raise ValueError(f"{info.filename} 未能安全解压")
+                parent_id = await _ensure_folder_path(
+                    dep,
+                    task,
+                    mount_id=source_info.mount.id,
+                    folder_ids=folder_ids,
+                    parts=folder_parts,
+                )
+                object_key = managed_key(
+                    task.owner_id,
+                    filename,
+                    style=str((source_info.mount.extra or {}).get("object_key_style", "readable")),
+                )
+                content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+                digest = hashlib.sha256()
+                object_written = False
+                with payload_path.open("rb") as entry, tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024) as payload:
+                    while chunk := await asyncio.to_thread(entry.read, CHUNK_SIZE):
+                        digest.update(chunk)
+                        payload.write(chunk)
+                    payload.seek(0)
+                    try:
+                        stored = await call_adapter(
+                            adapter,
+                            "put_object",
+                            source_info.policy,
+                            source_info.mount,
+                            object_key,
+                            payload,
+                            mime_type=content_type,
+                            metadata={"origin": "archive_extract"},
+                        )
+                        object_written = True
+                        await _persist_uploaded_file(
+                            dep,
+                            task,
+                            source=source_info,
+                            parent_id=parent_id,
+                            filename=filename,
+                            object_key=object_key,
+                            size=int(info.uncompressed or payload_path.stat().st_size),
+                            checksum=digest.hexdigest(),
+                            content_type=content_type,
+                            physical_id=adapter.physical_id(source_info.policy, source_info.mount, object_key),
+                            etag=getattr(stored, "etag", None),
+                        )
+                    except Exception:
+                        if object_written:
+                            await _cleanup_uploaded_object(adapter, source_info, object_key)
+                        raise
+                written += int(info.uncompressed or payload_path.stat().st_size)
+                _update(
+                    task,
+                    progress=min(99, round((index + 1) / max(1, len(file_infos)) * 100)),
+                    detail=f"已解压 {index + 1} / {len(file_infos)} 个文件",
+                )
+
+        await _write_extract_audit(dep, task, node_id=node_id, root_id=root_id, written=written)
+
+
+async def _run_extract(
+    dep,
+    task: _Task,
+    node_id: int,
+    target_parent_id: int | None,
+    selected_paths: list[str] | None,
+) -> None:
+    _update(task, status="running", detail="读取压缩包目录")
     try:
         source_info = await _load_extract_source(dep, task, node_id, target_parent_id)
         adapter = dep.storage_manager.get_adapter(source_info.policy)
@@ -324,8 +470,24 @@ async def _run_extract(dep, task: _Task, node_id: int, target_parent_id: int | N
                 await _close_stream(source_stream)
             spool.seek(0)
 
+            if Path(source_info.node_name).suffix.lower() == ".7z":
+                await _run_extract_7z(
+                    dep,
+                    task,
+                    node_id=node_id,
+                    source_info=source_info,
+                    adapter=adapter,
+                    spool=spool,
+                    selected_paths=selected_paths,
+                )
+                _update(task, status="completed", progress=100, detail="解压完成")
+                return
+
             with zipfile.ZipFile(spool) as archive:
-                infos = [info for info in archive.infolist() if _safe_parts(info.filename)]
+                infos = [
+                    info for info in archive.infolist()
+                    if _safe_parts(info.filename) and _is_selected(info.filename, selected_paths)
+                ]
                 if len(infos) > MAX_ENTRIES:
                     raise ValueError("ZIP 条目过多")
                 total_bytes = sum(info.file_size for info in infos if not info.is_dir())

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import Select, func, or_, select
+from sqlalchemy import Select, case, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -14,6 +14,16 @@ from models.tables import Node, ObjectRecord
 
 
 ID_BATCH_SIZE = 500
+
+CATEGORY_EXTENSIONS = {
+    "image": ("png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif", "ico", "heic", "tif", "tiff"),
+    "video": ("mp4", "mov", "mkv", "avi", "webm", "flv", "m4v", "wmv"),
+    "audio": ("mp3", "wav", "flac", "ogg", "m4a", "aac", "opus"),
+    "document": (
+        "pdf", "doc", "docx", "docm", "dot", "dotx", "xls", "xlsx", "xlsm", "xlsb", "xltx",
+        "ppt", "pptx", "pptm", "pps", "ppsx", "csv", "txt",
+    ),
+}
 
 
 def _unique_name(name: str, existing: set[str]) -> str:
@@ -79,6 +89,21 @@ class NodeRepository:
             statement = statement.where(Node.type == NodeType.FOLDER)
         return await self._list_page(statement, limit=limit, offset=offset, sort=sort)
 
+    async def child_content_counts(self, mount_id: int, parent_id: int) -> tuple[int, int]:
+        row = (
+            await self.session.execute(
+                select(
+                    func.coalesce(func.sum(case((Node.type == NodeType.FOLDER, 1), else_=0)), 0),
+                    func.coalesce(func.sum(case((Node.type == NodeType.FILE, 1), else_=0)), 0),
+                ).where(
+                    Node.mount_id == mount_id,
+                    Node.parent_id == parent_id,
+                    Node.deleted_at.is_(None),
+                )
+            )
+        ).one()
+        return int(row[0]), int(row[1])
+
     async def list_category_page(
         self,
         mount_id: int,
@@ -88,23 +113,23 @@ class NodeRepository:
         offset: int,
         sort: str,
     ) -> tuple[list[Node], bool]:
-        extensions = {
-            "image": ("png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif", "ico", "heic", "tif", "tiff"),
-            "video": ("mp4", "mov", "mkv", "avi", "webm", "flv", "m4v", "wmv"),
-            "audio": ("mp3", "wav", "flac", "ogg", "m4a", "aac", "opus"),
-            "document": (
-                "pdf", "doc", "docx", "docm", "dot", "dotx", "xls", "xlsx", "xlsm", "xlsb", "xltx",
-                "ppt", "pptx", "pptm", "pps", "ppsx", "csv", "txt",
-            ),
-        }[category]
+        statement = self._category_statement(mount_id, category)
+        return await self._list_page(statement, limit=limit, offset=offset, sort=sort)
+
+    async def category_count(self, mount_id: int, category: str) -> int:
+        statement = self._category_statement(mount_id, category).with_only_columns(func.count(Node.id)).order_by(None)
+        total = await self.session.scalar(statement)
+        return int(total or 0)
+
+    @staticmethod
+    def _category_statement(mount_id: int, category: str) -> Select:
         lowered_name = func.lower(Node.name)
-        statement = select(Node).where(
+        return select(Node).where(
             Node.mount_id == mount_id,
             Node.type == NodeType.FILE,
             Node.deleted_at.is_(None),
-            or_(*(lowered_name.like(f"%.{extension}") for extension in extensions)),
+            or_(*(lowered_name.like(f"%.{extension}") for extension in CATEGORY_EXTENSIONS[category])),
         )
-        return await self._list_page(statement, limit=limit, offset=offset, sort=sort)
 
     async def search(self, mount_id: int, query: str, *, limit: int) -> list[Node]:
         lowered_query = query.strip().lower()
@@ -203,6 +228,17 @@ class NodeRepository:
             )
         )
         return int(file_count or 0), int(folder_count or 0)
+
+    async def mount_file_bytes(self, mount_id: int) -> int:
+        """Return logical file bytes, including recycle-bin items that still consume quota."""
+
+        total = await self.session.scalar(
+            select(func.coalesce(func.sum(Node.size), 0)).where(
+                Node.mount_id == mount_id,
+                Node.type == NodeType.FILE,
+            )
+        )
+        return int(total or 0)
 
     async def get_child_any(self, mount_id: int, parent_id: int | None, name: str) -> Node | None:
         """Find a child including a previously missing/deleted imported node."""

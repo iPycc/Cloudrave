@@ -4,18 +4,32 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import EmailStr, Field, field_validator
+
+from schemas.common import CloudraveSchema
 
 
-class AuthSchema(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+class AuthSchema(CloudraveSchema):
+    pass
 
 
 class RegisterRequest(AuthSchema):
     email: EmailStr
     username: str = Field(min_length=2, max_length=64)
     password: str = Field(min_length=8, max_length=128)
+    timezone: str = Field(default="UTC", min_length=1, max_length=64)
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str) -> str:
+        normalized = value.strip()
+        try:
+            ZoneInfo(normalized)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("Invalid timezone") from exc
+        return normalized
 
 
 class LoginRequest(AuthSchema):
@@ -40,10 +54,12 @@ class UserResponse(AuthSchema):
     role: str
     status: str
     timezone: str
+    thumbnails_enabled: bool = True
     avatar: str | None = None
     created_at: datetime
     password_updated_at: datetime | None = None
     two_factor_enabled: bool = False
+    capabilities: list[str] = Field(default_factory=list)
 
 
 class TokenPairResponse(AuthSchema):
@@ -61,9 +77,9 @@ class TwoFactorChallengeResponse(AuthSchema):
 
 
 class TwoFactorVerifyRequest(AuthSchema):
-    two_factor_token: str = Field(min_length=20, max_length=512)
+    two_factor_token: str | None = Field(default=None, min_length=20, max_length=512)
     code: str = Field(min_length=6, max_length=8)
-    method: Literal["password", "passkey"] = "password"
+    method: Literal["password", "passkey", "github", "google", "qq"] = "password"
 
 
 class LoginResponse(AuthSchema):

@@ -19,6 +19,7 @@ from schemas.node import (
     NodeCopyRequest,
     NodeDeleteRequest,
     NodeMoveRequest,
+    NodePageMetadataRead,
     NodePageRead,
     NodeRead,
     NodeRenameRequest,
@@ -90,6 +91,25 @@ async def list_node_page(
         )
 
 
+@router.get("/node/page/metadata", response_model=NodePageMetadataRead)
+async def get_node_page_metadata(
+    request: Request,
+    mount_id: int,
+    parent_id: int | None = None,
+    folders_only: bool = False,
+    current_user: User = Depends(get_current_user),
+) -> NodePageMetadataRead:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = node_service(dep, session)
+        return await service.child_metadata(
+            current_user,
+            mount_id,
+            parent_id,
+            folders_only=folders_only,
+        )
+
+
 @router.get("/node/category", response_model=NodePageRead)
 async def list_node_category(
     request: Request,
@@ -111,6 +131,19 @@ async def list_node_category(
             cursor=cursor,
             sort=sort,
         )
+
+
+@router.get("/node/category/metadata", response_model=NodePageMetadataRead)
+async def get_node_category_metadata(
+    request: Request,
+    mount_id: int,
+    category: NodeCategory,
+    current_user: User = Depends(get_current_user),
+) -> NodePageMetadataRead:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        service = node_service(dep, session)
+        return await service.category_metadata(current_user, mount_id, category)
 
 
 @router.get("/node/search", response_model=list[NodeSearchResult])

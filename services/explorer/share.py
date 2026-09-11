@@ -16,6 +16,7 @@ from repositories.audit_logs import AuditLogRepository
 from repositories.nodes import NodeRepository
 from repositories.shares import ShareRepository
 from schemas.share import ShareCreateRequest, ShareRead, ShareVerifyRequest
+from security.capabilities import Capability, require_capability
 
 
 class ShareService:
@@ -47,6 +48,7 @@ class ShareService:
         )
 
     async def create_share(self, request: Request, actor: User, payload: ShareCreateRequest) -> ShareRead:
+        require_capability(actor, Capability.SHARE_MANAGE)
         requested_ids = list(dict.fromkeys(payload.node_ids or ([payload.node_id] if payload.node_id is not None else [])))
         if not requested_ids:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="At least one node is required")
@@ -87,6 +89,7 @@ class ShareService:
         return self._serialize_share(share, node).model_copy(update={"item_count": len(nodes)})
 
     async def list_shares(self, actor: User) -> list[ShareRead]:
+        require_capability(actor, Capability.SHARE_MANAGE)
         shares = await self.shares.list_for_owner(actor.id)
         return [
             self._serialize_share(share, share.node).model_copy(update={"item_count": len(share.items) or 1})
@@ -94,6 +97,7 @@ class ShareService:
         ]
 
     async def revoke_share(self, request: Request, actor: User, share_id: str) -> None:
+        require_capability(actor, Capability.SHARE_MANAGE)
         share = await self.shares.get_by_id(share_id)
         if share is None or share.owner_id != actor.id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Share not found")

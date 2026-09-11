@@ -27,6 +27,7 @@ from schemas.user import (
     UserProfileUpdateRequest,
 )
 from security.password import PasswordService
+from security.capabilities import Capability, require_capability
 from services.user.response import build_user_response
 from core.cfg import CloudraveConfig
 
@@ -57,6 +58,7 @@ class UserProfileService:
         self.site_settings = site_settings
 
     async def update_profile(self, request: Request, actor: User, payload: UserProfileUpdateRequest):
+        require_capability(actor, Capability.PROFILE_MANAGE)
         user = await self._get_managed_user(actor.uid)
         normalized_email = payload.email.lower()
         normalized_username = payload.username.strip()
@@ -86,6 +88,7 @@ class UserProfileService:
         return build_user_response(user)
 
     async def upload_avatar(self, request: Request, actor: User, file: UploadFile):
+        require_capability(actor, Capability.PROFILE_MANAGE)
         user = await self._get_managed_user(actor.uid)
         if not file.filename:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="请选择头像文件")
@@ -172,18 +175,33 @@ class UserProfileService:
         payload: UserPreferencesUpdateRequest,
     ) -> UserPreferencesResponse:
         user = await self._get_managed_user(actor.uid)
-        timezone = _normalize_timezone(payload.timezone)
-        user = await self.users.update_timezone(user, timezone)
+        timezone = _normalize_timezone(payload.timezone) if payload.timezone is not None else None
+        user = await self.users.update_preferences(
+            user,
+            timezone=timezone,
+            thumbnails_enabled=payload.thumbnails_enabled,
+        )
+        detail = {
+            **({"timezone": timezone} if timezone is not None else {}),
+            **(
+                {"thumbnails_enabled": payload.thumbnails_enabled}
+                if payload.thumbnails_enabled is not None
+                else {}
+            ),
+        }
         await self.audits.create(
             actor_id=user.id,
             action="preferences_update",
             target=f"user:{user.uid}",
-            detail=json.dumps({"timezone": timezone}, ensure_ascii=False),
+            detail=json.dumps(detail, ensure_ascii=False),
             ip=request.client.host if request.client else None,
             user_agent=request.headers.get("user-agent"),
             request_id=getattr(request.state, "request_id", None),
         )
-        return UserPreferencesResponse(timezone=user.timezone)
+        return UserPreferencesResponse(
+            timezone=user.timezone,
+            thumbnails_enabled=bool(user.thumbnails_enabled),
+        )
 
     async def list_login_activity(self, actor: User, limit: int = 50) -> list[LoginActivityEntry]:
         logs = await self.audits.list_login_events(actor_id=actor.id, identifier=actor.email, limit=limit)

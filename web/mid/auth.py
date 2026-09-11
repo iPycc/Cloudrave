@@ -11,9 +11,9 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.exc import OperationalError
 
 from core.dep import Dep
-from models.enums import UserStatus
 from security.auth_cookies import ACCESS_TOKEN_COOKIE
 from security.jwt import AuthError
+from services.session.context import AuthenticatedSessionService
 
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -51,18 +51,12 @@ async def get_current_user(
     token_version = int(payload.get("ver", 0))
 
     async with dep.session_scope() as session:
-        user_repo = dep.get_user_repository(session)
         session_repo = dep.get_session_repository(session)
-        session_record = await session_repo.get_active_by_id(session_id)
-        user = await user_repo.get_by_uid(user_uid)
-        if session_record is None or user is None or session_record.user_id != user.id:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session revoked")
-        if user.status != UserStatus.ACTIVE:
-            await session_repo.revoke_all_for_user(user.id)
-            await session.commit()
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Account disabled")
-        if session_record.token_version != token_version:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session token rotated")
+        user, session_record = await AuthenticatedSessionService(
+            session=session,
+            sessions=session_repo,
+            mounts=dep.get_mount_repository(session),
+        ).resolve(user_uid=user_uid, session_id=session_id, token_version=token_version)
         touch_due = _session_touch_due(session_record.last_seen_at)
 
     if touch_due:

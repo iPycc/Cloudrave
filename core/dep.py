@@ -14,6 +14,7 @@ from repositories.nodes import NodeRepository
 from repositories.objects import ObjectRepository
 from repositories.passkeys import PasskeyRepository
 from repositories.policies import StoragePolicyRepository
+from repositories.preview_annotations import PreviewAnnotationRepository
 from repositories.sessions import SessionRepository
 from repositories.shared import SharedRepository
 from repositories.shares import ShareRepository
@@ -176,6 +177,9 @@ class Dep:
 
     def get_passkey_repository(self, session: AsyncSession) -> PasskeyRepository:
         return PasskeyRepository(session)
+
+    def get_preview_annotation_repository(self, session: AsyncSession) -> PreviewAnnotationRepository:
+        return PreviewAnnotationRepository(session)
 
     def get_upload_repository(self, session: AsyncSession) -> UploadRepository:
         return UploadRepository(session)

@@ -2,7 +2,7 @@
   <br>
   <a href="https://github.com/ipycc/cloudrave" alt="logo"><img src="https://raw.githubusercontent.com/iPycc/frontend/00aca676ea29ef3186bd330e670df7e7aafaf7b5/public/cloudrave-logo.svg" width="100"/></a>
   <br>
-  Cloudrave B1
+  Cloudrave
   <br>
 </h1>
 
@@ -104,6 +104,12 @@ use_color = true
 
 生产部署前请务必修改 `jwt_secret`、`totp_secret_key`、`backup_codes_key`、`share_signing_key` 等敏感密钥。
 
+### GitHub OAuth 登录
+
+管理员可在“设置 → 账号与安全”中配置 GitHub OAuth App 的 Client ID 与 Client Secret。配置前先在“站点设置”保存站点的 HTTPS 网站链接，再将页面生成的 `Authorization callback URL` 原样填写到 GitHub OAuth App。
+
+GitHub 登录只用于已有 Cloudrave 账号：首次登录会使用 GitHub 返回的已验证邮箱匹配本地账号并建立身份关联，不会自动创建新用户。Client Secret 加密保存在数据库中，管理接口只返回是否已配置。
+
 ## 📦 构建与部署
 
 ### 全栈模式（前后端同一端口）
@@ -154,7 +160,7 @@ python build-fullstack.py --binary
 
 #### 多平台 CI 打包
 
-仓库包含 [`.github/workflows/build-binaries.yml`](.github/workflows/build-binaries.yml)。手动触发会进行一次不发布的多平台构建预演；推送 `v*` 标签后，会构建完整嵌入前端的 Linux x86_64、Windows x86_64、macOS ARM64、macOS Intel 可执行包，以及独立前端静态资源包，并附带 SHA-256 校验清单发布到 GitHub Release。
+仓库包含 [`.github/workflows/build-binaries.yml`](.github/workflows/build-binaries.yml)。手动触发会进行一次不发布的多平台构建预演；推送 `v*` 标签后，会构建完整嵌入前端的 Linux x86_64、Windows x86_64、macOS ARM64 与 macOS Intel 原生可执行文件，并连同 SHA-256 校验清单直接发布到 GitHub Release（不再套用 ZIP 或 tar.gz 压缩包）。
 
 发布使用的前端提交固定记录在 [`.frontend-ref`](.frontend-ref) 中。更新前端后，应先通过前端验证并推送提交，再更新此文件，确保发布构建可复现。
 

@@ -46,7 +46,7 @@ jobs:
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 9
+          version: 10
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
@@ -67,23 +67,6 @@ jobs:
         working-directory: Frontend
         run: pnpm build
 
-      - name: Package standalone frontend
-        shell: bash
-        run: |
-          mkdir -p release
-          python - <<'PY'
-          import os
-          from pathlib import Path
-          from zipfile import ZIP_DEFLATED, ZipFile
-
-          source = Path("Frontend/dist")
-          target = Path("release") / f"cloudrave-frontend-{os.environ['GITHUB_REF_NAME']}.zip"
-          with ZipFile(target, "w", ZIP_DEFLATED) as archive:
-              for path in sorted(source.rglob("*")):
-                  if path.is_file():
-                      archive.write(path, path.relative_to(source))
-          PY
-
       - name: Upload frontend for native builds
         uses: actions/upload-artifact@v4
         with:
@@ -91,14 +74,6 @@ jobs:
           path: Frontend/dist
           if-no-files-found: error
           retention-days: 7
-
-      - name: Upload standalone frontend artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-frontend
-          path: release/*
-          if-no-files-found: error
-          retention-days: 14
 
   backend-test:
     name: Validate backend
@@ -118,7 +93,7 @@ jobs:
           python -m pip install -e ".[dev]"
 
       - name: Compile backend
-        run: python -m compileall -q app
+        run: python -m compileall -q api core db models repositories schemas security services store web main.py
 
       - name: Run backend tests
         run: python -m pytest -q tests
@@ -264,22 +239,23 @@ jobs:
             }
           }
 
-      - name: Package Linux or macOS binary
+      - name: Stage Linux or macOS binary
         if: runner.os != 'Windows'
         shell: bash
         run: |
           mkdir -p release
-          tar -czf "release/cloudrave-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" \
-            -C Cloudrave/dist "${{ matrix.executable }}"
+          cp "Cloudrave/dist/${{ matrix.executable }}" \
+            "release/cloudrave-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          chmod +x "release/cloudrave-${GITHUB_REF_NAME}-${{ matrix.target }}"
 
-      - name: Package Windows binary
+      - name: Stage Windows binary
         if: runner.os == 'Windows'
         shell: powershell
         run: |
           New-Item -ItemType Directory -Path release -Force | Out-Null
-          Compress-Archive `
-            -Path "Cloudrave\dist\${{ matrix.executable }}" `
-            -DestinationPath "release\cloudrave-$env:GITHUB_REF_NAME-${{ matrix.target }}.zip"
+          Copy-Item `
+            -LiteralPath "Cloudrave\dist\${{ matrix.executable }}" `
+            -Destination "release\cloudrave-$env:GITHUB_REF_NAME-${{ matrix.target }}.exe"
 
       - name: Upload native release artifact
         uses: actions/upload-artifact@v4
@@ -300,6 +276,20 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout backend release source
+        uses: actions/checkout@v6
+        with:
+          path: Cloudrave
+          fetch-depth: 0
+
+      - name: Checkout pinned frontend history
+        uses: actions/checkout@v6
+        with:
+          repository: iPycc/frontend
+          ref: ${{ needs.frontend.outputs.frontend_sha }}
+          path: Frontend
+          fetch-depth: 0
+
       - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
@@ -312,6 +302,32 @@ jobs:
         run: |
           cd release
           sha256sum cloudrave-* > SHA256SUMS.txt
+
+      - name: Build release notes
+        shell: bash
+        env:
+          FRONTEND_SHA: ${{ needs.frontend.outputs.frontend_sha }}
+        run: |
+          notes="Cloudrave/.github/release-notes/${GITHUB_REF_NAME}.md"
+          if [[ -f "$notes" ]]; then
+            cp "$notes" release-notes.md
+          else
+            {
+              echo "# cloudrave-${GITHUB_REF_NAME}"
+              echo
+              echo "## Changed"
+              echo
+              echo "- See the commit history for changed behavior in this release."
+              echo
+              echo "## Added"
+              echo
+              echo "- See the commit history for features added in this release."
+              echo
+              echo "## Fixed"
+              echo
+              echo "- See the commit history for fixes included in this release."
+            } > release-notes.md
+          fi
 
       - name: Create GitHub release
         shell: bash
@@ -327,7 +343,6 @@ jobs:
           gh release create "$GITHUB_REF_NAME" release/* \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
-            --title "Cloudrave $GITHUB_REF_NAME" \
-            --generate-notes \
-            --notes "测试版本，请先备份现有数据。完整二进制已嵌入前端，只需启动对应服务器平台的一个可执行文件；其他设备可通过浏览器访问服务器的 1309 端口。前端提交：$FRONTEND_SHA" \
+            --title "cloudrave-$GITHUB_REF_NAME" \
+            --notes-file release-notes.md \
             "${flags[@]}"

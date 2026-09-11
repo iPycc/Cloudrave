@@ -7,22 +7,18 @@ import logging
 from fastapi import HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.enums import UserStatus
+from models.enums import UserRole, UserStatus
 from repositories.audit_logs import AuditLogRepository
 from repositories.mounts import BucketMountRepository
-from repositories.nodes import NodeRepository
-from repositories.policies import StoragePolicyRepository
 from repositories.sessions import SessionRepository
 from repositories.users import UserRepository
 from schemas.auth import LoginRequest, LoginResponse
 from security.jwt import TokenService
 from security.password import PasswordService
 from services.session.issue import IssueSessionService
+from services.session.two_factor_token import TwoFactorTokenService
+from services.user.guest_access import guest_is_available
 from services.user.response import build_user_response
-from services.user.storage import UserStorageProvisionService
-from services.user.totp import TOTPService
-from store.manager import StorageManager
-from core.cfg import CloudraveConfig
 from core.log import LogOperation, LogOutcome
 from web.client_ip import get_client_ip
 
@@ -38,25 +34,17 @@ class UserLoginService:
         users: UserRepository,
         sessions: SessionRepository,
         audits: AuditLogRepository,
-        policies: StoragePolicyRepository,
         mounts: BucketMountRepository,
-        nodes: NodeRepository,
         password_service: PasswordService,
         token_service: TokenService,
-        storage_manager: StorageManager,
-        config: CloudraveConfig,
     ) -> None:
         self.session = session
         self.users = users
         self.sessions = sessions
         self.audits = audits
-        self.policies = policies
         self.mounts = mounts
-        self.nodes = nodes
         self.password_service = password_service
         self.token_service = token_service
-        self.storage_manager = storage_manager
-        self.config = config
 
     async def login(self, request: Request, payload: LoginRequest) -> LoginResponse:
         normalized_email = payload.email.lower()
@@ -113,26 +101,26 @@ class UserLoginService:
                 detail="账号已被禁用",
             )
 
-        await UserStorageProvisionService(
-            policies=self.policies,
-            mounts=self.mounts,
-            nodes=self.nodes,
-            storage_manager=self.storage_manager,
-        ).ensure_default_local_storage(user)
+        if user.role == UserRole.GUEST:
+            if not await guest_is_available(user, self.mounts):
+                await self.sessions.revoke_all_for_user(user.id)
+                await self._record_login_attempt(
+                    request,
+                    actor_id=user.id,
+                    identifier=normalized_email,
+                    result="expired",
+                )
+                await self.session.commit()
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Guest account is unavailable or expired")
 
         if user.totp_enabled and user.totp_secret:
-            two_factor_token = TOTPService(
-                session=self.session,
-                users=self.users,
-                audits=self.audits,
-                passkeys=None,  # type: ignore[arg-type]
-                password_service=self.password_service,
-                token_service=self.token_service,
-                config=self.config,
-            ).issue_login_token(user.uid, login_method="password")
+            two_factor_token = TwoFactorTokenService(self.token_service).issue_login_token(
+                user.uid,
+                login_method="password",
+            )
             return LoginResponse(
                 user=build_user_response(user),
-                token=None,  # type: ignore[arg-type]
+                token=None,
                 requires_2fa=True,
                 two_factor_token=two_factor_token,
                 message="请输入两步验证码",

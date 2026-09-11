@@ -19,7 +19,13 @@ from schemas.passkey import (
     PasskeyAuthenticationVerifyRequest,
     PasskeyOptionsResponse,
 )
-from security.auth_cookies import clear_auth_cookies, resolve_refresh_token, set_auth_cookies
+from security.auth_cookies import (
+    clear_auth_cookies,
+    clear_oauth_two_factor_cookie,
+    resolve_refresh_token,
+    resolve_two_factor_token,
+    set_auth_cookies,
+)
 from schemas.common import MessageResponse
 from repositories.site_settings import SiteSettingsRepository
 from services.session.refresh import RefreshTokenService
@@ -46,13 +52,9 @@ async def login(
             users=dep.get_user_repository(session),
             sessions=dep.get_session_repository(session),
             audits=dep.get_audit_repository(session),
-            policies=dep.get_policy_repository(session),
             mounts=dep.get_mount_repository(session),
-            nodes=dep.get_node_repository(session),
             password_service=dep.password_service,
             token_service=dep.token_service,
-            storage_manager=dep.storage_manager,
-            config=dep.config,
         )
         result = await service.login(request, payload)
         if result.token:
@@ -123,26 +125,26 @@ async def verify_two_factor(
     _rate_limit: None = Depends(login_rate_limit),
 ) -> LoginResponse:
     dep = request.app.state.dep
+    login_token = resolve_two_factor_token(request, payload.two_factor_token)
+    if not login_token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="登录令牌缺失")
     async with dep.session_scope() as session:
         service = TwoFactorLoginService(
             session=session,
             users=dep.get_user_repository(session),
             sessions=dep.get_session_repository(session),
             audits=dep.get_audit_repository(session),
-            policies=dep.get_policy_repository(session),
-            mounts=dep.get_mount_repository(session),
-            nodes=dep.get_node_repository(session),
             token_service=dep.token_service,
-            storage_manager=dep.storage_manager,
             config=dep.config,
         )
         result = await service.verify(
             request,
-            login_token=payload.two_factor_token,
+            login_token=login_token,
             code=payload.code,
             login_method=payload.method,
         )
         set_auth_cookies(response, request=request, config=dep.config, token_pair=result.token)
+        clear_oauth_two_factor_cookie(response, request=request, config=dep.config)
         result.token.refresh_token = None
         return result
 
@@ -164,6 +166,7 @@ async def refresh_token(
             users=dep.get_user_repository(session),
             sessions=dep.get_session_repository(session),
             audits=dep.get_audit_repository(session),
+            mounts=dep.get_mount_repository(session),
             token_service=dep.token_service,
         )
         result = await service.refresh(request, RefreshRequest(refresh_token=refresh_token_value))

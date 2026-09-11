@@ -6,15 +6,17 @@ import hashlib
 from datetime import UTC, datetime
 
 from fastapi import HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from models.enums import ShareAccess
 from models.shared import ShareMount
 from models.tables import Node, ShareRecord, User
 from repositories.shared import SharedRepository
-from schemas.shared import SharedCreate, SharedNode, SharedRead
+from schemas.shared import SharedCreate, SharedNode, SharedRead, SharedSummaryRead, SharedOwnerRead
 from services.explorer.share import ShareService
 from services.user.response import build_avatar_url
+from security.capabilities import Capability, require_capability
 
 
 class SharedService:
@@ -23,6 +25,7 @@ class SharedService:
         self.source = source
 
     async def create(self, actor: User, payload: SharedCreate) -> SharedRead:
+        require_capability(actor, Capability.SHARED_MOUNT)
         share, nodes = await self._info(payload.share_id)
         self._require_other_owner(actor.id, share)
         if share.access == ShareAccess.PASSWORD and (
@@ -44,6 +47,7 @@ class SharedService:
         return self._read(mount, share, nodes, await self._owner(share.owner_id))
 
     async def list(self, actor: User) -> list[SharedRead]:
+        require_capability(actor, Capability.SHARED_MOUNT)
         mounts = await self.shared.list(actor.id)
         all_shares = {
             share.id: share
@@ -90,10 +94,69 @@ class SharedService:
             result.append(self._read(mount, share, roots, owners.get(share.owner_id)) if roots else self._unavailable(mount))
         return result
 
+    async def owners(self, actor: User) -> list[SharedOwnerRead]:
+        require_capability(actor, Capability.SHARED_MOUNT)
+        mounts = await self.shared.list(actor.id)
+        shares = {
+            share.id: share
+            for share in await self.source.shares.list_by_ids([mount.share_id for mount in mounts])
+            if share.owner_id != actor.id
+        }
+        root_ids = {
+            item.node_id
+            for share in shares.values()
+            for item in (share.items or [])
+        }
+        root_ids.update(share.node_id for share in shares.values() if not share.items)
+        nodes = {node.id: node for node in await self.source.nodes.list_by_ids(list(root_ids))}
+        groups: dict[int, SharedOwnerRead] = {}
+        now = datetime.now(UTC)
+        for mount in mounts:
+            share = shares.get(mount.share_id)
+            if share is None or not share.is_active:
+                continue
+            expires_at = share.expires_at
+            if expires_at is not None and expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
+            if expires_at is not None and expires_at < now:
+                continue
+            try:
+                self._require_grant(mount, share)
+            except HTTPException:
+                continue
+            ids = [item.node_id for item in share.items] or [share.node_id]
+            if not any(node_id in nodes and nodes[node_id].deleted_at is None for node_id in ids):
+                continue
+            group = groups.get(share.owner_id)
+            if group is None:
+                groups[share.owner_id] = SharedOwnerRead(
+                    id=share.owner_id, name=f"用户 #{share.owner_id}",
+                    share_count=1, latest_shared_at=mount.created_at,
+                )
+            else:
+                group.share_count += 1
+                group.latest_shared_at = max(group.latest_shared_at, mount.created_at)
+        if not groups:
+            return []
+        owners = await self.shared.session.scalars(select(User).where(User.id.in_(groups)))
+        for owner in owners:
+            groups[owner.id].name = owner.username
+            groups[owner.id].avatar = build_avatar_url(owner)
+        return sorted(groups.values(), key=lambda group: (group.latest_shared_at, group.id), reverse=True)
+
+    async def summary(self, actor: User) -> SharedSummaryRead:
+        owners = await self.owners(actor)
+        return SharedSummaryRead(
+            owner_count=len(owners),
+            share_count=sum(owner.share_count for owner in owners),
+        )
+
     async def get(self, actor: User, mount_id: int) -> SharedRead:
+        require_capability(actor, Capability.SHARED_MOUNT)
         return await self._resolve(actor, await self._mount(actor.id, mount_id))
 
     async def nodes(self, actor: User, mount_id: int, parent_id: int | None) -> list[SharedNode]:
+        require_capability(actor, Capability.SHARED_MOUNT)
         mount = await self._mount(actor.id, mount_id)
         share, _ = await self._info(mount.share_id)
         self._require_other_owner(actor.id, share)
@@ -102,6 +165,7 @@ class SharedService:
         return [self._node(node) for node in nodes]
 
     async def resolve_node(self, actor: User, mount_id: int, node_id: int) -> tuple[ShareRecord, Node]:
+        require_capability(actor, Capability.SHARED_MOUNT)
         mount = await self._mount(actor.id, mount_id)
         share, _ = await self._info(mount.share_id)
         self._require_other_owner(actor.id, share)
@@ -109,6 +173,7 @@ class SharedService:
         return share, await self.source.resolve_shared_node(share, node_id)
 
     async def delete(self, actor: User, mount_id: int) -> None:
+        require_capability(actor, Capability.SHARED_MOUNT)
         await self.shared.delete(await self._mount(actor.id, mount_id))
 
     async def _mount(self, user_id: int, mount_id: int) -> ShareMount:

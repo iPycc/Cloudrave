@@ -33,7 +33,8 @@ from repositories.sessions import SessionRepository
 from repositories.site_settings import SiteSettingsRepository
 from repositories.users import UserRepository
 from schemas.auth import LoginResponse
-from services.user.totp import TOTPService
+from services.session.two_factor_token import TwoFactorTokenService
+from security.capabilities import Capability, require_capability
 from schemas.passkey import (
     PasskeyAuthenticationOptionsRequest,
     PasskeyAuthenticationResponse,
@@ -98,6 +99,7 @@ class PasskeyService:
         self.site_settings = site_settings
 
     async def list_for_user(self, actor: User) -> PasskeyListResponse:
+        require_capability(actor, Capability.SECURITY_MANAGE)
         records = await self.passkeys.list_for_user(actor.id)
         return PasskeyListResponse(
             passkeys_enabled=bool(records),
@@ -110,6 +112,7 @@ class PasskeyService:
         actor: User,
         payload: PasskeyRegistrationOptionsRequest,
     ) -> PasskeyOptionsResponse:
+        require_capability(actor, Capability.SECURITY_MANAGE)
         await self.passkeys.delete_expired_ceremonies()
         rp_id = await self._resolve_rp_id(request)
         records = await self.passkeys.list_for_user(actor.id)
@@ -144,6 +147,7 @@ class PasskeyService:
         actor: User,
         payload: PasskeyRegistrationVerifyRequest,
     ) -> PasskeyVerificationResponse:
+        require_capability(actor, Capability.SECURITY_MANAGE)
         ceremony = await self.passkeys.get_active_ceremony(payload.ceremony_id, "registration")
         if ceremony is None or ceremony.user_id != actor.id:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="通行密钥注册挑战已失效")
@@ -188,6 +192,7 @@ class PasskeyService:
         return PasskeyVerificationResponse(passkey=self._build_passkey_read(record))
 
     async def delete_for_user(self, request: Request, actor: User, passkey_id: int) -> None:
+        require_capability(actor, Capability.SECURITY_MANAGE)
         record = await self.passkeys.get_for_user(actor.id, passkey_id)
         if record is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="通行密钥不存在")
@@ -209,6 +214,7 @@ class PasskeyService:
         passkey_id: int,
         payload: PasskeyRenameRequest,
     ) -> PasskeyRead:
+        require_capability(actor, Capability.SECURITY_MANAGE)
         record = await self.passkeys.get_for_user(actor.id, passkey_id)
         if record is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="通行密钥不存在")
@@ -316,21 +322,16 @@ class PasskeyService:
         ).ensure_default_local_storage(user)
 
         if user.totp_enabled and user.totp_secret:
-            two_factor_token = TOTPService(
-                session=self.session,
-                users=self.users,
-                audits=self.audits,
-                passkeys=None,  # type: ignore[arg-type]
-                password_service=None,  # type: ignore[arg-type]
-                token_service=self.token_service,
-                config=self.config,
-            ).issue_login_token(user.uid, login_method="passkey")
+            two_factor_token = TwoFactorTokenService(self.token_service).issue_login_token(
+                user.uid,
+                login_method="passkey",
+            )
             await self.passkeys.update_usage(record, sign_count=verification.new_sign_count)
             await self.passkeys.mark_ceremony_used(ceremony)
             return PasskeyAuthenticationResponse(
                 login=LoginResponse(
                     user=build_user_response(user),
-                    token=None,  # type: ignore[arg-type]
+                    token=None,
                     requires_2fa=True,
                     two_factor_token=two_factor_token,
                     message="请输入两步验证码",

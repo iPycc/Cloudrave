@@ -10,6 +10,8 @@ from sqlalchemy import Connection, select
 
 from db.mig.row import SchemaMigration
 from db.mig.v1 import upgrade as upgrade_v1
+from db.mig.v2 import upgrade as upgrade_v2
+from db.mig.v3 import upgrade as upgrade_v3
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +23,8 @@ class Migration:
 
 MIGRATIONS = (
     Migration(1, "legacy-runtime-schema", upgrade_v1),
+    Migration(2, "user-thumbnail-preference", upgrade_v2),
+    Migration(3, "oauth-provider-avatar-url", upgrade_v3),
 )
 
 

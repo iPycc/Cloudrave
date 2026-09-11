@@ -108,6 +108,39 @@ class BucketMountRepository:
         await self.session.flush()
         return mount
 
+    async def create_guest_workspace(
+        self,
+        *,
+        owner_id: int,
+        policy_id: int,
+        source_mount_id: int,
+        uid: str,
+        root_path: str,
+        quota_bytes: int,
+        expires_at: str | None,
+    ) -> BucketMount:
+        mount = BucketMount(
+            owner_id=owner_id,
+            policy_id=policy_id,
+            name="Guest Storage",
+            mount_slug=uid.lower(),
+            root_path=root_path.strip().strip("/"),
+            provider_label="Guest Storage",
+            is_enabled=True,
+            quota_bytes=quota_bytes,
+            extra={
+                "mode": "managed",
+                "read_only": False,
+                "system_managed": True,
+                "guest_workspace": True,
+                "guest_source_mount_id": source_mount_id,
+                "guest_expires_at": expires_at,
+            },
+        )
+        self.session.add(mount)
+        await self.session.flush()
+        return mount
+
     async def update(self, mount: BucketMount, payload: BucketMountUpdate) -> BucketMount:
         values = payload.model_dump(exclude_unset=True)
         mode = values.pop("mode", None)

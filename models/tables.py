@@ -50,7 +50,8 @@ class User(Base, TimestampMixin):
     avatar_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
     role: Mapped[UserRole] = mapped_column(Enum(UserRole, native_enum=False), default=UserRole.USER)
     status: Mapped[UserStatus] = mapped_column(Enum(UserStatus, native_enum=False), default=UserStatus.ACTIVE)
-    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai")
+    timezone: Mapped[str] = mapped_column(String(64), default="UTC")
+    thumbnails_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     password_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     totp_secret: Mapped[str | None] = mapped_column(String(255), nullable=True)
     totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -60,6 +61,7 @@ class User(Base, TimestampMixin):
     mounts: Mapped[list["BucketMount"]] = relationship(back_populates="owner")
     passkeys: Mapped[list["PasskeyCredential"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     passkey_ceremonies: Mapped[list["PasskeyCeremony"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    oauth_identities: Mapped[list["OAuthIdentity"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     shares: Mapped[list["ShareRecord"]] = relationship(back_populates="owner", cascade="all, delete-orphan")
 
 
@@ -81,6 +83,26 @@ class Session(Base):
     user: Mapped[User] = relationship(back_populates="sessions")
 
     __table_args__ = (Index("ix_sessions_user_status", "user_id", "status"),)
+
+
+class OAuthIdentity(Base, TimestampMixin):
+    __tablename__ = "oauth_identities"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    provider: Mapped[str] = mapped_column(String(32))
+    subject: Mapped[str] = mapped_column(String(255))
+    provider_username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    provider_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    provider_avatar_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    last_used_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    user: Mapped[User] = relationship(back_populates="oauth_identities")
+
+    __table_args__ = (
+        UniqueConstraint("provider", "subject", name="uq_oauth_identities_provider_subject"),
+        UniqueConstraint("user_id", "provider", name="uq_oauth_identities_user_provider"),
+    )
 
 
 class PasskeyCredential(Base, TimestampMixin):
@@ -230,6 +252,23 @@ class ObjectRecord(Base, TimestampMixin):
     checksum: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     content_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
     extra: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class PreviewAnnotation(Base, TimestampMixin):
+    """Private, per-user sidecar data for non-destructive preview annotations."""
+
+    __tablename__ = "preview_annotations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id", ondelete="CASCADE"), index=True)
+    source_version: Mapped[str] = mapped_column(String(64))
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    payload: Mapped[list[dict]] = mapped_column(JSON, default=list)
+
+    __table_args__ = (
+        UniqueConstraint("owner_id", "node_id", name="uq_preview_annotations_owner_node"),
+    )
 
 
 class ShareRecord(Base, TimestampMixin):

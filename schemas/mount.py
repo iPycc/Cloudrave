@@ -80,10 +80,19 @@ class BucketMountUpdate(CloudraveSchema):
 class BucketMountRead(BucketMountBase):
     id: int
     owner_id: int
+    created_at: datetime
+    updated_at: datetime
     sync_status: str = "never"
     last_sync_at: datetime | None = None
     sync_error: str | None = None
     synced_objects: int = 0
+
+
+class MountUsageRead(CloudraveSchema):
+    mount_id: int
+    used_bytes: int
+    reserved_bytes: int
+    quota_bytes: int | None = None
 
 
 class BucketMountDeletePreview(CloudraveSchema):
