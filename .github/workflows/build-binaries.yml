@@ -67,23 +67,6 @@ jobs:
         working-directory: Frontend
         run: pnpm build
 
-      - name: Package standalone frontend
-        shell: bash
-        run: |
-          mkdir -p release
-          python - <<'PY'
-          import os
-          from pathlib import Path
-          from zipfile import ZIP_DEFLATED, ZipFile
-
-          source = Path("Frontend/dist")
-          target = Path("release") / f"cloudrave-frontend-{os.environ['GITHUB_REF_NAME']}.zip"
-          with ZipFile(target, "w", ZIP_DEFLATED) as archive:
-              for path in sorted(source.rglob("*")):
-                  if path.is_file():
-                      archive.write(path, path.relative_to(source))
-          PY
-
       - name: Upload frontend for native builds
         uses: actions/upload-artifact@v4
         with:
@@ -91,14 +74,6 @@ jobs:
           path: Frontend/dist
           if-no-files-found: error
           retention-days: 7
-
-      - name: Upload standalone frontend artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-frontend
-          path: release/*
-          if-no-files-found: error
-          retention-days: 14
 
   backend-test:
     name: Validate backend
@@ -264,22 +239,23 @@ jobs:
             }
           }
 
-      - name: Package Linux or macOS binary
+      - name: Stage Linux or macOS binary
         if: runner.os != 'Windows'
         shell: bash
         run: |
           mkdir -p release
-          tar -czf "release/cloudrave-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" \
-            -C Cloudrave/dist "${{ matrix.executable }}"
+          cp "Cloudrave/dist/${{ matrix.executable }}" \
+            "release/cloudrave-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          chmod +x "release/cloudrave-${GITHUB_REF_NAME}-${{ matrix.target }}"
 
-      - name: Package Windows binary
+      - name: Stage Windows binary
         if: runner.os == 'Windows'
         shell: powershell
         run: |
           New-Item -ItemType Directory -Path release -Force | Out-Null
-          Compress-Archive `
-            -Path "Cloudrave\dist\${{ matrix.executable }}" `
-            -DestinationPath "release\cloudrave-$env:GITHUB_REF_NAME-${{ matrix.target }}.zip"
+          Copy-Item `
+            -LiteralPath "Cloudrave\dist\${{ matrix.executable }}" `
+            -Destination "release\cloudrave-$env:GITHUB_REF_NAME-${{ matrix.target }}.exe"
 
       - name: Upload native release artifact
         uses: actions/upload-artifact@v4
@@ -327,42 +303,31 @@ jobs:
           cd release
           sha256sum cloudrave-* > SHA256SUMS.txt
 
-      - name: Build What's New with linked commits
+      - name: Build release notes
         shell: bash
         env:
           FRONTEND_SHA: ${{ needs.frontend.outputs.frontend_sha }}
         run: |
-          previous_tag="$(git -C Cloudrave describe --tags --abbrev=0 "${GITHUB_SHA}^" 2>/dev/null || true)"
-          previous_backend="${previous_tag:-$(git -C Cloudrave rev-list --max-parents=0 HEAD)}"
-          previous_frontend=""
-          if [[ -n "$previous_tag" ]]; then
-            previous_frontend="$(git -C Cloudrave show "$previous_tag:.frontend-ref" 2>/dev/null | tr -d '\r\n' || true)"
+          notes="Cloudrave/.github/release-notes/${GITHUB_REF_NAME}.md"
+          if [[ -f "$notes" ]]; then
+            cp "$notes" release-notes.md
+          else
+            {
+              echo "# cloudrave-${GITHUB_REF_NAME}"
+              echo
+              echo "## Changed"
+              echo
+              echo "- See the commit history for changed behavior in this release."
+              echo
+              echo "## Added"
+              echo
+              echo "- See the commit history for features added in this release."
+              echo
+              echo "## Fixed"
+              echo
+              echo "- See the commit history for fixes included in this release."
+            } > release-notes.md
           fi
-          if [[ -z "$previous_frontend" ]]; then
-            previous_frontend="$(git -C Frontend rev-list --max-parents=0 "$FRONTEND_SHA")"
-          fi
-
-          {
-            echo "## What's New"
-            echo
-            echo "### Backend"
-            git -C Cloudrave log --reverse --format='%H%x09%h%x09%s' "$previous_backend..$GITHUB_SHA" | \
-              while IFS=$'\t' read -r full short subject; do
-                printf -- '- [`%s`](https://github.com/%s/commit/%s) %s\n' "$short" "$GITHUB_REPOSITORY" "$full" "$subject"
-              done
-            echo
-            echo "### Frontend"
-            git -C Frontend log --reverse --format='%H%x09%h%x09%s' "$previous_frontend..$FRONTEND_SHA" | \
-              while IFS=$'\t' read -r full short subject; do
-                printf -- '- [`%s`](https://github.com/iPycc/frontend/commit/%s) %s\n' "$short" "$full" "$subject"
-              done
-            echo
-            echo "## 使用提示"
-            echo
-            echo "这是测试版本，升级前请备份现有数据。原生二进制已内嵌前端，只需启动对应平台的可执行文件；其他设备可通过浏览器访问服务器的 1309 端口。"
-            echo
-            printf 'Pinned frontend: [`%s`](https://github.com/iPycc/frontend/commit/%s)\n' "${FRONTEND_SHA:0:7}" "$FRONTEND_SHA"
-          } > release-notes.md
 
       - name: Create GitHub release
         shell: bash
@@ -378,6 +343,6 @@ jobs:
           gh release create "$GITHUB_REF_NAME" release/* \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
-            --title "Cloudrave $GITHUB_REF_NAME" \
+            --title "cloudrave-$GITHUB_REF_NAME" \
             --notes-file release-notes.md \
             "${flags[@]}"
