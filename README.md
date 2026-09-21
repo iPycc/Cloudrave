@@ -86,8 +86,18 @@ local_upload_root = upload
 preview_cache_root = data/preview-cache
 
 [database]
-backend = sqlite
+database = sqlite
 sqlite_path = data/cloudrave.db
+mysql_host = 127.0.0.1
+mysql_port = 3306
+mysql_user = root
+mysql_password = change-me
+mysql_name = cloudrave
+postgresql_host = 127.0.0.1
+postgresql_port = 5432
+postgresql_user = postgres
+postgresql_password = change-me
+postgresql_name = cloudrave
 pool_size = 10
 max_overflow = 20
 pool_pre_ping = true
@@ -103,6 +113,14 @@ use_color = true
 ```
 
 生产部署前请务必修改 `jwt_secret`、`totp_secret_key`、`backup_codes_key`、`share_signing_key` 等敏感密钥。
+
+### 数据库切换
+
+`[database].database` 仅接受 `sqlite`、`mysql` 或 `postgresql`。MySQL/PostgreSQL 用户需要提前创建，并授予建库、建表、索引、读写和事务权限。管理员在切换向导中测试连接时，如果目标数据库不存在，Cloudrave 会自动创建；如果用户没有建库权限，页面会给出明确提示，此时也可以由数据库管理员预先创建目标数据库。
+
+管理员可从前端“系统设置 → 数据库”完成连接测试和数据迁移。运行中修改 `config.ini` 后，前端会自动显示迁移向导；可以选择把当前库的数据复制到目标库，或保留目标库现有数据。复制前会为非空目标库生成带 SHA-256 清单的逻辑备份。数据库元数据迁移完成后需要手动重启后端，原数据库和存储中的物理文件都不会被删除。
+
+`CLOUDRAVE_DATABASE_URL` 或非空的 `[database].url` 仍具有最高优先级。使用这两种覆盖方式时，管理页面只显示连接来源，不允许通过分字段向导切换数据库。
 
 ### GitHub OAuth 登录
 

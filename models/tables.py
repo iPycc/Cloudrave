@@ -5,7 +5,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from sqlalchemy import BigInteger, Index, JSON, Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Index, JSON, Boolean, Enum, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from models.enums import (
@@ -20,6 +21,7 @@ from models.enums import (
     UserStatus,
 )
 from db.base import Base
+from db.types import precise_datetime as DateTime
 
 
 def utcnow() -> datetime:
@@ -351,7 +353,9 @@ class AuditLog(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     actor_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     action: Mapped[str] = mapped_column(String(32))
-    target: Mapped[str] = mapped_column(String(255))
+    # Batch operations can reference thousands of node IDs. SQLite does not
+    # enforce VARCHAR lengths, while MySQL does, so use a real long-text type.
+    target: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"))
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
     user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)

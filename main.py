@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+from configparser import ConfigParser
 import sys
 from pathlib import Path
 
 import uvicorn
 
 from core.ver import __version__
-from core.cfg import load_config
+from core.cfg import database_management_source, load_config
 from core.dep import Dep
 from core.log import (
     LogOperation,
@@ -19,6 +20,8 @@ from core.log import (
     print_startup_banner,
 )
 from web.app import create_app
+from db.switch_state import load_switch_state, runtime_config
+from services.admin.database import DatabaseMigrationManager
 
 
 def _resolve_root_dir() -> Path:
@@ -34,13 +37,22 @@ def _resolve_root_dir() -> Path:
 
 
 ROOT_DIR = _resolve_root_dir()
-CONFIG = load_config(ROOT_DIR)
-app = create_app(CONFIG)
+REQUESTED_CONFIG = load_config(ROOT_DIR)
+SWITCH_STATE = load_switch_state(REQUESTED_CONFIG)
+CONFIG_PARSER = ConfigParser()
+CONFIG_PARSER.read(REQUESTED_CONFIG.config_path, encoding="utf-8")
+CONFIG = (
+    runtime_config(REQUESTED_CONFIG, SWITCH_STATE)
+    if database_management_source(CONFIG_PARSER) == "config"
+    else REQUESTED_CONFIG
+)
+DATABASE_MANAGER = DatabaseMigrationManager(ROOT_DIR, SWITCH_STATE)
+app = create_app(CONFIG, DATABASE_MANAGER)
 LOGGER = get_logger("cloudrave.main")
 
 
-async def preflight_startup() -> None:
-    dep = Dep(CONFIG)
+async def preflight_startup(config=None) -> None:
+    dep = Dep(config or CONFIG)
     try:
         await dep.check_database()
     finally:
@@ -58,17 +70,28 @@ def main() -> None:
     )
     LOGGER.info("Runtime profile: %s (%s).", CONFIG.app.env, mode)
     try:
-        asyncio.run(preflight_startup())
+        asyncio.run(preflight_startup(CONFIG))
     except RuntimeError as exc:
-        LOGGER.error(
-            str(exc),
-            extra={
-                "operation": LogOperation.STARTUP,
-                "resource": "application",
-                "outcome": LogOutcome.FAILED,
-            },
-        )
-        raise SystemExit(1) from None
+        fallback = DATABASE_MANAGER.activation_fallback_config()
+        if fallback is not None:
+            DATABASE_MANAGER.mark_activation_failed(str(exc))
+            try:
+                asyncio.run(preflight_startup(fallback))
+                app.state.dep = Dep(fallback)
+            except RuntimeError:
+                fallback = None
+        if fallback is not None:
+            LOGGER.warning("New database activation failed; continuing with the previous database.")
+        else:
+            LOGGER.error(
+                str(exc),
+                extra={
+                    "operation": LogOperation.STARTUP,
+                    "resource": "application",
+                    "outcome": LogOutcome.FAILED,
+                },
+            )
+            raise SystemExit(1) from None
     LOGGER.info(
         "Startup checks completed; binding HTTP server to %s:%s.",
         CONFIG.app.host,

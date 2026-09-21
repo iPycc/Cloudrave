@@ -6,6 +6,7 @@ from api.v1.admin_mount import router as admin_mount_router
 from api.v1.admin_guest import router as admin_guest_router
 from api.v1.admin_policy import router as admin_policy_router
 from api.v1.admin_sync import router as admin_sync_router
+from api.v1.admin_database import router as admin_database_router
 from api.v1.explorer import router as explorer_router
 from api.v1.google_oauth import router as google_oauth_router
 from api.v1.mount import router as mount_router
@@ -34,4 +35,5 @@ router.include_router(admin_policy_router)
 router.include_router(admin_guest_router)
 router.include_router(admin_mount_router)
 router.include_router(admin_sync_router)
+router.include_router(admin_database_router)
 router.include_router(recycle_router)

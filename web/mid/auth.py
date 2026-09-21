@@ -59,7 +59,8 @@ async def get_current_user(
         ).resolve(user_uid=user_uid, session_id=session_id, token_version=token_version)
         touch_due = _session_touch_due(session_record.last_seen_at)
 
-    if touch_due:
+    database_manager = getattr(request.app.state, "database_manager", None)
+    if touch_due and not (database_manager and database_manager.maintenance):
         try:
             async with dep.session_scope() as touch_session:
                 await dep.get_session_repository(touch_session).touch(session_id)

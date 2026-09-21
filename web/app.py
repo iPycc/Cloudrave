@@ -15,11 +15,13 @@ from api.v1 import router as v1_router
 from core.dep import Dep
 from web.err import install_exception_handlers
 from web.mid.log import LoggingMiddleware
+from web.mid.database import DatabaseMaintenanceMiddleware
 from web.mid.rid import RequestIdMiddleware
 from web.mid.sec import SecurityHeadersMiddleware
 from web.mid.spa import SpaFallbackMiddleware
 from core.cfg import CloudraveConfig
 from core.log import LogOperation, LogOutcome, configure_logging, get_logger
+from services.admin.database import DatabaseMigrationManager
 
 
 LOGGER = get_logger("cloudrave.lifecycle")
@@ -54,20 +56,32 @@ def _resolve_assets_dir(config: CloudraveConfig) -> Path | None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     dep: Dep = app.state.dep
+    database_manager = getattr(app.state, "database_manager", None)
     LOGGER.info("Opening application services.")
     try:
         await dep.connect()
-    except Exception:
-        LOGGER.exception(
-            "Application services failed to start.",
-            extra={
-                "operation": LogOperation.STARTUP,
-                "resource": "application",
-                "outcome": LogOutcome.FAILED,
-            },
-        )
+        if database_manager is not None:
+            await database_manager.ensure_instance_marker(dep.engine)
+            database_manager.mark_runtime_ready(dep.config)
+    except Exception as exc:
+        fallback = database_manager.activation_fallback_config() if database_manager is not None else None
         await dep.disconnect()
-        raise
+        if fallback is None:
+            LOGGER.exception(
+                "Application services failed to start.",
+                extra={
+                    "operation": LogOperation.STARTUP,
+                    "resource": "application",
+                    "outcome": LogOutcome.FAILED,
+                },
+            )
+            raise
+        database_manager.mark_activation_failed(str(exc))
+        LOGGER.warning("New database activation failed during startup; using the previous database.")
+        dep = Dep(fallback)
+        app.state.dep = dep
+        await dep.connect()
+        await database_manager.ensure_instance_marker(dep.engine)
 
     LOGGER.info(
         "Application services are ready.",
@@ -92,7 +106,10 @@ async def lifespan(app: FastAPI):
         )
 
 
-def create_app(config: CloudraveConfig) -> FastAPI:
+def create_app(
+    config: CloudraveConfig,
+    database_manager: DatabaseMigrationManager | None = None,
+) -> FastAPI:
     configure_logging(config)
     config.local_upload_root_path.mkdir(parents=True, exist_ok=True)
     config.preview_cache_root_path.mkdir(parents=True, exist_ok=True)
@@ -107,6 +124,7 @@ def create_app(config: CloudraveConfig) -> FastAPI:
 
     dep = Dep(config)
     app.state.dep = dep
+    app.state.database_manager = database_manager or DatabaseMigrationManager(config.root_dir)
 
     # Added from inner to outer. Authentication endpoints retain their focused
     # anti-brute-force dependency; ordinary API traffic is not globally capped.
@@ -130,6 +148,7 @@ def create_app(config: CloudraveConfig) -> FastAPI:
         expose_headers=["Accept-Ranges", "Content-Length", "Content-Range", "ETag", "Last-Modified"],
     )
     app.add_middleware(SecurityHeadersMiddleware)
+    app.add_middleware(DatabaseMaintenanceMiddleware)
     app.add_middleware(LoggingMiddleware)
     app.add_middleware(RequestIdMiddleware, header_name=config.app.request_id_header)
 
