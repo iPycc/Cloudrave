@@ -107,7 +107,7 @@ class FileExplorerService:
             policy.id: policy
             for policy in await self.policies.list_by_ids([mount.policy_id for mount in mounts])
         }
-        return [mount_read(mount, policies.get(mount.policy_id)) for mount in mounts]
+        return [mount_read(mount, policies.get(mount.policy_id), self.storage_manager) for mount in mounts]
 
     async def list_children(self, actor: User, mount_id: int, parent_id: int | None = None) -> list[NodeRead]:
         mount, _policy = await self._require_mount_access(actor, mount_id)

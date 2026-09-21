@@ -96,6 +96,10 @@ class _StorageManager:
     def get_adapter(self, _policy):
         return self.adapter
 
+    def local_path(self, policy, _mount, object_key: str):
+        provider = getattr(policy.provider, "value", policy.provider)
+        return Path(object_key) if provider == "local_fs" else None
+
 
 def _service_with_adapter(adapter: _SignedAdapter) -> PreviewService:
     service = object.__new__(PreviewService)
@@ -255,7 +259,8 @@ def test_preview_manifest_maps_missing_cos_object_to_404() -> None:
 
     service = object.__new__(PreviewService)
     service.storage_manager = SimpleNamespace(
-        get_adapter=lambda _policy: _MissingAdapter()
+        get_adapter=lambda _policy: _MissingAdapter(),
+        local_path=lambda _policy, _mount, _object_key: None,
     )
     node = SimpleNamespace(
         id=343,

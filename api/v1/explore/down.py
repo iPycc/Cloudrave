@@ -7,7 +7,6 @@ import mimetypes
 from fastapi import APIRouter, Depends, Query, Request
 
 from web.mid.auth import get_current_user
-from models.enums import StoragePolicyType
 from models.tables import User
 from services.explorer.preview import build_local_preview_response
 from services.explorer.proxy import remote_response
@@ -67,10 +66,8 @@ async def preview_file(
         node, mount, policy = await service.resolve(current_user, node_id)
         adapter = dep.storage_manager.get_adapter(policy)
         content_type = mimetypes.guess_type(node.name)[0] or "application/octet-stream"
-        if policy.provider == StoragePolicyType.LOCAL_FS:
-            local_path = dep.storage_manager.local_path(policy, mount, node.blob_path)
-            if local_path is None:
-                raise RuntimeError("Local filesystem policy has no local adapter")
+        local_path = dep.storage_manager.local_path(policy, mount, node.blob_path)
+        if local_path is not None:
             return build_local_preview_response(
                 request,
                 local_path,

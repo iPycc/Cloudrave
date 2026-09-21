@@ -82,11 +82,17 @@ class TencentCosConfig:
 
 
 @dataclass(slots=True)
+class StorageConfig:
+    credential_key: str = ""
+
+
+@dataclass(slots=True)
 class CloudraveConfig:
     app: AppConfig
     database: DatabaseConfig
     auth: AuthConfig
     logging: LoggingConfig
+    storage: StorageConfig
     tencent_cos: TencentCosConfig
     root_dir: Path
     config_path: Path
@@ -151,6 +157,9 @@ def default_config_parser() -> ConfigParser:
         "level": "INFO",
         "use_color": "true",
     }
+    parser["storage"] = {
+        "credential_key": _generate_secret(48),
+    }
     parser["tencent_cos"] = {
         "secret_id": "",
         "secret_key": "",
@@ -175,7 +184,9 @@ def load_config(root_dir: Path) -> CloudraveConfig:
     config_path = ensure_config_file(root_dir)
     parser = ConfigParser()
     parser.read(config_path, encoding="utf-8")
-    if _ensure_auth_secrets(parser):
+    auth_changed = _ensure_auth_secrets(parser)
+    storage_changed = _ensure_storage_secret(parser)
+    if auth_changed or storage_changed:
         config_path.write_text(_serialize_config(parser), encoding="utf-8")
 
     app = AppConfig(
@@ -232,6 +243,12 @@ def load_config(root_dir: Path) -> CloudraveConfig:
         level=parser.get("logging", "level", fallback="INFO"),
         use_color=parser.getboolean("logging", "use_color", fallback=True),
     )
+    storage = StorageConfig(
+        credential_key=(
+            getenv("CLOUDRAVE_STORAGE_CREDENTIAL_KEY")
+            or parser.get("storage", "credential_key", fallback="")
+        ).strip(),
+    )
     tencent_cos = TencentCosConfig(
         secret_id=parser.get("tencent_cos", "secret_id", fallback=""),
         secret_key=parser.get("tencent_cos", "secret_key", fallback=""),
@@ -244,6 +261,7 @@ def load_config(root_dir: Path) -> CloudraveConfig:
         database=database,
         auth=auth,
         logging=logging,
+        storage=storage,
         tencent_cos=tencent_cos,
         root_dir=root_dir,
         config_path=config_path,
@@ -399,6 +417,17 @@ def _ensure_auth_secrets(parser: ConfigParser) -> bool:
         parser["auth"]["share_signing_key"] = _generate_secret(48)
         changed = True
 
+    return changed
+
+
+def _ensure_storage_secret(parser: ConfigParser) -> bool:
+    changed = False
+    if not parser.has_section("storage"):
+        parser["storage"] = {}
+        changed = True
+    if not parser.get("storage", "credential_key", fallback="").strip():
+        parser["storage"]["credential_key"] = _generate_secret(48)
+        changed = True
     return changed
 
 

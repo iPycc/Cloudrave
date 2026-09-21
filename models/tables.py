@@ -14,7 +14,6 @@ from models.enums import (
     NodeType,
     SessionStatus,
     ShareAccess,
-    StoragePolicyType,
     UploadMode,
     UploadState,
     UserRole,
@@ -143,7 +142,7 @@ class StoragePolicy(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(128), unique=True)
-    provider: Mapped[StoragePolicyType] = mapped_column(Enum(StoragePolicyType, native_enum=False))
+    provider: Mapped[str] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(32), default="active")
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     bucket_name: Mapped[str] = mapped_column(String(255))
@@ -153,6 +152,8 @@ class StoragePolicy(Base, TimestampMixin):
     secret_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     secret_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     session_token: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    credential_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+    credential_version: Mapped[int] = mapped_column(Integer, default=1)
     multipart_threshold_mb: Mapped[int] = mapped_column(Integer, default=64)
     part_size_mb: Mapped[int] = mapped_column(Integer, default=16)
     presign_ttl_seconds: Mapped[int] = mapped_column(Integer, default=900)

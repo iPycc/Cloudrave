@@ -99,6 +99,17 @@ class Dep:
         LOGGER.info("Database schema and runtime migrations are ready.")
 
         async with self.session_scope() as session:
+            from services.storage_credentials import migrate_storage_credentials
+
+            migrated = await migrate_storage_credentials(
+                session,
+                config=self.config,
+                storage_manager=self.storage_manager,
+            )
+            if migrated:
+                LOGGER.info("Encrypted credentials for %s storage policy record(s).", migrated)
+
+        async with self.session_scope() as session:
             from services.admin.ids import ObjectIdService
 
             filled, failed = await ObjectIdService(

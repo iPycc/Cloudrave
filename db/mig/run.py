@@ -14,6 +14,8 @@ from db.mig.v2 import upgrade as upgrade_v2
 from db.mig.v3 import upgrade as upgrade_v3
 from db.mig.v4 import upgrade as upgrade_v4
 from db.mig.v5 import upgrade as upgrade_v5
+from db.mig.v6 import upgrade as upgrade_v6
+from db.mig.v7 import upgrade as upgrade_v7
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +31,8 @@ MIGRATIONS = (
     Migration(3, "oauth-provider-avatar-url", upgrade_v3),
     Migration(4, "audit-log-large-target", upgrade_v4),
     Migration(5, "mysql-datetime-microseconds", upgrade_v5),
+    Migration(6, "drive-credentials", upgrade_v6),
+    Migration(7, "normalize-drive-ids", upgrade_v7),
 )
 
 

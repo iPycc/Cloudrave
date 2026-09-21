@@ -18,11 +18,13 @@ from api.v1.shared import router as shared_router
 from api.v1.share import router as share_router
 from api.v1.site import router as site_router
 from api.v1.user import router as user_router
+from api.v1.storage import router as storage_router
 
 
 router = APIRouter()
 router.include_router(session_router)
 router.include_router(user_router)
+router.include_router(storage_router)
 router.include_router(explorer_router)
 router.include_router(mount_router)
 router.include_router(oauth_router)

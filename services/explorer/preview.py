@@ -18,7 +18,6 @@ from fastapi import HTTPException, Request, status
 from mutagen import File as MutagenFile
 from PIL import Image, UnidentifiedImageError
 
-from models.enums import StoragePolicyType
 from models.tables import BucketMount, Node, StoragePolicy, User
 from repositories.audit_logs import AuditLogRepository
 from repositories.nodes import NodeRepository
@@ -436,7 +435,7 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
             size=node.size,
             supports_range=True,
         )
-        if policy.provider == StoragePolicyType.LOCAL_FS:
+        if self.storage_manager.local_path(policy, mount, node.blob_path) is not None:
             return {"source": proxy_asset}
         if not node.blob_path:
             raise HTTPException(
@@ -680,7 +679,7 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
         version: str,
     ) -> str:
         adapter = self.storage_manager.get_adapter(policy)
-        if policy.provider != StoragePolicyType.LOCAL_FS:
+        if self.storage_manager.local_path(policy, mount, node.blob_path) is None:
             return adapter.build_download_url(policy, mount, node.blob_path, expires_in=self.office_ttl_seconds).url
         token = self.token_service.issue_scoped_token(
             sub=str(node.owner_id),
@@ -695,10 +694,9 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
 
     def _source_locator(self, node: Node, mount: BucketMount, policy: StoragePolicy, *, expires_in: int = 3600) -> str:
         adapter = self.storage_manager.get_adapter(policy)
-        if policy.provider == StoragePolicyType.LOCAL_FS:
-            local_path = self.storage_manager.local_path(policy, mount, node.blob_path)
-            if local_path is not None:
-                return str(local_path)
+        local_path = self.storage_manager.local_path(policy, mount, node.blob_path)
+        if local_path is not None:
+            return str(local_path)
         return adapter.build_download_url(policy, mount, node.blob_path, expires_in=expires_in).url
 
     def _open_seekable(self, node: Node, mount: BucketMount, policy: StoragePolicy) -> BinaryIO:

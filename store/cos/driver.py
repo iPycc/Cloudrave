@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 from store.port import StorageAdapterBase
 from store.cos.cors import RULE_ID, configured_origins, merge_rule
 from store.identity import physical_hash
-from store.cos.key import mount_prefix, physical_key, physical_list_prefix
+from store.key import mount_prefix, physical_key, physical_list_prefix
 from store.cos.obj import CosObjectMixin
 from store.cos.upload import CosUploadMixin
 from store.types import StorageCapability
@@ -71,6 +71,12 @@ class TencentCosAdapter(CosObjectMixin, CosUploadMixin, StorageAdapterBase):
         supports_multipart=True,
         supports_cors_autoconfig=True,
         supports_direct_write=False,
+        supports_single_put=True,
+        supports_mirror=True,
+        supports_versioned_delete=True,
+        supports_server_side_encryption=True,
+        upload_transport="presigned",
+        requires_part_etag=True,
     )
 
     def __init__(self, config: TencentCosConfig | None = None) -> None:
@@ -146,6 +152,10 @@ class TencentCosAdapter(CosObjectMixin, CosUploadMixin, StorageAdapterBase):
     def clear_client_cache(self) -> None:
         with self._clients_lock:
             self._clients.clear()
+
+    def validate_completed_object(self, policy: Any, mount: Any, stored_object: Any, checksum: str | None = None) -> None:
+        verified = self.head_object(policy, mount, stored_object.object_key, verify_encryption=True)
+        super().validate_completed_object(policy, mount, verified, checksum)
 
     def _bucket(self, policy: Any) -> str:
         return self._target(policy).bucket

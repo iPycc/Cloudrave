@@ -8,7 +8,6 @@ from urllib.parse import urlsplit
 from fastapi import HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.enums import StoragePolicyType
 from models.tables import User
 from repositories.audit_logs import AuditLogRepository
 from repositories.mounts import BucketMountRepository
@@ -23,6 +22,7 @@ from schemas.mount import (
     BucketMountUpdate,
     mount_read,
 )
+from drives.ids import provider_id
 from services.explorer.upload_cleanup import UploadCleanup
 from store.manager import StorageManager
 from store.call import call_adapter
@@ -58,13 +58,13 @@ class MountAdminService:
             policy.id: policy
             for policy in await self.policies.list_by_ids([mount.policy_id for mount in mounts])
         }
-        return [mount_read(mount, policies.get(mount.policy_id)) for mount in mounts]
+        return [mount_read(mount, policies.get(mount.policy_id), self.storage_manager) for mount in mounts]
 
     async def get_mount(self, mount_id: int) -> BucketMountRead:
         mount = await self.mounts.get_by_id(mount_id)
         if mount is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bucket mount not found")
-        return mount_read(mount, await self.policies.get_by_id(mount.policy_id))
+        return mount_read(mount, await self.policies.get_by_id(mount.policy_id), self.storage_manager)
 
     async def create_mount(self, request: Request, actor: User, payload: BucketMountCreate) -> BucketMountRead:
         owner_id = payload.owner_id or actor.id
@@ -74,15 +74,16 @@ class MountAdminService:
 
         mount = await self.mounts.create(owner_id, payload)
         await self.nodes.ensure_mount_root(owner_id=owner_id, mount_id=mount.id, name=mount.name)
-        if policy.provider == StoragePolicyType.LOCAL_FS:
-            await call_adapter(self.storage_manager.get_adapter(policy), "prepare_mount_root", mount)
+        adapter = self.storage_manager.get_adapter(policy)
+        if adapter.capabilities.upload_transport == "cloudrave":
+            await call_adapter(adapter, "prepare_mount_root", mount)
         else:
             try:
-                await call_adapter(self.storage_manager.get_adapter(policy), "validate_mount", policy, mount)
+                await call_adapter(adapter, "validate_mount", policy, mount)
             except Exception as exc:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"COS mount validation failed: {exc}",
+                    detail=f"Storage drive validation failed: {exc}",
                 ) from exc
 
         await self.audits.create(
@@ -105,7 +106,7 @@ class MountAdminService:
                 "actor": actor.email,
             },
         )
-        return mount_read(mount, policy)
+        return mount_read(mount, policy, self.storage_manager)
 
     async def update_mount(
         self,
@@ -171,7 +172,7 @@ class MountAdminService:
             user_agent=request.headers.get("user-agent"),
             request_id=getattr(request.state, "request_id", None),
         )
-        return mount_read(updated, await self.policies.get_by_id(updated.policy_id))
+        return mount_read(updated, await self.policies.get_by_id(updated.policy_id), self.storage_manager)
 
     async def delete_preview(self, mount_id: int) -> BucketMountDeletePreview:
         mount = await self.mounts.get_by_id(mount_id)
@@ -212,7 +213,7 @@ class MountAdminService:
         return BucketMountDeletePreview(
             mount_id=mount.id,
             mount_name=mount.name,
-            provider=policy.provider.value,
+            provider=provider_id(policy.provider),
             bucket_name=policy.bucket_name,
             prefix=prefix,
             file_count=file_count,

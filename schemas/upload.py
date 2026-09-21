@@ -70,6 +70,8 @@ class UploadSessionPlan(CloudraveSchema):
     expires_at: datetime | None = None
     is_duplicate: bool = False
     node_id: int | None = None
+    transport: str = "presigned"
+    required_response_headers: list[str] = Field(default_factory=list)
 
 
 class UploadPartComplete(CloudraveSchema):
@@ -101,6 +103,8 @@ class UploadSessionRead(CloudraveSchema):
     part_size: int
     created_at: datetime
     updated_at: datetime
+    transport: str
+    required_response_headers: list[str] = Field(default_factory=list)
     parts: list[UploadPartRead] = Field(default_factory=list)
 
 

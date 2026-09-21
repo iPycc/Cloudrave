@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from models.enums import StoragePolicyType, UserRole
+from models.enums import UserRole
+from drives.ids import LOCAL_FS
 from models.tables import User
 from repositories.mounts import BucketMountRepository
 from repositories.nodes import NodeRepository
@@ -44,7 +45,7 @@ class UserStorageProvisionService:
             policy = await self.policies.create(
                 StoragePolicyCreate(
                     name=policy_name,
-                    provider=StoragePolicyType.LOCAL_FS,
+                    provider=LOCAL_FS,
                     bucket_name=policy_name,
                     base_prefix="",
                     description=f"System managed local storage for {user.uid}",
@@ -56,7 +57,7 @@ class UserStorageProvisionService:
                 )
             )
         else:
-            policy.provider = StoragePolicyType.LOCAL_FS
+            policy.provider = LOCAL_FS
             policy.bucket_name = policy.bucket_name or policy_name
             policy.description = policy.description or f"System managed local storage for {user.uid}"
             policy.multipart_threshold_mb = policy.multipart_threshold_mb or 25

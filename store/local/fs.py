@@ -6,7 +6,7 @@ import os
 import re
 from datetime import timedelta
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Iterator
 from uuid import uuid4
 
 from store.port import StorageAdapterBase
@@ -17,6 +17,7 @@ from store.types import (
     PresignedURL,
     StorageCapability,
     StorageObject,
+    StorageObjectPage,
     normalize_object_key,
     utcnow,
 )
@@ -26,10 +27,14 @@ from store.stream import copy_stream, write_atomic
 class LocalFsAdapter(StorageAdapterBase):
     provider_type = "local_fs"
     capabilities = StorageCapability(
-        supports_presign=True,
+        supports_presign=False,
         supports_multipart=True,
         supports_cors_autoconfig=False,
         supports_direct_write=True,
+        supports_single_put=False,
+        supports_mirror=False,
+        upload_transport="cloudrave",
+        requires_part_etag=False,
     )
 
     def __init__(self, base_root: str | Path | None = None) -> None:
@@ -46,6 +51,16 @@ class LocalFsAdapter(StorageAdapterBase):
         _ = policy
         path = os.path.normcase(str(self._resolve_object_path(mount, object_key).resolve()))
         return physical_hash(self.provider_type, path)
+
+    def validate_mount(self, policy, mount) -> dict[str, object]:
+        _ = policy
+        root = self.prepare_mount_root(mount)
+        page = self.list_objects(policy, mount, max_keys=1)
+        return {
+            "root": str(root),
+            "sample_count": len(page.objects),
+            "has_more": page.is_truncated,
+        }
 
     def _resolve_mount_root(self, mount) -> Path:
         base_root = self.base_root.resolve()
@@ -127,6 +142,73 @@ class LocalFsAdapter(StorageAdapterBase):
             metadata=dict(metadata or {}),
         )
 
+    def list_objects(
+        self,
+        policy,
+        mount,
+        *,
+        prefix: str = "",
+        marker: str | None = None,
+        max_keys: int = 1000,
+        delimiter: str | None = None,
+    ) -> StorageObjectPage:
+        _ = policy
+        object_root = (self.prepare_mount_root(mount) / "objects").resolve()
+        raw_prefix = prefix.replace("\\", "/").lstrip("/")
+        normalized_prefix = ""
+        if raw_prefix:
+            trailing = raw_prefix.endswith("/")
+            normalized_prefix = normalize_object_key(raw_prefix.rstrip("/"))
+            if trailing:
+                normalized_prefix += "/"
+
+        keys = sorted(
+            path.relative_to(object_root).as_posix()
+            for path in object_root.rglob("*")
+            if path.is_file()
+        )
+        keys = [
+            key for key in keys
+            if key.startswith(normalized_prefix) and (marker is None or key > marker)
+        ]
+
+        objects: list[StorageObject] = []
+        common_prefixes: list[str] = []
+        seen_prefixes: set[str] = set()
+        last_scanned: str | None = None
+        limit = max(1, min(int(max_keys), 1000))
+        for key in keys:
+            last_scanned = key
+            remainder = key[len(normalized_prefix):]
+            if delimiter and delimiter in remainder:
+                common = normalized_prefix + remainder.split(delimiter, 1)[0] + delimiter
+                if common not in seen_prefixes:
+                    seen_prefixes.add(common)
+                    common_prefixes.append(common)
+            else:
+                objects.append(self.head_object(policy, mount, key))
+            if len(objects) + len(common_prefixes) >= limit:
+                break
+
+        is_truncated = bool(last_scanned and keys and last_scanned != keys[-1])
+        return StorageObjectPage(
+            objects=objects,
+            common_prefixes=common_prefixes,
+            next_marker=last_scanned if is_truncated else None,
+            is_truncated=is_truncated,
+        )
+
+    def iter_objects(self, policy, mount, **kwargs) -> Iterator[StorageObject]:
+        marker = kwargs.pop("marker", None)
+        while True:
+            page = self.list_objects(policy, mount, marker=marker, **kwargs)
+            yield from page.objects
+            if not page.is_truncated:
+                return
+            if not page.next_marker or page.next_marker == marker:
+                raise RuntimeError("Local filesystem returned a truncated object page without a marker")
+            marker = page.next_marker
+
     def open_object(self, policy, mount, object_key: str) -> BinaryIO:
         target = self._resolve_object_path(mount, object_key)
         return target.open("rb")
@@ -142,6 +224,13 @@ class LocalFsAdapter(StorageAdapterBase):
             size=stat.st_size,
             etag=f'"{stat.st_mtime_ns:x}-{stat.st_size:x}"',
         )
+
+    def copy_object(self, policy, mount, source_key: str, destination_key: str) -> StorageObject:
+        source = self._resolve_object_path(mount, source_key)
+        target = self._resolve_object_path(mount, destination_key)
+        self._ensure_directory(target.parent)
+        shutil.copy2(source, target)
+        return self.head_object(policy, mount, destination_key)
 
     def delete_object(self, policy, mount, object_key: str, *, hard_delete: bool = False) -> bool:
         source = self._resolve_object_path(mount, object_key)

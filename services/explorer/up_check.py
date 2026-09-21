@@ -7,39 +7,40 @@ from pathlib import Path
 
 from fastapi import HTTPException, status
 
-from models.enums import StoragePolicyType, UploadMode
-from store.limits import MAX_OBJECT_SIZE, MAX_PARTS, MAX_PART_SIZE, MAX_SINGLE_PUT, MIB
-from store.types import MultipartUploadState
+from drives.ids import provider_id
+from models.enums import UploadMode
+from store.limits import MAX_SINGLE_PUT, MIB
+from store.types import MultipartUploadState, StorageCapability
 
 
-def choose_part_size(size: int, requested: int | None, policy_size_mb: int) -> int:
-    if size > MAX_OBJECT_SIZE:
+def choose_part_size(size: int, requested: int | None, policy_size_mb: int, capability: StorageCapability) -> int:
+    if size > capability.max_object_size:
         raise HTTPException(
             status_code=status.HTTP_413_CONTENT_TOO_LARGE,
-            detail="File exceeds the COS multipart object limit",
+            detail="File exceeds this storage drive's object limit",
         )
-    if requested is not None and requested > MAX_PART_SIZE:
+    if requested is not None and requested > capability.max_part_size:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Upload part size cannot exceed 5 GiB",
         )
     part_size = requested or policy_size_mb * MIB
-    result = max(part_size, MIB, ceil(max(size, 1) / MAX_PARTS))
-    if result > MAX_PART_SIZE:
+    result = max(part_size, capability.min_part_size, ceil(max(size, 1) / capability.max_parts))
+    if result > capability.max_part_size:
         raise HTTPException(
             status_code=status.HTTP_413_CONTENT_TOO_LARGE,
-            detail="File cannot be represented within the COS multipart limits",
+            detail="File cannot be represented within this storage drive's multipart limits",
         )
     return result
 
 
 def choose_mode(
     mode: UploadMode,
-    provider: StoragePolicyType,
+    capability: StorageCapability,
     size: int,
     threshold_mb: int,
 ) -> UploadMode:
-    if provider == StoragePolicyType.LOCAL_FS:
+    if not capability.supports_single_put:
         return UploadMode.MULTIPART
     if mode == UploadMode.AUTO:
         threshold = max(1, threshold_mb) * MIB
@@ -51,11 +52,11 @@ def choose_mode(
 
 def apply_threshold(
     part_size: int,
-    provider: StoragePolicyType,
+    capability: StorageCapability,
     size: int,
     threshold_mb: int,
 ) -> int:
-    if provider == StoragePolicyType.LOCAL_FS and size <= max(1, threshold_mb) * MIB:
+    if capability.upload_transport == "cloudrave" and size <= max(1, threshold_mb) * MIB:
         return max(size, 1)
     return part_size
 
@@ -64,8 +65,8 @@ def part_count(size: int, part_size: int) -> int:
     return max(1, ceil(size / part_size)) if size else 1
 
 
-def validate_part_count(count: int) -> None:
-    if count > MAX_PARTS:
+def validate_part_count(count: int, capability: StorageCapability) -> None:
+    if count > capability.max_parts:
         raise HTTPException(
             status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail="File requires too many upload parts",
@@ -106,7 +107,7 @@ def build_upload_state(record, policy, mount, storage_manager) -> MultipartUploa
     upload_id = record.upload_id or record.id
     return MultipartUploadState(
         upload_id=upload_id,
-        provider_type=policy.provider.value,
+        provider_type=provider_id(policy.provider),
         mount_id=str(mount.id),
         object_key=record.path,
         upload_root=mount_root,

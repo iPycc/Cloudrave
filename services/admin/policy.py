@@ -12,6 +12,7 @@ from repositories.audit_logs import AuditLogRepository
 from repositories.policies import StoragePolicyRepository
 from schemas.policy import StoragePolicyCreate, StoragePolicyRead, StoragePolicyUpdate
 from core.log import LogOperation, LogOutcome
+from store.manager import StorageManager
 
 
 LOGGER = logging.getLogger("cloudrave.store")
@@ -24,10 +25,12 @@ class SingleStoragePolicyService:
         session: AsyncSession,
         policies: StoragePolicyRepository,
         audits: AuditLogRepository,
+        storage_manager: StorageManager,
     ) -> None:
         self.session = session
         self.policies = policies
         self.audits = audits
+        self.storage_manager = storage_manager
 
     async def list_policies(self) -> list[StoragePolicyRead]:
         return [self._to_schema(policy) for policy in await self.policies.list_all()]
@@ -39,12 +42,23 @@ class SingleStoragePolicyService:
         return self._to_schema(policy)
 
     async def create_policy(self, request: Request, actor: User, payload: StoragePolicyCreate) -> StoragePolicyRead:
+        try:
+            self.storage_manager.definition_for(payload.provider)
+            ciphertext, version = self.storage_manager.credentials_from_payload(payload.provider, payload)
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=str(exc),
+            ) from exc
         policy = await self.policies.create(payload)
+        policy.credential_ciphertext = ciphertext
+        policy.credential_version = version
+        await self.session.flush()
         await self.audits.create(
             actor_id=actor.id,
             action="policy.create",
             target=f"policy:{policy.id}",
-            detail=policy.provider.value,
+            detail=str(policy.provider),
             ip=request.client.host if request.client else None,
             user_agent=request.headers.get("user-agent"),
             request_id=getattr(request.state, "request_id", None),
@@ -83,7 +97,21 @@ class SingleStoragePolicyService:
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"Policy is mounted; cannot change {', '.join(sorted(changed_mapping))}",
             )
+        try:
+            ciphertext, version = self.storage_manager.credentials_from_payload(
+                policy.provider,
+                payload,
+                current=policy,
+            )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=str(exc),
+            ) from exc
         updated = await self.policies.update(policy, payload)
+        updated.credential_ciphertext = ciphertext
+        updated.credential_version = version
+        await self.session.flush()
         await self.audits.create(
             actor_id=actor.id,
             action="policy.update",
@@ -127,16 +155,9 @@ class SingleStoragePolicyService:
         )
 
     def _to_schema(self, policy) -> StoragePolicyRead:
-        data = StoragePolicyRead.model_validate(policy).model_dump()
-        if data.get("secret_id"):
-            data["secret_id"] = self._mask_secret(data["secret_id"])
-        if data.get("secret_key"):
-            data["secret_key"] = self._mask_secret(data["secret_key"])
-        if data.get("session_token"):
-            data["session_token"] = self._mask_secret(data["session_token"])
-        return StoragePolicyRead.model_validate(data)
-
-    def _mask_secret(self, value: str) -> str:
-        if len(value) <= 8:
-            return "*" * len(value)
-        return f"{value[:4]}{'*' * max(4, len(value) - 8)}{value[-4:]}"
+        configured, fields = self.storage_manager.credential_state(policy)
+        return StoragePolicyRead.model_validate({
+            **StoragePolicyRead.model_validate(policy).model_dump(),
+            "credentials_configured": configured,
+            "credential_fields": fields,
+        })

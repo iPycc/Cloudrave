@@ -12,7 +12,7 @@ from urllib.parse import quote
 from fastapi import HTTPException, status
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 
-from models.enums import NodeType, StoragePolicyType
+from models.enums import NodeType
 from models.tables import User
 from repositories.mounts import BucketMountRepository
 from repositories.nodes import NodeRepository
@@ -125,7 +125,7 @@ class FileSourceService:
     ) -> FileResponse | StreamingResponse:
         """Compatibility wrapper for the old local-only synchronous call."""
 
-        if policy.provider != StoragePolicyType.LOCAL_FS:
+        if self.storage_manager.local_path(policy, mount, node.blob_path) is None:
             raise RuntimeError("Remote storage responses must be awaited with response()")
         return self.local_response(node, mount, policy)
 
@@ -138,7 +138,7 @@ class FileSourceService:
         inline: bool = False,
         expires_in: int | None = None,
     ) -> FileResponse | StreamingResponse | RedirectResponse:
-        if policy.provider == StoragePolicyType.LOCAL_FS:
+        if self.storage_manager.local_path(policy, mount, node.blob_path) is not None:
             return self.local_response(node, mount, policy, inline=inline)
 
         adapter = self.storage_manager.get_adapter(policy)

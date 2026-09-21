@@ -8,7 +8,6 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, sta
 from fastapi.responses import Response
 
 from web.mid.auth import get_current_user
-from models.enums import StoragePolicyType
 from models.tables import Node, ShareRecord, User
 from schemas.common import MessageResponse
 from schemas.preview import PreviewManifestRead
@@ -298,10 +297,8 @@ async def preview_shared_file(
         )
         node, mount, policy = await download_service.resolve_shared(node.id)
         adapter = dep.storage_manager.get_adapter(policy)
-        if policy.provider == StoragePolicyType.LOCAL_FS:
-            local_path = dep.storage_manager.local_path(policy, mount, node.blob_path)
-            if local_path is None:
-                raise RuntimeError("Local filesystem policy has no local adapter")
+        local_path = dep.storage_manager.local_path(policy, mount, node.blob_path)
+        if local_path is not None:
             return build_local_preview_response(
                 request,
                 local_path,

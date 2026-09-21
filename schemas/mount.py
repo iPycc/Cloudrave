@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 from pydantic import AliasChoices, AliasPath, Field, field_validator
 
+from drives.ids import provider_id
 from schemas.common import CloudraveSchema
 from schemas.name import valid_name
 
@@ -86,6 +87,10 @@ class BucketMountRead(BucketMountBase):
     last_sync_at: datetime | None = None
     sync_error: str | None = None
     synced_objects: int = 0
+    driver_id: str = ""
+    driver_label: str = ""
+    driver_kind: str = ""
+    driver_capabilities: list[str] = Field(default_factory=list)
 
 
 class MountUsageRead(CloudraveSchema):
@@ -114,7 +119,7 @@ class BucketMountDeleteResult(CloudraveSchema):
     deleted_objects: int = 0
 
 
-def mount_read(mount, policy=None) -> BucketMountRead:
+def mount_read(mount, policy=None, storage_manager=None) -> BucketMountRead:
     result = BucketMountRead.model_validate(mount)
     if policy is None:
         return result
@@ -122,7 +127,13 @@ def mount_read(mount, policy=None) -> BucketMountRead:
     policy_extra = dict(getattr(policy, "extra", None) or {})
     extra = dict(result.extra)
     extra.setdefault("provider_label", result.provider_label)
-    extra["storage_type"] = "local" if getattr(policy.provider, "value", policy.provider) == "local_fs" else "tencent"
+    driver_id = provider_id(policy.provider)
+    compatibility_types = {
+        "local_fs": "local",
+        "tencent_cos": "tencent",
+        "aliyun_oss": "aliyun",
+    }
+    extra["storage_type"] = compatibility_types.get(driver_id, driver_id)
     extra["bucket_name"] = policy.bucket_name
     extra["region"] = policy.region
     extra["endpoint"] = policy.endpoint
@@ -140,4 +151,18 @@ def mount_read(mount, policy=None) -> BucketMountRead:
     ):
         if key in policy_extra:
             extra[key] = policy_extra[key]
-    return result.model_copy(update={"extra": extra})
+    metadata = {
+        "driver_id": driver_id,
+        "driver_label": result.provider_label or driver_id,
+        "driver_kind": "",
+        "driver_capabilities": [],
+    }
+    if storage_manager is not None:
+        definition = storage_manager.definition_for(driver_id)
+        adapter = storage_manager.adapters.get(driver_id)
+        metadata.update({
+            "driver_label": definition.label,
+            "driver_kind": definition.kind,
+            "driver_capabilities": list(adapter.capabilities.names()) if adapter else [],
+        })
+    return result.model_copy(update={"extra": extra, **metadata})

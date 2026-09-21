@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Protocol, runtime_checkable
+from typing import Any, BinaryIO, Iterator, Literal, Protocol, runtime_checkable
 from uuid import uuid4
 
 
@@ -37,6 +37,31 @@ class StorageCapability:
     supports_multipart: bool = True
     supports_cors_autoconfig: bool = False
     supports_direct_write: bool = False
+    supports_single_put: bool = True
+    supports_range: bool = True
+    supports_mirror: bool = False
+    supports_versioned_delete: bool = False
+    supports_server_side_encryption: bool = False
+    upload_transport: Literal["cloudrave", "presigned"] = "presigned"
+    requires_part_etag: bool = True
+    min_part_size: int = 1024 * 1024
+    max_part_size: int = 5 * 1024 * 1024 * 1024
+    max_parts: int = 10_000
+    max_object_size: int = 50 * 1024 * 1024 * 1024 * 1024
+
+    def names(self) -> tuple[str, ...]:
+        flags = {
+            "presign": self.supports_presign,
+            "multipart": self.supports_multipart,
+            "cors": self.supports_cors_autoconfig,
+            "direct_write": self.supports_direct_write,
+            "single_put": self.supports_single_put,
+            "range": self.supports_range,
+            "mirror": self.supports_mirror,
+            "versioned_delete": self.supports_versioned_delete,
+            "server_side_encryption": self.supports_server_side_encryption,
+        }
+        return tuple(name for name, enabled in flags.items() if enabled)
 
 
 @dataclass(slots=True)
@@ -120,6 +145,24 @@ class StorageAdapter(Protocol):
     def physical_id(self, policy: Any, mount: Any, object_key: str) -> str:
         ...
 
+    def validate_mount(self, policy: Any, mount: Any) -> dict[str, Any]:
+        ...
+
+    def list_objects(
+        self,
+        policy: Any,
+        mount: Any,
+        *,
+        prefix: str = "",
+        marker: str | None = None,
+        max_keys: int = 1000,
+        delimiter: str | None = None,
+    ) -> StorageObjectPage:
+        ...
+
+    def iter_objects(self, policy: Any, mount: Any, **kwargs: Any) -> Iterator[StorageObject]:
+        ...
+
     def put_object(
         self,
         policy: Any,
@@ -132,10 +175,26 @@ class StorageAdapter(Protocol):
     ) -> StorageObject:
         ...
 
-    def open_object(self, policy: Any, mount: Any, object_key: str) -> BinaryIO:
+    def open_object(
+        self,
+        policy: Any,
+        mount: Any,
+        object_key: str,
+        *,
+        byte_range: str | tuple[int, int | None] | None = None,
+    ) -> BinaryIO:
         ...
 
     def head_object(self, policy: Any, mount: Any, object_key: str) -> StorageObject:
+        ...
+
+    def copy_object(
+        self,
+        policy: Any,
+        mount: Any,
+        source_key: str,
+        destination_key: str,
+    ) -> StorageObject:
         ...
 
     def delete_object(self, policy: Any, mount: Any, object_key: str, *, hard_delete: bool = False) -> bool:
@@ -225,6 +284,15 @@ class StorageAdapter(Protocol):
         ...
 
     def configure_cors(self, policy: Any, mount: Any) -> dict[str, Any]:
+        ...
+
+    def validate_completed_object(
+        self,
+        policy: Any,
+        mount: Any,
+        stored_object: StorageObject,
+        checksum: str | None = None,
+    ) -> None:
         ...
 
 

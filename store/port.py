@@ -24,3 +24,12 @@ class StorageAdapterBase(ABC):
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    def validate_completed_object(self, policy, mount, stored_object, checksum: str | None = None) -> None:
+        """Validate provider-specific completion guarantees."""
+
+        _ = (policy, mount)
+        if checksum and self.capabilities.upload_transport == "presigned":
+            metadata = getattr(stored_object, "metadata", {}) or {}
+            if metadata.get("sha256") != checksum:
+                raise RuntimeError("Uploaded object checksum metadata does not match the session")
+
