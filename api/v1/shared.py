@@ -222,6 +222,7 @@ async def preview_shared_mount_archive_entry(
 
 
 @router.get("/{mount_id}/download")
+@router.head("/{mount_id}/download", include_in_schema=False)
 async def download_shared_mount(
     mount_id: int,
     node_id: int,
@@ -229,7 +230,7 @@ async def download_shared_mount(
     current_user: User = Depends(get_current_user),
 ):
     async with request.app.state.dep.session_scope() as session:
-        return await _io(request, session).download(current_user, mount_id, node_id)
+        return await _io(request, session).download(request, current_user, mount_id, node_id)
 
 
 @router.post("/{mount_id}/save", response_model=NodeRead)

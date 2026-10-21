@@ -49,12 +49,16 @@ class SharedIo:
             filename=node.name,
         )
 
-    async def download(self, actor: User, mount_id: int, node_id: int):
+    async def download(self, request: Request, actor: User, mount_id: int, node_id: int):
         share, node = await self.shared.resolve_node(actor, mount_id, node_id)
         if node.type == NodeType.FILE:
             resolved = await self.source.resolve_shared(node.id)
-            response = await self.source.response(*resolved)
+            if request.method == "HEAD":
+                return await self.source.probe_response(*resolved)
+            response = await self.source.response(*resolved, request=request)
         else:
+            if request.method == "HEAD":
+                return await self.archive.probe_response([node], filename=node.name)
             response = await self.archive.response([node], filename=node.name)
         await self.shared.source.record_download(share)
         return response

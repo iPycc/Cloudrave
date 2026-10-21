@@ -222,12 +222,14 @@ async def record_shared_directory_download(
 
 
 @router.get("/{share_id}/download")
+@router.head("/{share_id}/download", include_in_schema=False)
 async def download_shared_file(
     share_id: str,
     request: Request,
     access_token: str | None = Query(None),
     node_id: int | None = Query(None),
     node_ids: list[int] | None = Query(None),
+    download_name: str | None = Query(None, max_length=240),
 ):
     dep = request.app.state.dep
     async with dep.session_scope() as session:
@@ -255,7 +257,9 @@ async def download_shared_file(
         )
         if len(nodes) == 1 and nodes[0].type.value == "file":
             node, mount, policy = await download_service.resolve_shared(nodes[0].id)
-            response = await download_service.response(node, mount, policy)
+            if request.method == "HEAD":
+                return await download_service.probe_response(node, mount, policy)
+            response = await download_service.response(node, mount, policy, request=request)
         else:
             archive_service = ArchiveDownloadService(
                 mounts=dep.get_mount_repository(session),
@@ -263,7 +267,11 @@ async def download_shared_file(
                 policies=dep.get_policy_repository(session),
                 storage_manager=dep.storage_manager,
             )
-            archive_name = nodes[0].name if len(nodes) == 1 else f"Cloudrave-share-{share.id[:8]}"
+            archive_name = download_name or (
+                nodes[0].name if len(nodes) == 1 else f"Cloudrave-share-{share.id[:8]}"
+            )
+            if request.method == "HEAD":
+                return await archive_service.probe_response(nodes, filename=archive_name)
             response = await archive_service.build_archive_response(nodes, filename=archive_name)
         await service.record_download(share)
         return response

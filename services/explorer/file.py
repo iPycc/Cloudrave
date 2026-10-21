@@ -638,6 +638,8 @@ class FileExplorerService:
             storage_manager=self.storage_manager,
         )
         roots = await archive_service.resolve_owned_roots(actor, node_ids)
+        if request.method == "HEAD":
+            return await archive_service.probe_response(roots, filename=filename)
         response = await archive_service.build_archive_response(roots, filename=filename)
         await self.audits.create(
             actor_id=actor.id,
