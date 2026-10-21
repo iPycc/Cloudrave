@@ -26,6 +26,8 @@ def choose_part_size(size: int, requested: int | None, policy_size_mb: int, capa
         )
     part_size = requested or policy_size_mb * MIB
     result = max(part_size, capability.min_part_size, ceil(max(size, 1) / capability.max_parts))
+    alignment = max(1, capability.part_size_alignment)
+    result = ceil(result / alignment) * alignment
     if result > capability.max_part_size:
         raise HTTPException(
             status_code=status.HTTP_413_CONTENT_TOO_LARGE,
@@ -115,4 +117,10 @@ def build_upload_state(record, policy, mount, storage_manager) -> MultipartUploa
         part_size_bytes=record.part_size,
         total_size=record.size,
         provider_upload_id=record.upload_id,
+        metadata={
+            "checksum": record.checksum or "",
+            "provider_checksum": getattr(record, "provider_checksum", None) or "",
+            "content_type": record.content_type or "",
+            "file_name": record.file_name,
+        },
     )

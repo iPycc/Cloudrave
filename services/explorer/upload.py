@@ -133,6 +133,7 @@ class CreateUploadSessionService:
                     size=payload.size,
                     part_size=payload.size or 1,
                     checksum=payload.checksum,
+                    provider_checksum=payload.provider_checksum,
                     state=UploadState.COMPLETED,
                 )
                 await self.uploads.bind_node(session_record.id, file_node.id)
@@ -196,26 +197,33 @@ class CreateUploadSessionService:
         ):
             mount, policy = await self._require_mount_access(actor, record.mount_id)
             adapter = self.storage_manager.get_adapter(policy)
-            storage_parts = await call_adapter(
-                adapter,
-                "list_parts",
-                policy,
-                mount,
-                self._build_upload_state(record, policy, mount),
-            )
-            reconciled: list[tuple[int, str | None, int]] = []
-            for part in storage_parts:
-                try:
-                    expected_size = self._expected_part_size(record, part.part_number)
-                except HTTPException:
-                    continue
-                if part.etag and part.size == expected_size:
-                    reconciled.append((part.part_number, part.etag, part.size))
-            await self.uploads.sync_parts(record.id, reconciled)
+            if adapter.capabilities.supports_part_listing:
+                storage_parts = await call_adapter(
+                    adapter,
+                    "list_parts",
+                    policy,
+                    mount,
+                    self._build_upload_state(record, policy, mount),
+                )
+                reconciled: list[tuple[int, str | None, int]] = []
+                for part in storage_parts:
+                    try:
+                        expected_size = self._expected_part_size(record, part.part_number)
+                    except HTTPException:
+                        continue
+                    if part.etag and part.size == expected_size:
+                        reconciled.append((part.part_number, part.etag, part.size))
+                await self.uploads.sync_parts(record.id, reconciled)
             await self.uploads.touch(record.id)
         return await self._to_read(record)
 
-    async def part_url(self, actor: User, session_id: str, part_number: int) -> UploadPartPlan:
+    async def part_url(
+        self,
+        actor: User,
+        session_id: str,
+        part_number: int,
+        part_checksum: str | None = None,
+    ) -> UploadPartPlan:
         record = await self._require_upload_access(actor, session_id)
         if record.state not in (UploadState.CREATED, UploadState.UPLOADING, UploadState.FAILED):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Upload session cannot issue part URLs")
@@ -240,11 +248,20 @@ class CreateUploadSessionService:
                 method="POST",
                 url=f"/api/v1/explorer/upload/{record.id}/part",
             )
+        checksum_algorithm = adapter.capabilities.part_checksum_algorithm
+        if checksum_algorithm and not part_checksum:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=f"{checksum_algorithm.upper()} checksum is required for this upload part",
+            )
+        upload_state = self._build_upload_state(record, policy, mount)
+        if part_checksum:
+            upload_state.metadata["part_checksum"] = part_checksum
         return await sign_part(
             adapter,
             policy,
             mount,
-            self._build_upload_state(record, policy, mount),
+            upload_state,
             part_number,
         )
 
@@ -376,7 +393,26 @@ class CreateUploadSessionService:
                 self._validate_complete_parts(record, parts)
                 upload_state = self._build_upload_state(record, policy, mount)
                 if adapter.capabilities.upload_transport == "cloudrave":
-                    storage_parts = await call_adapter(adapter, "list_parts", policy, mount, upload_state)
+                    # Some backend-relay providers cannot enumerate uploaded
+                    # parts.  Their successfully relayed parts are already
+                    # recorded in Cloudrave, so use that durable list instead
+                    # of replacing it with an unsupported empty provider list.
+                    storage_parts = [
+                        MultipartPart(
+                            part_number=part.part_number,
+                            etag=part.etag or "",
+                            size=part.size,
+                        )
+                        for part in parts
+                    ]
+                    if adapter.capabilities.supports_part_listing:
+                        storage_parts = await call_adapter(
+                            adapter,
+                            "list_parts",
+                            policy,
+                            mount,
+                            upload_state,
+                        )
                     self._validate_complete_parts(record, storage_parts)
                     stored_object = await call_adapter(
                         adapter,
@@ -570,12 +606,15 @@ class CreateUploadSessionService:
             upload_id=record.upload_id,
             file_name=record.file_name,
             content_type=record.content_type,
+            checksum=record.checksum,
+            provider_checksum=getattr(record, "provider_checksum", None),
             size=record.size,
             part_size=record.part_size,
             created_at=record.created_at,
             updated_at=record.updated_at,
             transport=capability.upload_transport,
             required_response_headers=["ETag"] if capability.requires_part_etag else [],
+            part_checksum_algorithm=capability.part_checksum_algorithm,
             parts=[UploadPartRead.model_validate(part) for part in parts],
         )
 

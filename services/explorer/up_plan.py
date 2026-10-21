@@ -29,6 +29,11 @@ async def sign_part(adapter, policy, mount, upload, part_number: int) -> UploadP
         url=presigned.url,
         headers=presigned.headers,
         expires_at=presigned.expires_at,
+        body_mode=presigned.body_mode,
+        form_fields=presigned.form_fields,
+        file_field=presigned.file_field,
+        record_etag=presigned.record_etag,
+        response_mode=presigned.response_mode,
     )
 
 
@@ -84,6 +89,7 @@ async def make_plan(*, uploads, storage_manager, policy, mount, parent, file_nam
             size=payload.size,
             part_size=single_size,
             checksum=payload.checksum,
+            provider_checksum=payload.provider_checksum,
         )
         return record, UploadSessionPlan(
             session_id=record.id,
@@ -105,7 +111,12 @@ async def make_plan(*, uploads, storage_manager, policy, mount, parent, file_nam
         object_key,
         total_size=payload.size,
         mime_type=payload.content_type,
-        metadata={"sha256": payload.checksum} if payload.checksum else None,
+        metadata={
+            "sha256": payload.checksum or "",
+            "provider_checksum": payload.provider_checksum or "",
+            "file_name": file_name,
+            "part_size": str(size),
+        },
     )
     record = await uploads.create_session(
         owner_id=mount.owner_id,
@@ -119,9 +130,14 @@ async def make_plan(*, uploads, storage_manager, policy, mount, parent, file_nam
         size=payload.size,
         part_size=size,
         checksum=payload.checksum,
+        provider_checksum=payload.provider_checksum,
     )
     extra = policy.extra or {}
-    window = min(count, _window(extra))
+    window = (
+        0
+        if capability.part_checksum_algorithm or not capability.eager_part_plans
+        else min(count, _window(extra))
+    )
     if capability.upload_transport == "cloudrave":
         urls = [
             UploadPartPlan(
@@ -146,4 +162,5 @@ async def make_plan(*, uploads, storage_manager, policy, mount, parent, file_nam
         expires_at=upload.expires_at,
         transport=capability.upload_transport,
         required_response_headers=["ETag"] if capability.requires_part_etag else [],
+        part_checksum_algorithm=capability.part_checksum_algorithm,
     )
