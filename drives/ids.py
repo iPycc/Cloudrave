@@ -3,8 +3,18 @@
 LOCAL_FS = "local_fs"
 TENCENT_COS = "tencent_cos"
 ALIYUN_OSS = "aliyun_oss"
+DRIVE_139 = "drive_139"
+DRIVE_189 = "drive_189"
+DRIVE_WO = "drive_wo"
 
-BUILTIN_DRIVER_IDS = (LOCAL_FS, TENCENT_COS, ALIYUN_OSS)
+BUILTIN_DRIVER_IDS = (
+    LOCAL_FS,
+    TENCENT_COS,
+    ALIYUN_OSS,
+    DRIVE_139,
+    DRIVE_189,
+    DRIVE_WO,
+)
 
 # SQLAlchemy's legacy ``Enum(StoragePolicyType)`` column persisted enum member
 # names (for example ``TENCENT_COS``), not their lower-case values. Keep the

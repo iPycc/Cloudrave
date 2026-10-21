@@ -8,7 +8,14 @@ from pathlib import Path
 from typing import Any
 
 from core.cfg import CloudraveConfig
-from drives.ids import ALIYUN_OSS, LOCAL_FS, TENCENT_COS
+from drives.ids import (
+    ALIYUN_OSS,
+    DRIVE_139,
+    DRIVE_189,
+    DRIVE_WO,
+    LOCAL_FS,
+    TENCENT_COS,
+)
 from store.types import StorageAdapter, StorageCapability
 
 
@@ -120,6 +127,10 @@ class DriveRegistry:
 
 
 def default_drive_registry() -> DriveRegistry:
+    from drives.drive_139 import Drive139Client
+    from drives.drive_189 import Drive189Client
+    from drives.drive_wo import DriveWoClient
+    from drives.remote_drive import RemoteDirectAdapter
     from store.cos import TencentCosAdapter
     from store.local import LocalFsAdapter
     from store.oss import AliyunOssAdapter
@@ -128,7 +139,7 @@ def default_drive_registry() -> DriveRegistry:
     registry.register(
         DriverDefinition(
             id=LOCAL_FS,
-            label="Local Storage（本机存储）",
+            label="Local Storage",
             kind="local",
             icon="local_fs",
             factory=lambda _config, local_root: LocalFsAdapter(local_root),
@@ -138,7 +149,7 @@ def default_drive_registry() -> DriveRegistry:
     registry.register(
         DriverDefinition(
             id=TENCENT_COS,
-            label="腾讯云 COS",
+            label="Tencent COS",
             kind="object_storage",
             icon="tencent_cos",
             credential_fields=("secret_id", "secret_key"),
@@ -154,12 +165,45 @@ def default_drive_registry() -> DriveRegistry:
     registry.register(
         DriverDefinition(
             id=ALIYUN_OSS,
-            label="阿里云 OSS",
+            label="Aliyun OSS",
             kind="object_storage",
             icon="aliyun_oss",
             credential_fields=("access_key_id", "access_key_secret"),
             optional_credential_fields=("security_token",),
             factory=lambda _config, _local_root: AliyunOssAdapter(),
+        )
+    )
+    registry.register(
+        DriverDefinition(
+            id=DRIVE_139,
+            label="139zhey",
+            kind="consumer_cloud",
+            icon="drive_139",
+            credential_fields=("authorization", "user_domain_id"),
+            optional_credential_fields=("root_id",),
+            factory=lambda _config, local_root: RemoteDirectAdapter(DRIVE_139, Drive139Client, local_root),
+        )
+    )
+    registry.register(
+        DriverDefinition(
+            id=DRIVE_189,
+            label="189 Cloud",
+            kind="consumer_cloud",
+            icon="drive_189",
+            credential_fields=("session",),
+            optional_credential_fields=("root_id",),
+            factory=lambda _config, local_root: RemoteDirectAdapter(DRIVE_189, Drive189Client, local_root),
+        )
+    )
+    registry.register(
+        DriverDefinition(
+            id=DRIVE_WO,
+            label="Wo Cloud",
+            kind="consumer_cloud",
+            icon="drive_wo",
+            credential_fields=("token",),
+            optional_credential_fields=("root_id",),
+            factory=lambda _config, local_root: RemoteDirectAdapter(DRIVE_WO, DriveWoClient, local_root),
         )
     )
     return registry

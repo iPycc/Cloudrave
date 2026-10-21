@@ -28,6 +28,7 @@ class UserBucketMountCreate(CloudraveSchema):
     mode: Literal["managed", "mirror"] = "managed"
     read_only: bool = False
     legacy_prefixed_keys: bool = False
+    quota_bytes: int | None = Field(default=None, ge=0)
     extra: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("root_path")
