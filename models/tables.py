@@ -327,10 +327,11 @@ class UploadSessionRecord(Base, TimestampMixin):
     path: Mapped[str] = mapped_column(String(1024))
     mode: Mapped[UploadMode] = mapped_column(Enum(UploadMode, native_enum=False))
     state: Mapped[UploadState] = mapped_column(Enum(UploadState, native_enum=False), default=UploadState.CREATED)
-    upload_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    upload_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     file_name: Mapped[str] = mapped_column(String(255))
     content_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
     checksum: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    provider_checksum: Mapped[str | None] = mapped_column(String(128), nullable=True)
     size: Mapped[int] = mapped_column(BigInteger, default=0)
     part_size: Mapped[int] = mapped_column(BigInteger, default=0)
 

@@ -42,8 +42,13 @@ class StorageCapability:
     supports_mirror: bool = False
     supports_versioned_delete: bool = False
     supports_server_side_encryption: bool = False
+    download_transport: Literal["cloudrave", "browser"] = "cloudrave"
     upload_transport: Literal["cloudrave", "presigned"] = "presigned"
     requires_part_etag: bool = True
+    supports_part_listing: bool = True
+    eager_part_plans: bool = True
+    part_checksum_algorithm: Literal["md5"] | None = None
+    part_size_alignment: int = 1
     min_part_size: int = 1024 * 1024
     max_part_size: int = 5 * 1024 * 1024 * 1024
     max_parts: int = 10_000
@@ -95,6 +100,11 @@ class PresignedURL:
     expires_at: datetime | None = None
     upload_id: str | None = None
     part_number: int | None = None
+    body_mode: Literal["raw", "multipart"] = "raw"
+    form_fields: dict[str, str] = field(default_factory=dict)
+    file_field: str = "file"
+    record_etag: str | None = None
+    response_mode: Literal["header", "wopan_json", "opaque", "skip"] = "header"
 
 
 @dataclass(slots=True)

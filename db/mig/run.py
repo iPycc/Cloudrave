@@ -16,6 +16,7 @@ from db.mig.v4 import upgrade as upgrade_v4
 from db.mig.v5 import upgrade as upgrade_v5
 from db.mig.v6 import upgrade as upgrade_v6
 from db.mig.v7 import upgrade as upgrade_v7
+from db.mig.v8 import upgrade as upgrade_v8
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +34,7 @@ MIGRATIONS = (
     Migration(5, "mysql-datetime-microseconds", upgrade_v5),
     Migration(6, "drive-credentials", upgrade_v6),
     Migration(7, "normalize-drive-ids", upgrade_v7),
+    Migration(8, "direct-operator-drive-uploads", upgrade_v8),
 )
 
 
