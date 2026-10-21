@@ -33,10 +33,12 @@ class UploadCleanupWorker:
         with suppress(asyncio.CancelledError):
             await self.task
         self.task = None
+        await self.storage_manager.remote_auth.persist(self.session_factory)
 
     async def _loop(self) -> None:
         while True:
             try:
+                await self.storage_manager.remote_auth.persist(self.session_factory)
                 async with session_scope(self.session_factory) as session:
                     cleaned = await UploadCleanup(
                         uploads=UploadRepository(session),
@@ -46,6 +48,7 @@ class UploadCleanupWorker:
                     ).run_expired(limit=100)
                     if cleaned:
                         self.log.info("Cleaned %s failed or inactive upload session(s).", cleaned)
+                await self.storage_manager.remote_auth.persist(self.session_factory)
             except Exception:
                 self.log.exception("Automatic upload cleanup failed")
             await asyncio.sleep(self.interval)

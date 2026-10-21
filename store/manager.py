@@ -9,6 +9,7 @@ from core.cfg import CloudraveConfig
 from drives.credentials import CredentialVault
 from drives.ids import provider_id
 from drives.registry import DriveRegistry, default_drive_registry
+from drives.remote_drive.auth import PROVIDERS, RemoteCredentialRuntime
 from models.tables import BucketMount, StoragePolicy
 from store.types import join_object_key, normalize_object_key
 
@@ -37,12 +38,17 @@ class _PolicyContext:
 class _PolicyBoundAdapter:
     """Replace the public ORM policy with its short-lived decrypted view."""
 
-    def __init__(self, adapter: Any, policy: StoragePolicy, credentials: dict[str, str]) -> None:
+    def __init__(self, adapter: Any, policy: StoragePolicy, credentials: dict[str, str], remote_auth=None) -> None:
         self._adapter = adapter
         self._policy = policy
         self._context = _PolicyContext(policy, credentials)
+        self._remote_auth = remote_auth
         self.provider_type = adapter.provider_type
         self.capabilities = adapter.capabilities
+
+    def _on_call_success(self) -> None:
+        if self._remote_auth is not None:
+            self._remote_auth.synchronize(self._policy)
 
     def __getattr__(self, name: str) -> Any:
         value = getattr(self._adapter, name)
@@ -52,6 +58,10 @@ class _PolicyBoundAdapter:
         def bound(*args: Any, **kwargs: Any) -> Any:
             if args and args[0] is self._policy:
                 args = (self._context, *args[1:])
+            if self._remote_auth is not None and name not in {
+                "prepare_mount_root", "local_path", "purge_mount", "configure_cors",
+            }:
+                return self._remote_auth.invoke(self._adapter, name, self._policy, self._context, args, kwargs)
             return value(*args, **kwargs)
 
         return bound
@@ -68,13 +78,17 @@ class StorageManager:
         self.registry = registry or default_drive_registry()
         self.adapters = self.registry.create_all(config=config, local_root=Path(local_root))
         self.vault = CredentialVault(config.storage.credential_key)
+        self.remote_auth = RemoteCredentialRuntime(self.vault)
 
     def get_adapter(self, policy: StoragePolicy):
         key = provider_id(policy.provider)
         adapter = self.adapters.get(key)
         if adapter is None:
             raise KeyError(f"Storage drive {key!r} is not registered")
-        return _PolicyBoundAdapter(adapter, policy, self.credentials_for(policy))
+        return _PolicyBoundAdapter(
+            adapter, policy, self.credentials_for(policy),
+            self.remote_auth if key in PROVIDERS else None,
+        )
 
     def definition_for(self, provider: object):
         return self.registry.require(provider)

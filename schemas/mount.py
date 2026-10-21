@@ -132,6 +132,9 @@ def mount_read(mount, policy=None, storage_manager=None) -> BucketMountRead:
         "local_fs": "local",
         "tencent_cos": "tencent",
         "aliyun_oss": "aliyun",
+        "drive_139": "139",
+        "drive_189": "189",
+        "drive_wo": "wo",
     }
     extra["storage_type"] = compatibility_types.get(driver_id, driver_id)
     extra["bucket_name"] = policy.bucket_name
@@ -165,4 +168,6 @@ def mount_read(mount, policy=None, storage_manager=None) -> BucketMountRead:
             "driver_kind": definition.kind,
             "driver_capabilities": list(adapter.capabilities.names()) if adapter else [],
         })
+        if driver_id in {"drive_139", "drive_189", "drive_wo"}:
+            extra["requires_reauthorization"] = storage_manager.remote_auth.status(policy)
     return result.model_copy(update={"extra": extra, **metadata})
