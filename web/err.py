@@ -11,7 +11,9 @@ from fastapi.exception_handlers import (
 )
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
+
+from drives.remote_drive.common import RemoteAuthenticationError, RemoteProtocolError
 
 
 _MAX_REASON_LENGTH = 500
@@ -61,6 +63,18 @@ async def logged_validation_exception_handler(
     return await request_validation_exception_handler(request, exc)
 
 
+async def remote_protocol_exception_handler(
+    request: Request,
+    exc: RemoteProtocolError,
+) -> Response:
+    detail = _single_line(exc)
+    request.state.failure_reason = detail
+    if isinstance(exc, RemoteAuthenticationError):
+        return JSONResponse(status_code=409, content={"detail": detail, "code": "storage_reauthorization_required"})
+    return JSONResponse(status_code=502, content={"detail": detail})
+
+
 def install_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(StarletteHTTPException, logged_http_exception_handler)
     app.add_exception_handler(RequestValidationError, logged_validation_exception_handler)
+    app.add_exception_handler(RemoteProtocolError, remote_protocol_exception_handler)

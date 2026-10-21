@@ -388,7 +388,8 @@ class UserMountService:
 
     async def _validate_storage(self, policy, mount: BucketMount) -> None:
         adapter = self.storage_manager.get_adapter(policy)
-        if adapter.capabilities.upload_transport == "cloudrave":
+        definition = self.storage_manager.definition_for(policy.provider)
+        if definition.kind == "local":
             await call_adapter(adapter, "prepare_mount_root", mount)
             return
         try:
