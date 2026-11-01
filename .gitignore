@@ -46,6 +46,8 @@ db.sql
 
 # Local configuration and secrets
 config.ini
+config.ini.bak
+config.ini.before-drive-credentials-*.bak
 .env
 .env.*
 
@@ -67,4 +69,7 @@ bin/
 *.manifest
 *.pyz
 
-tests/
+tests/*
+!tests/test_database_switching.py
+!tests/test_database_cross_backend_integration.py
+!tests/test_storage_drives.py

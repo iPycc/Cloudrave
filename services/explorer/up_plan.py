@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-from models.enums import StoragePolicyType, UploadMode
+from models.enums import UploadMode
 from schemas.upload import UploadPartPlan, UploadSessionPlan
 from services.explorer.up_check import apply_threshold, choose_mode, choose_part_size, part_count, validate_part_count
 from store.call import call_adapter
@@ -21,7 +21,7 @@ def _window(extra: dict) -> int:
     return max(1, min(value, 64))
 
 
-async def sign_part(adapter, policy, mount, upload, part_number: int) -> UploadPartPlan:
+async def sign_part(adapter, policy, mount, upload, part_number: int, *, relay_url: str | None = None) -> UploadPartPlan:
     presigned = await call_adapter(adapter, "presign_part", policy, mount, upload, part_number)
     return UploadPartPlan(
         part_number=part_number,
@@ -29,6 +29,12 @@ async def sign_part(adapter, policy, mount, upload, part_number: int) -> UploadP
         url=presigned.url,
         headers=presigned.headers,
         expires_at=presigned.expires_at,
+        body_mode=presigned.body_mode,
+        form_fields=presigned.form_fields,
+        file_field=presigned.file_field,
+        record_etag=presigned.record_etag,
+        response_mode=presigned.response_mode,
+        relay_url=relay_url,
     )
 
 
@@ -52,23 +58,24 @@ async def sign_put(adapter, policy, mount, object_key: str, mime_type: str | Non
 
 
 async def make_plan(*, uploads, storage_manager, policy, mount, parent, file_name, object_key, payload):
+    adapter = storage_manager.get_adapter(policy)
+    capability = adapter.capabilities
     size = apply_threshold(
-        choose_part_size(payload.size, payload.part_size, policy.part_size_mb),
-        policy.provider,
+        choose_part_size(payload.size, payload.part_size, policy.part_size_mb, capability),
+        capability,
         payload.size,
         policy.multipart_threshold_mb,
     )
     count = part_count(payload.size, size)
-    validate_part_count(count)
-    adapter = storage_manager.get_adapter(policy)
+    validate_part_count(count, capability)
     mode = choose_mode(
         payload.mode,
-        policy.provider,
+        capability,
         payload.size,
         policy.multipart_threshold_mb,
     )
 
-    if policy.provider == StoragePolicyType.TENCENT_COS and mode == UploadMode.SINGLE:
+    if capability.supports_single_put and mode == UploadMode.SINGLE:
         single_size = payload.size or 1
         put = await sign_put(adapter, policy, mount, object_key, payload.content_type, payload.checksum)
         record = await uploads.create_session(
@@ -83,6 +90,7 @@ async def make_plan(*, uploads, storage_manager, policy, mount, parent, file_nam
             size=payload.size,
             part_size=single_size,
             checksum=payload.checksum,
+            provider_checksum=payload.provider_checksum,
         )
         return record, UploadSessionPlan(
             session_id=record.id,
@@ -92,6 +100,8 @@ async def make_plan(*, uploads, storage_manager, policy, mount, parent, file_nam
             part_count=1,
             upload_urls=[put],
             expires_at=put.expires_at,
+            transport=capability.upload_transport,
+            required_response_headers=[],
         )
 
     upload = await call_adapter(
@@ -102,7 +112,12 @@ async def make_plan(*, uploads, storage_manager, policy, mount, parent, file_nam
         object_key,
         total_size=payload.size,
         mime_type=payload.content_type,
-        metadata={"sha256": payload.checksum} if payload.checksum else None,
+        metadata={
+            "sha256": payload.checksum or "",
+            "provider_checksum": payload.provider_checksum or "",
+            "file_name": file_name,
+            "part_size": str(size),
+        },
     )
     record = await uploads.create_session(
         owner_id=mount.owner_id,
@@ -116,10 +131,15 @@ async def make_plan(*, uploads, storage_manager, policy, mount, parent, file_nam
         size=payload.size,
         part_size=size,
         checksum=payload.checksum,
+        provider_checksum=payload.provider_checksum,
     )
     extra = policy.extra or {}
-    window = min(count, _window(extra))
-    if policy.provider == StoragePolicyType.LOCAL_FS:
+    window = (
+        0
+        if capability.part_checksum_algorithm or not capability.eager_part_plans
+        else min(count, _window(extra))
+    )
+    if capability.upload_transport == "cloudrave":
         urls = [
             UploadPartPlan(
                 part_number=number,
@@ -129,8 +149,13 @@ async def make_plan(*, uploads, storage_manager, policy, mount, parent, file_nam
             for number in range(1, window + 1)
         ]
     else:
+        relay_url = (
+            f"/api/v1/explorer/upload/{record.id}/part"
+            if getattr(adapter, "supports_relay_upload", False)
+            else None
+        )
         urls = await asyncio.gather(
-            *(sign_part(adapter, policy, mount, upload, number) for number in range(1, window + 1))
+            *(sign_part(adapter, policy, mount, upload, number, relay_url=relay_url) for number in range(1, window + 1))
         )
     return record, UploadSessionPlan(
         session_id=record.id,
@@ -141,4 +166,7 @@ async def make_plan(*, uploads, storage_manager, policy, mount, parent, file_nam
         part_count=count,
         upload_urls=urls,
         expires_at=upload.expires_at,
+        transport=capability.upload_transport,
+        required_response_headers=["ETag"] if capability.requires_part_etag else [],
+        part_checksum_algorithm=capability.part_checksum_algorithm,
     )

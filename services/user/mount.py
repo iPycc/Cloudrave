@@ -11,7 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.enums import NodeType, StoragePolicyType, UploadState
+from models.enums import NodeType, UploadState
 from models.gc import GcTask
 from models.tables import BucketMount, Node, UploadSessionRecord, User
 from repositories.audit_logs import AuditLogRepository
@@ -32,6 +32,7 @@ from schemas.user_mount import (
 from services.explorer.upload_cleanup import UploadCleanup
 from store.call import call_adapter
 from store.manager import StorageManager
+from drives.ids import provider_id
 
 
 LOGGER = logging.getLogger("cloudrave.store")
@@ -65,7 +66,7 @@ class UserMountService:
             policy.id: policy
             for policy in await self.policies.list_by_ids([mount.policy_id for mount in mounts])
         }
-        return [mount_read(mount, policies.get(mount.policy_id)) for mount in mounts]
+        return [mount_read(mount, policies.get(mount.policy_id), self.storage_manager) for mount in mounts]
 
     async def get_mount(self, actor: User, mount_id: int) -> UserMountRead:
         mount = await self._owned_mount(actor, mount_id)
@@ -77,7 +78,14 @@ class UserMountService:
         mount_payload = self._mount_create(actor, payload.mount, policy_id=0, provider=policy_payload.provider)
 
         try:
+            self.storage_manager.definition_for(policy_payload.provider)
+            ciphertext, version = self.storage_manager.credentials_from_payload(
+                policy_payload.provider,
+                policy_payload,
+            )
             policy = await self.policies.create(policy_payload)
+            policy.credential_ciphertext = ciphertext
+            policy.credential_version = version
             mount_payload.policy_id = policy.id
             mount = await self.mounts.create(actor.id, mount_payload)
             await self.nodes.ensure_mount_root(owner_id=actor.id, mount_id=mount.id, name=mount.name)
@@ -87,8 +95,13 @@ class UserMountService:
                 status_code=status.HTTP_409_CONFLICT,
                 detail="A mount with the same name or slug already exists",
             ) from exc
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=str(exc),
+            ) from exc
 
-        await self._audit(request, actor, "mount.create", mount, policy.provider.value)
+        await self._audit(request, actor, "mount.create", mount, provider_id(policy.provider))
         LOGGER.info("Created user mount %s for %s", mount.name, actor.uid)
         return self._read(mount, policy)
 
@@ -120,7 +133,14 @@ class UserMountService:
 
         try:
             if policy_patch is not None:
+                ciphertext, version = self.storage_manager.credentials_from_payload(
+                    policy.provider,
+                    policy_patch,
+                    current=policy,
+                )
                 policy = await self.policies.update(policy, policy_patch)
+                policy.credential_ciphertext = ciphertext
+                policy.credential_version = version
             if mount_patch is not None:
                 mount = await self.mounts.update(mount, mount_patch)
             if mapping_changed or connection_changed:
@@ -129,6 +149,11 @@ class UserMountService:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="A mount or policy with the same name already exists",
+            ) from exc
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=str(exc),
             ) from exc
 
         await self._audit(request, actor, "mount.update", mount, ",".join(mapping_changed) or "settings")
@@ -149,7 +174,7 @@ class UserMountService:
         return UserMountDeletePreview(
             mount_id=mount.id,
             mount_name=mount.name,
-            provider=policy.provider.value,
+            provider=provider_id(policy.provider),
             bucket_name=policy.bucket_name,
             prefix=prefix,
             file_count=file_count,
@@ -276,14 +301,14 @@ class UserMountService:
         payload: UserBucketMountCreate,
         *,
         policy_id: int,
-        provider: StoragePolicyType,
+        provider: str,
     ) -> BucketMountCreate:
         extra = {
             **payload.extra,
             OWNER_KEY: actor.id,
             USER_MANAGED_KEY: True,
         }
-        self._validate_local_root(actor, provider, payload.mount_slug, extra)
+        self._validate_user_mount(actor, provider, payload.mount_slug, extra)
         return BucketMountCreate(policy_id=policy_id, **payload.model_dump(exclude={"extra"}), extra=extra)
 
     def _owned_policy_update(
@@ -294,6 +319,13 @@ class UserMountService:
         payload: StoragePolicyUpdate,
     ) -> StoragePolicyUpdate:
         values = payload.model_dump(exclude_unset=True)
+        # Pydantic intentionally excludes credentials from serialization so
+        # they can never leak into API responses or logs. Preserve explicitly
+        # submitted write-only fields while constructing the owner-scoped
+        # patch; an omitted credentials object still means "keep existing".
+        for field in ("credentials", "secret_id", "secret_key", "session_token"):
+            if field in payload.model_fields_set:
+                values[field] = getattr(payload, field)
         values.pop("name", None)
         if "is_default" in values:
             values["is_default"] = False
@@ -323,27 +355,20 @@ class UserMountService:
                 USER_MANAGED_KEY: True,
             }
             slug = str(values.get("mount_slug") or mount.mount_slug)
-            self._validate_local_root(actor, policy.provider, slug, values["extra"])
+            self._validate_user_mount(actor, policy.provider, slug, values["extra"])
         return BucketMountUpdate.model_validate(values)
 
-    def _validate_local_root(
+    def _validate_user_mount(
         self,
         actor: User,
-        provider: StoragePolicyType,
+        provider: str,
         mount_slug: str,
         extra: dict,
     ) -> None:
-        if provider != StoragePolicyType.LOCAL_FS:
-            return
-        raw_root = str(extra.get("storage_root") or f"/upload/{actor.uid}/{mount_slug}/")
-        normalized = "/" + raw_root.replace("\\", "/").strip("/")
-        owner_root = f"/upload/{actor.uid}"
-        if normalized != owner_root and not normalized.startswith(f"{owner_root}/"):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Local storage path must stay inside the current user's upload directory",
-            )
-        extra["storage_root"] = f"{normalized}/"
+        try:
+            self.storage_manager.validate_user_mount(provider, actor, mount_slug, extra)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
 
     def _require_owned_policy(self, actor: User, policy) -> None:
         if not self._is_owned_policy(actor, policy):
@@ -363,7 +388,8 @@ class UserMountService:
 
     async def _validate_storage(self, policy, mount: BucketMount) -> None:
         adapter = self.storage_manager.get_adapter(policy)
-        if policy.provider == StoragePolicyType.LOCAL_FS:
+        definition = self.storage_manager.definition_for(policy.provider)
+        if definition.kind == "local":
             await call_adapter(adapter, "prepare_mount_root", mount)
             return
         try:
@@ -371,7 +397,7 @@ class UserMountService:
         except Exception as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"COS mount validation failed: {exc}",
+                detail=f"Storage drive validation failed: {exc}",
             ) from exc
 
     async def _mount_is_busy(self, mount_id: int) -> bool:
@@ -403,9 +429,9 @@ class UserMountService:
     def _connection_changed(policy, policy_patch) -> bool:
         if policy_patch is None:
             return False
-        return any(
-            field in policy_patch.model_fields_set and getattr(policy_patch, field) != getattr(policy, field)
-            for field in {"secret_id", "secret_key", "session_token"}
+        return bool(
+            {"credentials", "secret_id", "secret_key", "session_token"}
+            & policy_patch.model_fields_set
         )
 
     async def _node_counts(self, mount_id: int) -> tuple[int, int]:
@@ -458,19 +484,15 @@ class UserMountService:
         )
 
     def _read(self, mount: BucketMount, policy) -> UserMountRead:
-        return UserMountRead(policy=self._policy_read(policy), mount=mount_read(mount, policy))
+        return UserMountRead(
+            policy=self._policy_read(policy),
+            mount=mount_read(mount, policy, self.storage_manager),
+        )
 
-    @staticmethod
-    def _policy_read(policy) -> StoragePolicyRead:
-        data = StoragePolicyRead.model_validate(policy).model_dump()
-        for field in ("secret_id", "secret_key", "session_token"):
-            value = data.get(field)
-            if value:
-                data[field] = UserMountService._mask_secret(value)
-        return StoragePolicyRead.model_validate(data)
-
-    @staticmethod
-    def _mask_secret(value: str) -> str:
-        if len(value) <= 8:
-            return "*" * len(value)
-        return f"{value[:4]}{'*' * max(4, len(value) - 8)}{value[-4:]}"
+    def _policy_read(self, policy) -> StoragePolicyRead:
+        configured, fields = self.storage_manager.credential_state(policy)
+        return StoragePolicyRead.model_validate({
+            **StoragePolicyRead.model_validate(policy).model_dump(),
+            "credentials_configured": configured,
+            "credential_fields": fields,
+        })

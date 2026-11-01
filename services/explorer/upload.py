@@ -9,7 +9,7 @@ from fastapi import HTTPException, Request, UploadFile, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.enums import StoragePolicyType, UploadMode, UploadState
+from models.enums import UploadMode, UploadState
 from models.tables import BucketMount, StoragePolicy, User
 from repositories.audit_logs import AuditLogRepository
 from repositories.mounts import BucketMountRepository
@@ -133,6 +133,7 @@ class CreateUploadSessionService:
                     size=payload.size,
                     part_size=payload.size or 1,
                     checksum=payload.checksum,
+                    provider_checksum=payload.provider_checksum,
                     state=UploadState.COMPLETED,
                 )
                 await self.uploads.bind_node(session_record.id, file_node.id)
@@ -196,26 +197,33 @@ class CreateUploadSessionService:
         ):
             mount, policy = await self._require_mount_access(actor, record.mount_id)
             adapter = self.storage_manager.get_adapter(policy)
-            storage_parts = await call_adapter(
-                adapter,
-                "list_parts",
-                policy,
-                mount,
-                self._build_upload_state(record, policy, mount),
-            )
-            reconciled: list[tuple[int, str | None, int]] = []
-            for part in storage_parts:
-                try:
-                    expected_size = self._expected_part_size(record, part.part_number)
-                except HTTPException:
-                    continue
-                if part.etag and part.size == expected_size:
-                    reconciled.append((part.part_number, part.etag, part.size))
-            await self.uploads.sync_parts(record.id, reconciled)
+            if adapter.capabilities.supports_part_listing:
+                storage_parts = await call_adapter(
+                    adapter,
+                    "list_parts",
+                    policy,
+                    mount,
+                    self._build_upload_state(record, policy, mount),
+                )
+                reconciled: list[tuple[int, str | None, int]] = []
+                for part in storage_parts:
+                    try:
+                        expected_size = self._expected_part_size(record, part.part_number)
+                    except HTTPException:
+                        continue
+                    if part.etag and part.size == expected_size:
+                        reconciled.append((part.part_number, part.etag, part.size))
+                await self.uploads.sync_parts(record.id, reconciled)
             await self.uploads.touch(record.id)
         return await self._to_read(record)
 
-    async def part_url(self, actor: User, session_id: str, part_number: int) -> UploadPartPlan:
+    async def part_url(
+        self,
+        actor: User,
+        session_id: str,
+        part_number: int,
+        part_checksum: str | None = None,
+    ) -> UploadPartPlan:
         record = await self._require_upload_access(actor, session_id)
         if record.state not in (UploadState.CREATED, UploadState.UPLOADING, UploadState.FAILED):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Upload session cannot issue part URLs")
@@ -234,18 +242,33 @@ class CreateUploadSessionService:
             )
         if record.mode != UploadMode.MULTIPART:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Upload session cannot issue part URLs")
-        if policy.provider == StoragePolicyType.LOCAL_FS:
+        if adapter.capabilities.upload_transport == "cloudrave":
             return UploadPartPlan(
                 part_number=part_number,
                 method="POST",
                 url=f"/api/v1/explorer/upload/{record.id}/part",
             )
+        checksum_algorithm = adapter.capabilities.part_checksum_algorithm
+        if checksum_algorithm and not part_checksum:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=f"{checksum_algorithm.upper()} checksum is required for this upload part",
+            )
+        upload_state = self._build_upload_state(record, policy, mount)
+        if part_checksum:
+            upload_state.metadata["part_checksum"] = part_checksum
+        relay_url = (
+            f"/api/v1/explorer/upload/{record.id}/part"
+            if getattr(adapter, "supports_relay_upload", False)
+            else None
+        )
         return await sign_part(
             adapter,
             policy,
             mount,
-            self._build_upload_state(record, policy, mount),
+            upload_state,
             part_number,
+            relay_url=relay_url,
         )
 
     async def heartbeat(self, actor: User, session_id: str) -> None:
@@ -275,16 +298,19 @@ class CreateUploadSessionService:
 
         resolved_etag = etag
         resolved_size = size
-        if policy.provider == StoragePolicyType.LOCAL_FS:
+        if file is not None or adapter.capabilities.upload_transport == "cloudrave":
             if file is None:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Local upload requires file content")
+            await file.seek(0)
+            upload_state = self._build_upload_state(record, policy, mount)
+            upload_state.metadata["part_checksum"] = hashlib.md5(await file.read(expected_size + 1)).hexdigest()
             await file.seek(0)
             part = await call_adapter(
                 adapter,
                 "upload_part",
                 policy,
                 mount,
-                self._build_upload_state(record, policy, mount),
+                upload_state,
                 part_number,
                 file.file,
             )
@@ -363,7 +389,6 @@ class CreateUploadSessionService:
                         policy,
                         mount,
                         record.path,
-                        **({"verify_encryption": True} if policy.provider == StoragePolicyType.TENCENT_COS else {}),
                     )
                 except Exception as exc:
                     if not is_not_found(exc):
@@ -376,8 +401,27 @@ class CreateUploadSessionService:
                 parts = await self.uploads.list_parts(record.id)
                 self._validate_complete_parts(record, parts)
                 upload_state = self._build_upload_state(record, policy, mount)
-                if policy.provider == StoragePolicyType.LOCAL_FS:
-                    storage_parts = await call_adapter(adapter, "list_parts", policy, mount, upload_state)
+                if adapter.capabilities.upload_transport == "cloudrave":
+                    # Some backend-relay providers cannot enumerate uploaded
+                    # parts.  Their successfully relayed parts are already
+                    # recorded in Cloudrave, so use that durable list instead
+                    # of replacing it with an unsupported empty provider list.
+                    storage_parts = [
+                        MultipartPart(
+                            part_number=part.part_number,
+                            etag=part.etag or "",
+                            size=part.size,
+                        )
+                        for part in parts
+                    ]
+                    if adapter.capabilities.supports_part_listing:
+                        storage_parts = await call_adapter(
+                            adapter,
+                            "list_parts",
+                            policy,
+                            mount,
+                            upload_state,
+                        )
                     self._validate_complete_parts(record, storage_parts)
                     stored_object = await call_adapter(
                         adapter,
@@ -401,13 +445,17 @@ class CreateUploadSessionService:
             elif stored_object is None:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Uploaded object was not found")
 
-            if declared_checksum and policy.provider == StoragePolicyType.TENCENT_COS:
-                metadata = getattr(stored_object, "metadata", {}) or {}
-                if metadata.get("sha256") != declared_checksum:
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail="Uploaded object checksum metadata does not match the session",
-                    )
+            try:
+                await call_adapter(
+                    adapter,
+                    "validate_completed_object",
+                    policy,
+                    mount,
+                    stored_object,
+                    declared_checksum,
+                )
+            except RuntimeError as exc:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
             try:
                 file_node = await self.nodes.create_file(
@@ -422,7 +470,7 @@ class CreateUploadSessionService:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="目标位置已存在同名文件") from exc
 
             checksum = None
-            if policy.provider == StoragePolicyType.LOCAL_FS:
+            if adapter.capabilities.upload_transport == "cloudrave":
                 checksum = await asyncio.to_thread(self._compute_sha256_from_adapter, adapter, policy, mount, record.path)
                 if declared_checksum and checksum != declared_checksum:
                     raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Uploaded object checksum mismatch")
@@ -550,6 +598,13 @@ class CreateUploadSessionService:
 
     async def _to_read(self, record) -> UploadSessionRead:
         parts = await self.uploads.list_parts(record.id)
+        mount = await self.mounts.get_by_id(record.mount_id)
+        if mount is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Storage mount not found")
+        policy = await self.policies.get_by_id(mount.policy_id)
+        if policy is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Storage policy not found")
+        capability = self.storage_manager.get_adapter(policy).capabilities
         return UploadSessionRead(
             id=record.id,
             mount_id=record.mount_id,
@@ -560,10 +615,15 @@ class CreateUploadSessionService:
             upload_id=record.upload_id,
             file_name=record.file_name,
             content_type=record.content_type,
+            checksum=record.checksum,
+            provider_checksum=getattr(record, "provider_checksum", None),
             size=record.size,
             part_size=record.part_size,
             created_at=record.created_at,
             updated_at=record.updated_at,
+            transport=capability.upload_transport,
+            required_response_headers=["ETag"] if capability.requires_part_etag else [],
+            part_checksum_algorithm=capability.part_checksum_algorithm,
             parts=[UploadPartRead.model_validate(part) for part in parts],
         )
 

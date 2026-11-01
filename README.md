@@ -13,6 +13,7 @@
   <a href="https://fastapi.tiangolo.com/"><img src="https://img.shields.io/badge/FastAPI-0.116+-009688?logo=fastapi" alt="FastAPI"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.12+-3776AB?logo=python" alt="Python"></a>
   <a href="https://www.sqlalchemy.org/"><img src="https://img.shields.io/badge/SQLAlchemy-2.0+-D71F00?logo=sqlalchemy" alt="SQLAlchemy"></a>
+  <a href="https://github.com/iPycc/Cloudrave/releases/tag/v1.0.0-beta.4"><img src="https://img.shields.io/badge/release-v1.0.0--beta.4-blue" alt="v1.0.0-beta.4"></a>
 </p>
 
 <p align="center">
@@ -26,22 +27,32 @@
 
 ## 📖 简介
 
-Cloudrave，基于 Python + FastAPI 构建，提供文件存储、用户认证、分享、回收站、在线预览等核心能力的 RESTful API。
+Cloudrave 是基于 Python + FastAPI 的多用户文件管理服务，提供身份认证、文件管理、分享、回收站和在线预览 API。当前版本为 **v1.0.0-beta.4**。
 
-后端采用异步 SQLAlchemy ORM，支持 SQLite、PostgreSQL 和 MySQL 多种数据库；存储层支持本地文件系统与腾讯云 COS，并可通过适配器模式扩展更多云存储后端。
+后端采用异步 SQLAlchemy ORM，支持 SQLite、PostgreSQL 和 MySQL。存储策略可连接本地文件系统、腾讯云 COS、阿里云 OSS，以及 139 移动云盘、189 天翼云盘和联通云盘。
 
 ## ✨ 特性
 
-- 🔐 支持 JWT 访问令牌 + Refresh Token、TOTP 双因素认证与 Passkey/WebAuthn 登录
-- 👤 多用户、用户组与基于角色的权限控制（RBAC）
-- ☁️ 支持本地文件系统、腾讯云 COS 等多种存储策略
-- 📁 文件浏览、目录管理、分片上传、断点续传、并行上传
-- 🔗 文件与目录分享链接，支持密码与过期时间
-- 🗑️ 回收站机制，支持恢复与自动清理
-- 🖼️ 视频、音频、图片、PDF、Office、文本等在线预览（视频海报生成依赖 FFmpeg）
-- 📦 压缩包在线预览、多文件打包下载
-- 🧩 管理后台 API：用户管理、存储策略、挂载管理、系统设置
-- 📝 结构化日志、请求追踪、速率限制与安全响应头
+- **存储后端**：本地文件系统、腾讯云 COS、阿里云 OSS；139 移动云盘、189 天翼云盘、联通云盘以用户凭据连接。
+- **文件管理**：目录浏览、创建、重命名、移动、复制、回收站恢复和永久删除；支持多挂载及容量信息。
+- **上传和下载**：分片并行上传、断点续传、重复文件检查及下载；对象存储使用直传能力，运营商网盘优先直传，浏览器跨域或网络错误时可经 Cloudrave 中转上传分片。
+- **预览与编辑**：图片、视频、音频、PDF、Office、文本和压缩包预览；文本与 Markdown 保存、PDF 注释及图片另存为。
+- **分享**：文件和目录分享链接、访问密码、过期时间和分享下载。
+- **账号与权限**：JWT 与 Refresh Token、TOTP 双因素认证、Passkey/WebAuthn、GitHub/Google/QQ OAuth 关联；用户、管理员和访客权限控制。
+- **管理与运维**：存储策略和挂载管理、数据库连接测试与迁移、站点设置、审计记录、结构化日志、请求追踪、速率限制与安全响应头。
+
+### 存储能力说明
+
+| 驱动 | 浏览与下载 | 上传 | 说明 |
+| --- | --- | --- | --- |
+| 本地文件系统 | 支持 | 后端接收 | 支持目录与文件管理 |
+| 腾讯云 COS | 支持 | 浏览器直传、分片上传 | 可配置桶 CORS |
+| 阿里云 OSS | 支持 | 浏览器直传、分片上传 | CORS 由 OSS 配置管理 |
+| 139 移动云盘 | 支持 | 浏览器直传；失败时可由后端中转分片 | 通过登录凭据连接 |
+| 189 天翼云盘 | 支持 | 浏览器直传；失败时可由后端中转分片 | 上传分片按运营商要求计算 MD5 |
+| 联通云盘 | 支持 | 浏览器直传或运营商上传协议 | 通过 WoCloud Web Token 连接 |
+
+运营商网盘的凭据由管理员或挂载所有者维护。中转上传会让文件分片经过 Cloudrave 服务器，部署时应为临时文件和请求体配置足够的磁盘空间与带宽。驱动能力受运营商接口和账号权限限制。
 
 ## 🚀 快速开始
 
@@ -86,8 +97,18 @@ local_upload_root = upload
 preview_cache_root = data/preview-cache
 
 [database]
-backend = sqlite
+database = sqlite
 sqlite_path = data/cloudrave.db
+mysql_host = 127.0.0.1
+mysql_port = 3306
+mysql_user = root
+mysql_password = change-me
+mysql_name = cloudrave
+postgresql_host = 127.0.0.1
+postgresql_port = 5432
+postgresql_user = postgres
+postgresql_password = change-me
+postgresql_name = cloudrave
 pool_size = 10
 max_overflow = 20
 pool_pre_ping = true
@@ -103,6 +124,14 @@ use_color = true
 ```
 
 生产部署前请务必修改 `jwt_secret`、`totp_secret_key`、`backup_codes_key`、`share_signing_key` 等敏感密钥。
+
+### 数据库切换
+
+`[database].database` 仅接受 `sqlite`、`mysql` 或 `postgresql`。MySQL/PostgreSQL 用户需要提前创建，并授予建库、建表、索引、读写和事务权限。管理员在切换向导中测试连接时，如果目标数据库不存在，Cloudrave 会自动创建；如果用户没有建库权限，页面会给出明确提示，此时也可以由数据库管理员预先创建目标数据库。
+
+管理员可从前端“系统设置 → 数据库”完成连接测试和数据迁移。运行中修改 `config.ini` 后，前端会自动显示迁移向导；可以选择把当前库的数据复制到目标库，或保留目标库现有数据。复制前会为非空目标库生成带 SHA-256 清单的逻辑备份。数据库元数据迁移完成后需要手动重启后端，原数据库和存储中的物理文件都不会被删除。
+
+`CLOUDRAVE_DATABASE_URL` 或非空的 `[database].url` 仍具有最高优先级。使用这两种覆盖方式时，管理页面只显示连接来源，不允许通过分字段向导切换数据库。
 
 ### GitHub OAuth 登录
 

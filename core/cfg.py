@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 from configparser import ConfigParser
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from os import getenv
 from pathlib import Path
 import secrets
+from typing import Literal, cast
 from urllib.parse import quote_plus
 
 
 CONFIG_FILENAME = "config.ini"
+DatabaseBackend = Literal["sqlite", "mysql", "postgresql"]
+SUPPORTED_DATABASES: tuple[DatabaseBackend, ...] = ("sqlite", "mysql", "postgresql")
 
 
 @dataclass(slots=True)
@@ -31,7 +34,7 @@ class AppConfig:
 
 @dataclass(slots=True)
 class DatabaseConfig:
-    backend: str = "sqlite"
+    backend: DatabaseBackend = "sqlite"
     url: str = "sqlite+aiosqlite:///cloudrave.db"
     echo: bool = False
     pool_size: int = 10
@@ -79,11 +82,17 @@ class TencentCosConfig:
 
 
 @dataclass(slots=True)
+class StorageConfig:
+    credential_key: str = ""
+
+
+@dataclass(slots=True)
 class CloudraveConfig:
     app: AppConfig
     database: DatabaseConfig
     auth: AuthConfig
     logging: LoggingConfig
+    storage: StorageConfig
     tencent_cos: TencentCosConfig
     root_dir: Path
     config_path: Path
@@ -148,6 +157,9 @@ def default_config_parser() -> ConfigParser:
         "level": "INFO",
         "use_color": "true",
     }
+    parser["storage"] = {
+        "credential_key": _generate_secret(48),
+    }
     parser["tencent_cos"] = {
         "secret_id": "",
         "secret_key": "",
@@ -172,7 +184,9 @@ def load_config(root_dir: Path) -> CloudraveConfig:
     config_path = ensure_config_file(root_dir)
     parser = ConfigParser()
     parser.read(config_path, encoding="utf-8")
-    if _ensure_auth_secrets(parser):
+    auth_changed = _ensure_auth_secrets(parser)
+    storage_changed = _ensure_storage_secret(parser)
+    if auth_changed or storage_changed:
         config_path.write_text(_serialize_config(parser), encoding="utf-8")
 
     app = AppConfig(
@@ -191,7 +205,9 @@ def load_config(root_dir: Path) -> CloudraveConfig:
         request_id_header=parser.get("app", "request_id_header", fallback="X-Request-ID"),
         default_timezone=parser.get("app", "default_timezone", fallback="UTC"),
     )
-    database_backend = parser.get("database", "database", fallback="sqlite").strip().lower() or "sqlite"
+    database_backend = normalize_database_backend(
+        parser.get("database", "database", fallback="sqlite")
+    )
     database_url = _resolve_database_url(parser, root_dir, database_backend)
     database = DatabaseConfig(
         backend=_detect_database_backend(database_url, database_backend),
@@ -227,6 +243,12 @@ def load_config(root_dir: Path) -> CloudraveConfig:
         level=parser.get("logging", "level", fallback="INFO"),
         use_color=parser.getboolean("logging", "use_color", fallback=True),
     )
+    storage = StorageConfig(
+        credential_key=(
+            getenv("CLOUDRAVE_STORAGE_CREDENTIAL_KEY")
+            or parser.get("storage", "credential_key", fallback="")
+        ).strip(),
+    )
     tencent_cos = TencentCosConfig(
         secret_id=parser.get("tencent_cos", "secret_id", fallback=""),
         secret_key=parser.get("tencent_cos", "secret_key", fallback=""),
@@ -239,6 +261,7 @@ def load_config(root_dir: Path) -> CloudraveConfig:
         database=database,
         auth=auth,
         logging=logging,
+        storage=storage,
         tencent_cos=tencent_cos,
         root_dir=root_dir,
         config_path=config_path,
@@ -249,7 +272,12 @@ def _split_csv(value: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in value.split(",") if item.strip())
 
 
-def _resolve_database_url(parser: ConfigParser, root_dir: Path, backend: str) -> str:
+def _resolve_database_url(
+    parser: ConfigParser,
+    root_dir: Path,
+    backend: DatabaseBackend | str,
+) -> str:
+    backend = normalize_database_backend(backend)
     env_url = getenv("CLOUDRAVE_DATABASE_URL")
     if env_url:
         return env_url
@@ -279,7 +307,10 @@ def _resolve_database_url(parser: ConfigParser, root_dir: Path, backend: str) ->
     return f"sqlite+aiosqlite:///{resolved_path.as_posix()}"
 
 
-def _detect_database_backend(url: str, fallback: str) -> str:
+def _detect_database_backend(
+    url: str,
+    fallback: DatabaseBackend | str,
+) -> DatabaseBackend:
     normalized = url.lower()
     if normalized.startswith("postgresql"):
         return "postgresql"
@@ -287,7 +318,72 @@ def _detect_database_backend(url: str, fallback: str) -> str:
         return "mysql"
     if normalized.startswith("sqlite"):
         return "sqlite"
-    return fallback
+    # Explicit connection URLs may use a custom SQLAlchemy dialect. Preserve
+    # the historical fallback behavior here; config.ini's `database` value is
+    # validated strictly before this helper is called by load_config().
+    return cast(DatabaseBackend, fallback)
+
+
+def normalize_database_backend(value: str) -> DatabaseBackend:
+    normalized = value.strip().lower()
+    if normalized not in SUPPORTED_DATABASES:
+        supported = ", ".join(SUPPORTED_DATABASES)
+        raise ValueError(
+            f"Unsupported [database].database value {value!r}; expected one of: {supported}"
+        )
+    return normalized  # type: ignore[return-value]
+
+
+def database_config_for_backend(
+    config: CloudraveConfig,
+    backend: DatabaseBackend | str,
+) -> CloudraveConfig:
+    """Return a config targeting one of the configured database profiles.
+
+    Environment and explicit URL overrides are intentionally not applied here.
+    This helper is used only by the database switch controller after it has
+    verified that the installation is managed by the split config.ini fields.
+    """
+
+    normalized = normalize_database_backend(backend)
+    current = config.database
+    if normalized == "postgresql":
+        user = quote_plus(current.postgresql_user)
+        password = quote_plus(current.postgresql_password)
+        url = (
+            f"postgresql+asyncpg://{user}:{password}@"
+            f"{current.postgresql_host}:{current.postgresql_port}/{current.postgresql_name}"
+        )
+    elif normalized == "mysql":
+        user = quote_plus(current.mysql_user)
+        password = quote_plus(current.mysql_password)
+        url = (
+            f"mysql+aiomysql://{user}:{password}@"
+            f"{current.mysql_host}:{current.mysql_port}/{current.mysql_name}"
+        )
+    else:
+        sqlite_path = Path(current.sqlite_path)
+        resolved_path = (
+            (config.root_dir / sqlite_path).resolve()
+            if not sqlite_path.is_absolute()
+            else sqlite_path.resolve()
+        )
+        url = f"sqlite+aiosqlite:///{resolved_path.as_posix()}"
+
+    return replace(
+        config,
+        database=replace(current, backend=normalized, url=url),
+    )
+
+
+def database_management_source(parser: ConfigParser | None = None) -> str:
+    """Describe which setting currently controls the database connection."""
+
+    if getenv("CLOUDRAVE_DATABASE_URL"):
+        return "environment"
+    if parser is not None and parser.get("database", "url", fallback="").strip():
+        return "url"
+    return "config"
 
 
 def _ensure_auth_secrets(parser: ConfigParser) -> bool:
@@ -321,6 +417,17 @@ def _ensure_auth_secrets(parser: ConfigParser) -> bool:
         parser["auth"]["share_signing_key"] = _generate_secret(48)
         changed = True
 
+    return changed
+
+
+def _ensure_storage_secret(parser: ConfigParser) -> bool:
+    changed = False
+    if not parser.has_section("storage"):
+        parser["storage"] = {}
+        changed = True
+    if not parser.get("storage", "credential_key", fallback="").strip():
+        parser["storage"]["credential_key"] = _generate_secret(48)
+        changed = True
     return changed
 
 

@@ -7,7 +7,7 @@ from contextlib import closing
 
 from fastapi import HTTPException, Request, status
 
-from models.enums import NodeType, StoragePolicyType
+from models.enums import NodeType
 from models.tables import User
 from repositories.nodes import _unique_name
 from services.explorer.archive import ArchiveService
@@ -31,10 +31,8 @@ class SharedIo:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Folders cannot be previewed")
         node, mount, policy = await self.source.resolve_shared(node.id)
         adapter = self.source.storage_manager.get_adapter(policy)
-        if policy.provider == StoragePolicyType.LOCAL_FS:
-            local_path = self.source.storage_manager.local_path(policy, mount, node.blob_path)
-            if local_path is None:
-                raise RuntimeError("Local filesystem policy has no local adapter")
+        local_path = self.source.storage_manager.local_path(policy, mount, node.blob_path)
+        if local_path is not None:
             return build_local_preview_response(
                 request,
                 local_path,
@@ -51,12 +49,16 @@ class SharedIo:
             filename=node.name,
         )
 
-    async def download(self, actor: User, mount_id: int, node_id: int):
+    async def download(self, request: Request, actor: User, mount_id: int, node_id: int):
         share, node = await self.shared.resolve_node(actor, mount_id, node_id)
         if node.type == NodeType.FILE:
             resolved = await self.source.resolve_shared(node.id)
-            response = await self.source.response(*resolved)
+            if request.method == "HEAD":
+                return await self.source.probe_response(*resolved)
+            response = await self.source.response(*resolved, request=request)
         else:
+            if request.method == "HEAD":
+                return await self.archive.probe_response([node], filename=node.name)
             response = await self.archive.response([node], filename=node.name)
         await self.shared.source.record_download(share)
         return response

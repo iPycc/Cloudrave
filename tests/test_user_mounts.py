@@ -11,6 +11,7 @@ from starlette.requests import Request
 import models  # noqa: F401
 from api.v1.mount import require_mount_manager, router
 from db.base import Base
+from drives.registry import default_drive_registry
 from models.enums import NodeStatus, NodeType, StoragePolicyType, UserRole, UserStatus
 from models.tables import Node, User
 from repositories.audit_logs import AuditLogRepository
@@ -21,9 +22,12 @@ from repositories.uploads import UploadRepository
 from schemas.policy import StoragePolicyCreate, StoragePolicyUpdate
 from schemas.user_mount import UserBucketMountCreate, UserMountCreate, UserMountUpdate
 from services.user.mount import OWNER_KEY, USER_MANAGED_KEY, UserMountService
+from store.types import StorageCapability
 
 
 class _Adapter:
+    capabilities = StorageCapability(upload_transport="presigned")
+
     def __init__(self) -> None:
         self.validated = 0
         self.cors = 0
@@ -40,9 +44,32 @@ class _Adapter:
 class _StorageManager:
     def __init__(self) -> None:
         self.adapter = _Adapter()
+        self.adapters = {"tencent_cos": self.adapter}
+        self.credential_fields = ["secret_id", "secret_key"]
 
     def get_adapter(self, _policy):
         return self.adapter
+
+    def definition_for(self, provider):
+        assert getattr(provider, "value", provider) == "tencent_cos"
+        return SimpleNamespace(label="Tencent COS", kind="object_storage")
+
+    def credentials_from_payload(self, _provider, payload, *, current=None):
+        fields = {
+            key: value
+            for key in ("secret_id", "secret_key", "session_token")
+            if (value := getattr(payload, key, None))
+        }
+        if fields:
+            self.credential_fields = sorted(fields)
+            return "encrypted-test-credentials", 1
+        return current.credential_ciphertext, current.credential_version
+
+    def credential_state(self, _policy):
+        return True, self.credential_fields
+
+    def validate_user_mount(self, provider, actor, mount_slug, extra):
+        default_drive_registry().require(provider).validate_user_mount(actor, mount_slug, extra)
 
 
 def _request() -> Request:
@@ -140,13 +167,15 @@ async def test_user_mount_crud_is_owner_scoped_and_policy_is_atomic() -> None:
 
         assert created.mount.owner_id == actor.id
         assert created.mount.policy_id == policy_id
-        assert created.policy.secret_id != "abcdefgh12345678"
+        assert created.policy.credentials_configured is True
+        assert created.policy.credential_fields == ["secret_id", "secret_key"]
         assert storage_manager.adapter.validated == 1
 
         policy = await StoragePolicyRepository(session).get_by_id(policy_id)
         assert policy is not None
         assert policy.extra[OWNER_KEY] == actor.id
         assert policy.extra[USER_MANAGED_KEY] is True
+        assert policy.credential_ciphertext == "encrypted-test-credentials"
 
         with pytest.raises(HTTPException) as exc_info:
             await service.get_mount(other, mount_id)
@@ -205,7 +234,7 @@ async def test_local_mount_cannot_escape_user_upload_directory() -> None:
         nodes=SimpleNamespace(),
         uploads=SimpleNamespace(),
         audits=SimpleNamespace(),
-        storage_manager=SimpleNamespace(),
+        storage_manager=_StorageManager(),
     )
     payload = UserBucketMountCreate(
         name="Local",

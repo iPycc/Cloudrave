@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from models.tables import BucketMount, StoragePolicy
 from store.manager import StorageManager
 from store.key import is_managed_key
+from store.call import call_adapter
 
 
 @dataclass(slots=True, frozen=True)
@@ -40,7 +41,9 @@ class BucketScanner:
         page_size: int,
     ) -> BucketPage:
         adapter = self.storage_manager.get_adapter(policy)
-        page = await adapter.alist_objects(
+        page = await call_adapter(
+            adapter,
+            "list_objects",
             policy,
             mount,
             prefix="",
@@ -64,7 +67,7 @@ class BucketScanner:
                 )
             )
         if page.is_truncated and (not page.next_marker or page.next_marker == cursor):
-            raise RuntimeError("COS returned a truncated page without a continuation marker")
+            raise RuntimeError("Storage drive returned a truncated page without a continuation marker")
         return BucketPage(
             items=tuple(items),
             next_cursor=page.next_marker,
@@ -74,7 +77,7 @@ class BucketScanner:
     async def exists(self, policy: StoragePolicy, mount: BucketMount, key: str) -> bool:
         adapter = self.storage_manager.get_adapter(policy)
         try:
-            await adapter.ahead_object(policy, mount, key)
+            await call_adapter(adapter, "head_object", policy, mount, key)
         except Exception:
             return False
         return True

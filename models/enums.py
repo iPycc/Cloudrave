@@ -22,8 +22,11 @@ class SessionStatus(StrEnum):
 
 
 class StoragePolicyType(StrEnum):
+    """Deprecated value constants; provider validation now lives in DriveRegistry."""
+
     LOCAL_FS = "local_fs"
     TENCENT_COS = "tencent_cos"
+    ALIYUN_OSS = "aliyun_oss"
 
 
 class NodeType(StrEnum):

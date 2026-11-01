@@ -58,6 +58,16 @@ a = Analysis(
         "webauthn.helpers.cose",
         # Tencent COS
         *collect_submodules("qcloud_cos"),
+        # Aliyun OSS and built-in drive registry
+        # The async SDK facade has an optional aiohttp dependency. Cloudrave's
+        # adapter deliberately uses the synchronous client behind its shared
+        # async call bridge, so only collect the modules used by that client.
+        *collect_submodules(
+            "alibabacloud_oss_v2",
+            filter=lambda name: not name.startswith("alibabacloud_oss_v2.aio"),
+        ),
+        *collect_submodules("drives"),
+        *collect_submodules("store.oss"),
         # SQLAlchemy / models
         "sqlalchemy.ext.asyncio",
         "models",

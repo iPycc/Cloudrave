@@ -5,7 +5,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from sqlalchemy import BigInteger, Index, JSON, Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Index, JSON, Boolean, Enum, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from models.enums import (
@@ -13,13 +14,13 @@ from models.enums import (
     NodeType,
     SessionStatus,
     ShareAccess,
-    StoragePolicyType,
     UploadMode,
     UploadState,
     UserRole,
     UserStatus,
 )
 from db.base import Base
+from db.types import precise_datetime as DateTime
 
 
 def utcnow() -> datetime:
@@ -141,7 +142,7 @@ class StoragePolicy(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(128), unique=True)
-    provider: Mapped[StoragePolicyType] = mapped_column(Enum(StoragePolicyType, native_enum=False))
+    provider: Mapped[str] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(32), default="active")
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     bucket_name: Mapped[str] = mapped_column(String(255))
@@ -151,6 +152,8 @@ class StoragePolicy(Base, TimestampMixin):
     secret_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     secret_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     session_token: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    credential_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+    credential_version: Mapped[int] = mapped_column(Integer, default=1)
     multipart_threshold_mb: Mapped[int] = mapped_column(Integer, default=64)
     part_size_mb: Mapped[int] = mapped_column(Integer, default=16)
     presign_ttl_seconds: Mapped[int] = mapped_column(Integer, default=900)
@@ -324,10 +327,11 @@ class UploadSessionRecord(Base, TimestampMixin):
     path: Mapped[str] = mapped_column(String(1024))
     mode: Mapped[UploadMode] = mapped_column(Enum(UploadMode, native_enum=False))
     state: Mapped[UploadState] = mapped_column(Enum(UploadState, native_enum=False), default=UploadState.CREATED)
-    upload_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    upload_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     file_name: Mapped[str] = mapped_column(String(255))
     content_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
     checksum: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    provider_checksum: Mapped[str | None] = mapped_column(String(128), nullable=True)
     size: Mapped[int] = mapped_column(BigInteger, default=0)
     part_size: Mapped[int] = mapped_column(BigInteger, default=0)
 
@@ -351,7 +355,9 @@ class AuditLog(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     actor_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     action: Mapped[str] = mapped_column(String(32))
-    target: Mapped[str] = mapped_column(String(255))
+    # Batch operations can reference thousands of node IDs. SQLite does not
+    # enforce VARCHAR lengths, while MySQL does, so use a real long-text type.
+    target: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"))
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
     user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)

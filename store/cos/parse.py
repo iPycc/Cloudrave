@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from store.types import StorageObject, StorageObjectPage
-from store.cos.key import logical_key
+from store.key import logical_key
 
 
 def one_or_many(value: Any) -> list[dict[str, Any]]:

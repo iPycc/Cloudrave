@@ -7,7 +7,6 @@ import mimetypes
 from fastapi import APIRouter, Depends, Query, Request
 
 from web.mid.auth import get_current_user
-from models.enums import StoragePolicyType
 from models.tables import User
 from services.explorer.preview import build_local_preview_response
 from services.explorer.proxy import remote_response
@@ -18,31 +17,43 @@ router = APIRouter()
 
 
 @router.get("/download/archive")
+@router.head("/download/archive", include_in_schema=False)
 async def download_archive(
     request: Request,
     node_ids: list[int] = Query(...),
+    download_name: str | None = Query(None, max_length=240),
     current_user: User = Depends(get_current_user),
 ):
     dep = request.app.state.dep
     async with dep.session_scope() as session:
         service = node_service(dep, session)
-        return await service.download_nodes(request, current_user, node_ids, filename="Cloudrave-download")
+        return await service.download_nodes(
+            request,
+            current_user,
+            node_ids,
+            filename=download_name or "Cloudrave-download",
+        )
 
 
 @router.get("/download/{node_id}")
+@router.head("/download/{node_id}", include_in_schema=False)
 async def download_file(
     node_id: int,
     request: Request,
+    relay: bool = Query(False),
     current_user: User = Depends(get_current_user),
 ):
     dep = request.app.state.dep
     async with dep.session_scope() as session:
         service = download_service(dep, session)
         node, mount, policy = await service.resolve(current_user, node_id)
-        return await service.response(node, mount, policy)
+        if request.method == "HEAD":
+            return await service.probe_response(node, mount, policy)
+        return await service.response(node, mount, policy, request=request, relay=relay)
 
 
 @router.get("/download/folder/{node_id}")
+@router.head("/download/folder/{node_id}", include_in_schema=False)
 async def download_folder(
     node_id: int,
     request: Request,
@@ -67,10 +78,8 @@ async def preview_file(
         node, mount, policy = await service.resolve(current_user, node_id)
         adapter = dep.storage_manager.get_adapter(policy)
         content_type = mimetypes.guess_type(node.name)[0] or "application/octet-stream"
-        if policy.provider == StoragePolicyType.LOCAL_FS:
-            local_path = dep.storage_manager.local_path(policy, mount, node.blob_path)
-            if local_path is None:
-                raise RuntimeError("Local filesystem policy has no local adapter")
+        local_path = dep.storage_manager.local_path(policy, mount, node.blob_path)
+        if local_path is not None:
             return build_local_preview_response(
                 request,
                 local_path,

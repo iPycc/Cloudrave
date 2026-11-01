@@ -19,6 +19,7 @@ class UploadSessionCreate(CloudraveSchema):
     file_name: str = Field(min_length=1, max_length=255)
     relative_path: str | None = Field(default=None, max_length=2048)
     checksum: str | None = Field(default=None, max_length=128)
+    provider_checksum: str | None = Field(default=None, max_length=128)
     object_key: str | None = None
     mode: UploadMode = UploadMode.AUTO
     size: int = Field(ge=0, le=MAX_OBJECT_SIZE)
@@ -57,6 +58,12 @@ class UploadPartPlan(CloudraveSchema):
     url: str
     headers: dict[str, str] = Field(default_factory=dict)
     expires_at: datetime | None = None
+    body_mode: str = "raw"
+    form_fields: dict[str, str] = Field(default_factory=dict)
+    file_field: str = "file"
+    record_etag: str | None = None
+    response_mode: str = "header"
+    relay_url: str | None = None
 
 
 class UploadSessionPlan(CloudraveSchema):
@@ -70,6 +77,9 @@ class UploadSessionPlan(CloudraveSchema):
     expires_at: datetime | None = None
     is_duplicate: bool = False
     node_id: int | None = None
+    transport: str = "presigned"
+    required_response_headers: list[str] = Field(default_factory=list)
+    part_checksum_algorithm: str | None = None
 
 
 class UploadPartComplete(CloudraveSchema):
@@ -97,10 +107,14 @@ class UploadSessionRead(CloudraveSchema):
     file_name: str
     content_type: str | None
     checksum: str | None = None
+    provider_checksum: str | None = None
     size: int
     part_size: int
     created_at: datetime
     updated_at: datetime
+    transport: str
+    required_response_headers: list[str] = Field(default_factory=list)
+    part_checksum_algorithm: str | None = None
     parts: list[UploadPartRead] = Field(default_factory=list)
 
 

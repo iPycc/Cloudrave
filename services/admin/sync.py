@@ -1,4 +1,4 @@
-"""Mirror a COS bucket prefix into Cloudrave's node/object metadata."""
+"""Mirror an object-storage prefix into Cloudrave's node/object metadata."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from fastapi import HTTPException, Request, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.enums import NodeStatus, NodeType, StoragePolicyType
+from models.enums import NodeStatus, NodeType
 from models.tables import BucketMount, Node, StoragePolicy, User
 from repositories.audit_logs import AuditLogRepository
 from repositories.blobs import BlobUnavailable
@@ -95,10 +95,10 @@ class MountSyncService:
         policy = await self.policies.get_by_id(mount.policy_id)
         if policy is None or policy.status != "active":
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Storage policy not found")
-        if policy.provider != StoragePolicyType.TENCENT_COS:
+        if not self.scanner.storage_manager.get_adapter(policy).capabilities.supports_mirror:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Bucket mirror synchronization currently requires a Tencent COS policy",
+                detail="This storage drive does not support bucket mirror synchronization",
             )
 
         state = self._state(mount)
@@ -106,7 +106,7 @@ class MountSyncService:
             state = self._new_state()
             await self.mounts.save_sync_state(mount, state)
 
-        # Release the row lock before the remote COS request. The generation and
+        # Release the row lock before the remote provider request. The generation and
         # cursor below act as an optimistic page token when the response returns.
         await self.session.commit()
         return mount, policy, dict(state)
@@ -140,7 +140,7 @@ class MountSyncService:
                 mount.policy_id != policy.id
                 or current_policy is None
                 or current_policy.status != "active"
-                or current_policy.provider != StoragePolicyType.TENCENT_COS
+                or not self.scanner.storage_manager.get_adapter(current_policy).capabilities.supports_mirror
             ):
                 invalid_reason = "Storage policy changed while the sync page was in flight"
 
@@ -152,7 +152,7 @@ class MountSyncService:
                 result = self._read(mount, failed)
             elif not self._same_page(current, expected):
                 # Another request already applied this cursor (or restarted the
-                # generation). Discard the stale COS response without replaying it.
+                # generation). Discard the stale provider response without replaying it.
                 result = self._read(mount, current)
             else:
                 next_state = dict(current)

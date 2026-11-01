@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Body, Depends, File, Form, Request, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, Query, Request, Response, UploadFile
 
 from web.mid.auth import get_current_user
 from models.tables import User
@@ -51,12 +51,15 @@ async def get_upload_part_url(
     session_id: str,
     part_number: int,
     request: Request,
+    response: Response,
+    part_checksum: str | None = Query(default=None, max_length=128),
     current_user: User = Depends(get_current_user),
 ) -> UploadPartPlan:
     dep = request.app.state.dep
+    response.headers["Cache-Control"] = "private, no-store"
     async with dep.session_scope() as session:
         service = upload_service(dep, session)
-        return await service.part_url(current_user, session_id, part_number)
+        return await service.part_url(current_user, session_id, part_number, part_checksum=part_checksum)
 
 
 @router.post("/upload/{session_id}/part", response_model=UploadPartRead)

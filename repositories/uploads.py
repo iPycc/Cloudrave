@@ -29,6 +29,7 @@ class UploadRepository:
         size: int,
         part_size: int,
         checksum: str | None = None,
+        provider_checksum: str | None = None,
         state: UploadState = UploadState.CREATED,
     ) -> UploadSessionRecord:
         record = UploadSessionRecord(
@@ -42,6 +43,7 @@ class UploadRepository:
             file_name=file_name,
             content_type=content_type,
             checksum=checksum,
+            provider_checksum=provider_checksum,
             size=size,
             part_size=part_size,
         )

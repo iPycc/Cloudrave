@@ -91,12 +91,23 @@ class Dep:
             await create_schema(self.engine)
         except (OSError, SQLAlchemyError) as exc:
             raise RuntimeError(
-                "Cloudrave 无法连接数据库。"
+                "Cloudrave 已连接数据库，但初始化或升级数据库结构失败。"
                 f" 当前配置: {self._mask_database_url(self.config.database.url)}。"
-                f" 请先启动 {self.config.database.backend}，或修改 {self.config.config_path} 中 [database] 的 database/url 配置。"
+                " 请检查此前输出的数据库迁移错误详情。"
             ) from exc
 
         LOGGER.info("Database schema and runtime migrations are ready.")
+
+        async with self.session_scope() as session:
+            from services.storage_credentials import migrate_storage_credentials
+
+            migrated = await migrate_storage_credentials(
+                session,
+                config=self.config,
+                storage_manager=self.storage_manager,
+            )
+            if migrated:
+                LOGGER.info("Encrypted credentials for %s storage policy record(s).", migrated)
 
         async with self.session_scope() as session:
             from services.admin.ids import ObjectIdService

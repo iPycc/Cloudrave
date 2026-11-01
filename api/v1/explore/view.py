@@ -9,7 +9,6 @@ from fastapi import APIRouter, Body, Depends, File, Form, Header, HTTPException,
 from fastapi.responses import Response
 
 from web.mid.auth import get_current_user
-from models.enums import StoragePolicyType
 from models.tables import User
 from schemas.preview import (
     OfficeCardPreviewRead,
@@ -357,10 +356,8 @@ async def office_source(node_id: int, token: str, request: Request):
         service = preview_service(dep, session)
         node, mount, policy = await service.resolver.resolve_shared(node_id)
         service.validate_office_token(token, node)
-        if policy.provider == StoragePolicyType.LOCAL_FS:
-            local_path = dep.storage_manager.local_path(policy, mount, node.blob_path)
-            if local_path is None:
-                raise RuntimeError("Local filesystem policy has no local adapter")
+        local_path = dep.storage_manager.local_path(policy, mount, node.blob_path)
+        if local_path is not None:
             media_type = mimetypes.guess_type(node.name)[0] or "application/octet-stream"
             return build_local_preview_response(
                 request,

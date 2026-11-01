@@ -24,6 +24,7 @@ async def list_policies(request: Request, current_user: User = Depends(get_curre
             session=session,
             policies=dep.get_policy_repository(session),
             audits=dep.get_audit_repository(session),
+            storage_manager=dep.storage_manager,
         )
         return await service.list_policies()
 
@@ -37,6 +38,7 @@ async def get_policy(policy_id: int, request: Request, current_user: User = Depe
             session=session,
             policies=dep.get_policy_repository(session),
             audits=dep.get_audit_repository(session),
+            storage_manager=dep.storage_manager,
         )
         return await service.get_policy(policy_id)
 
@@ -54,6 +56,7 @@ async def create_policy(
             session=session,
             policies=dep.get_policy_repository(session),
             audits=dep.get_audit_repository(session),
+            storage_manager=dep.storage_manager,
         )
         return await service.create_policy(request, current_user, payload)
 
@@ -72,6 +75,7 @@ async def update_policy(
             session=session,
             policies=dep.get_policy_repository(session),
             audits=dep.get_audit_repository(session),
+            storage_manager=dep.storage_manager,
         )
         return await service.update_policy(request, current_user, policy_id, payload)
 
@@ -85,6 +89,7 @@ async def delete_policy(policy_id: int, request: Request, current_user: User = D
             session=session,
             policies=dep.get_policy_repository(session),
             audits=dep.get_audit_repository(session),
+            storage_manager=dep.storage_manager,
         )
         await service.delete_policy(request, current_user, policy_id)
         return MessageResponse(message="Storage policy deleted")

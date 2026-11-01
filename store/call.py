@@ -17,7 +17,13 @@ async def call_adapter(adapter: Any, method: str, /, *args: Any, **kwargs: Any) 
     async_method = getattr(adapter, f"a{method}", None)
     if async_method is not None:
         result = async_method(*args, **kwargs)
-        return await result if inspect.isawaitable(result) else result
-
-    sync_method = getattr(adapter, method)
-    return await asyncio.to_thread(sync_method, *args, **kwargs)
+        result = await result if inspect.isawaitable(result) else result
+    else:
+        sync_method = getattr(adapter, method)
+        result = await asyncio.to_thread(sync_method, *args, **kwargs)
+    # Apply ORM credential changes on the event-loop thread, after synchronous
+    # provider IO has finished. Failures are saved by the background worker.
+    on_success = getattr(adapter, "_on_call_success", None)
+    if on_success is not None:
+        on_success()
+    return result

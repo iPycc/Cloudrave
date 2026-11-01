@@ -19,7 +19,7 @@ from models.tables import User
 from repositories.mounts import BucketMountRepository
 from repositories.nodes import NodeRepository
 from repositories.policies import StoragePolicyRepository
-from services.explorer.source import content_disposition
+from services.explorer.source import content_disposition, download_probe_response
 from store.manager import StorageManager
 
 if TYPE_CHECKING:
@@ -194,6 +194,24 @@ class ArchiveService:
                 "X-Content-Type-Options": "nosniff",
             },
         )
+
+    async def probe_response(self, roots: list["Node"], *, filename: str):
+        """Use native browser downloads when an archive reads an operator mount."""
+
+        mode = "cloudrave"
+        for mount_id in {node.mount_id for node in roots}:
+            mount = await self.mounts.get_by_id(mount_id)
+            if mount is None or not getattr(mount, "is_enabled", True):
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bucket mount not found")
+            policy = await self.policies.get_by_id(mount.policy_id)
+            if policy is None or getattr(policy, "status", "active") != "active":
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Storage policy not found")
+            adapter = self.storage_manager.get_adapter(policy)
+            if getattr(adapter.capabilities, "download_transport", "cloudrave") == "browser":
+                mode = "browser"
+                break
+        archive_name = filename if filename.lower().endswith(".zip") else f"{filename}.zip"
+        return download_probe_response(archive_name, mode)
 
     async def build_archive_response(self, roots: list["Node"], *, filename: str) -> StreamingResponse:
         """Compatibility name used by the current explorer and share services."""

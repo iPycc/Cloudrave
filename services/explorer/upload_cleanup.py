@@ -12,6 +12,7 @@ from repositories.uploads import UploadRepository
 from services.explorer.up_abort import cleanup_upload
 from services.explorer.up_check import build_upload_state
 from store.manager import StorageManager
+from drives.remote_drive.common import RemoteAuthenticationError
 
 
 # Paused browser uploads must outlive a tab refresh or a return on another day.
@@ -48,6 +49,10 @@ class UploadCleanup:
             try:
                 if await self._cleanup_record(record):
                     cleaned += 1
+            except RemoteAuthenticationError:
+                # Keep provider remnants for retry after reauthorization.
+                await self.uploads.set_state(record.id, UploadState.FAILED)
+                self.log.warning("Upload cleanup deferred for session %s: storage reauthorization required", record.id)
             except Exception:
                 await self.uploads.set_state(record.id, UploadState.FAILED)
                 self.log.exception("Upload remnant cleanup failed for session %s", record.id)

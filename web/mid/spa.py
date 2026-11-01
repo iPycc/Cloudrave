@@ -19,7 +19,7 @@ class SpaFallbackMiddleware:
             return
 
         path = scope.get("path", "")
-        if path.startswith("/api/"):
+        if path in ("/api", "/assets") or path.startswith(("/api/", "/assets/")):
             await self.app(scope, receive, send)
             return
 
@@ -34,45 +34,42 @@ class SpaFallbackMiddleware:
             await self.app(scope, receive, send)
             return
 
-        status_code = None
-        response_started = False
+        fallback_body = None
 
         async def wrapped_send(message):
-            nonlocal status_code, response_started
+            nonlocal fallback_body
             if message["type"] == "http.response.start":
-                status_code = message["status"]
-                if status_code != 404:
-                    response_started = True
-                    await send(message)
-                    return
-                # Replace 404 with index.html
-                response_started = True
-                await send({
-                    "type": "http.response.start",
-                    "status": 200,
-                    "headers": [
-                        (b"content-type", b"text/html; charset=utf-8"),
-                    ],
-                })
-            elif message["type"] == "http.response.body" and status_code == 404:
-                if not self.index_html.is_file():
+                if message["status"] == 404:
+                    try:
+                        fallback_body = await asyncio.to_thread(self.index_html.read_bytes)
+                    except OSError:
+                        # Preserve the original 404 if the entrypoint is unavailable.
+                        pass
+                    else:
+                        # Retain security, request-id and cookie headers, replacing
+                        # metadata belonging to the original error document.
+                        replaced_headers = {
+                            b"content-type", b"content-length", b"content-encoding",
+                            b"content-range", b"etag", b"last-modified", b"cache-control",
+                        }
+                        response_headers = [
+                            (key, value) for key, value in message.get("headers", [])
+                            if key.lower() not in replaced_headers
+                        ]
+                        response_headers.extend([
+                            (b"content-type", b"text/html; charset=utf-8"),
+                            (b"content-length", str(len(fallback_body)).encode("ascii")),
+                            (b"cache-control", b"no-cache"),
+                        ])
+                        message = {**message, "status": 200, "headers": response_headers}
+                await send(message)
+            elif message["type"] == "http.response.body" and fallback_body is not None:
+                # BaseHTTPMiddleware streams the 404 and then emits an empty
+                # final chunk. Drain all chunks and finish the replacement once.
+                if not message.get("more_body", False):
                     await send({
                         "type": "http.response.body",
-                        "body": b"Not Found",
-                        "more_body": False,
-                    })
-                    return
-                if method == "HEAD":
-                    await send({
-                        "type": "http.response.body",
-                        "body": b"",
-                        "more_body": False,
-                    })
-                else:
-                    body = await asyncio.to_thread(self.index_html.read_bytes)
-                    await send({
-                        "type": "http.response.body",
-                        "body": body,
+                        "body": b"" if method == "HEAD" else fallback_body,
                         "more_body": False,
                     })
             else:

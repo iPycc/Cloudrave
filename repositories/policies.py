@@ -37,13 +37,18 @@ class StoragePolicyRepository:
         return bool(count)
 
     async def create(self, payload: StoragePolicyCreate) -> StoragePolicy:
-        policy = StoragePolicy(**payload.model_dump())
+        policy = StoragePolicy(**payload.model_dump(exclude={
+            "credentials", "secret_id", "secret_key", "session_token"
+        }))
         self.session.add(policy)
         await self.session.flush()
         return policy
 
     async def update(self, policy: StoragePolicy, payload: StoragePolicyUpdate) -> StoragePolicy:
-        for key, value in payload.model_dump(exclude_unset=True).items():
+        for key, value in payload.model_dump(
+            exclude_unset=True,
+            exclude={"credentials", "secret_id", "secret_key", "session_token"},
+        ).items():
             if key == "extra":
                 value = {**(policy.extra or {}), **(value or {})}
             setattr(policy, key, value)

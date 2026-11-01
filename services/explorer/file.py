@@ -107,7 +107,7 @@ class FileExplorerService:
             policy.id: policy
             for policy in await self.policies.list_by_ids([mount.policy_id for mount in mounts])
         }
-        return [mount_read(mount, policies.get(mount.policy_id)) for mount in mounts]
+        return [mount_read(mount, policies.get(mount.policy_id), self.storage_manager) for mount in mounts]
 
     async def list_children(self, actor: User, mount_id: int, parent_id: int | None = None) -> list[NodeRead]:
         mount, _policy = await self._require_mount_access(actor, mount_id)
@@ -638,6 +638,8 @@ class FileExplorerService:
             storage_manager=self.storage_manager,
         )
         roots = await archive_service.resolve_owned_roots(actor, node_ids)
+        if request.method == "HEAD":
+            return await archive_service.probe_response(roots, filename=filename)
         response = await archive_service.build_archive_response(roots, filename=filename)
         await self.audits.create(
             actor_id=actor.id,
