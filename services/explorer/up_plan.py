@@ -21,7 +21,7 @@ def _window(extra: dict) -> int:
     return max(1, min(value, 64))
 
 
-async def sign_part(adapter, policy, mount, upload, part_number: int) -> UploadPartPlan:
+async def sign_part(adapter, policy, mount, upload, part_number: int, *, relay_url: str | None = None) -> UploadPartPlan:
     presigned = await call_adapter(adapter, "presign_part", policy, mount, upload, part_number)
     return UploadPartPlan(
         part_number=part_number,
@@ -34,6 +34,7 @@ async def sign_part(adapter, policy, mount, upload, part_number: int) -> UploadP
         file_field=presigned.file_field,
         record_etag=presigned.record_etag,
         response_mode=presigned.response_mode,
+        relay_url=relay_url,
     )
 
 
@@ -148,8 +149,13 @@ async def make_plan(*, uploads, storage_manager, policy, mount, parent, file_nam
             for number in range(1, window + 1)
         ]
     else:
+        relay_url = (
+            f"/api/v1/explorer/upload/{record.id}/part"
+            if getattr(adapter, "supports_relay_upload", False)
+            else None
+        )
         urls = await asyncio.gather(
-            *(sign_part(adapter, policy, mount, upload, number) for number in range(1, window + 1))
+            *(sign_part(adapter, policy, mount, upload, number, relay_url=relay_url) for number in range(1, window + 1))
         )
     return record, UploadSessionPlan(
         session_id=record.id,

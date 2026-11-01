@@ -257,12 +257,18 @@ class CreateUploadSessionService:
         upload_state = self._build_upload_state(record, policy, mount)
         if part_checksum:
             upload_state.metadata["part_checksum"] = part_checksum
+        relay_url = (
+            f"/api/v1/explorer/upload/{record.id}/part"
+            if getattr(adapter, "supports_relay_upload", False)
+            else None
+        )
         return await sign_part(
             adapter,
             policy,
             mount,
             upload_state,
             part_number,
+            relay_url=relay_url,
         )
 
     async def heartbeat(self, actor: User, session_id: str) -> None:
@@ -292,16 +298,19 @@ class CreateUploadSessionService:
 
         resolved_etag = etag
         resolved_size = size
-        if adapter.capabilities.upload_transport == "cloudrave":
+        if file is not None or adapter.capabilities.upload_transport == "cloudrave":
             if file is None:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Local upload requires file content")
+            await file.seek(0)
+            upload_state = self._build_upload_state(record, policy, mount)
+            upload_state.metadata["part_checksum"] = hashlib.md5(await file.read(expected_size + 1)).hexdigest()
             await file.seek(0)
             part = await call_adapter(
                 adapter,
                 "upload_part",
                 policy,
                 mount,
-                self._build_upload_state(record, policy, mount),
+                upload_state,
                 part_number,
                 file.file,
             )

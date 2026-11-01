@@ -32,6 +32,7 @@ class RemoteDirectAdapter(RemoteMirrorAdapter):
 
     def __init__(self, provider_type: str, client_factory: ClientFactory, staging_root: Path) -> None:
         super().__init__(provider_type, client_factory, staging_root)
+        self.supports_relay_upload = True
         upload_transport = getattr(client_factory, "UPLOAD_TRANSPORT", "presigned")
         self._parent_lock = Lock()
         self.capabilities = StorageCapability(
@@ -211,10 +212,19 @@ class RemoteDirectAdapter(RemoteMirrorAdapter):
             )
         return self._storage_object(mount, self._remember(policy, mount, key, entry))
 
-    @staticmethod
-    def copy_object(*args, **kwargs):
-        _ = (args, kwargs)
-        raise NotImplementedError("运营商云盘的物理对象复制不允许退回 Cloudrave 中转")
+    def copy_object(self, policy, mount, source_key: str, destination_key: str) -> StorageObject:
+        if normalize_object_key(source_key) == normalize_object_key(destination_key):
+            raise ValueError("源文件和目标文件不能相同")
+        source = self.head_object(policy, mount, source_key)
+        with self.open_object(policy, mount, source_key) as body:
+            return self.put_object(
+                policy,
+                mount,
+                destination_key,
+                body,
+                mime_type=source.mime_type,
+                metadata=source.metadata,
+            )
 
     @staticmethod
     def presign_put(*args, **kwargs):

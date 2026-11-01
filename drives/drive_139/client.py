@@ -325,6 +325,18 @@ class Drive139Client:
             record_etag=f"part:{part_number}",
         )
 
+    def upload_part(self, upload: MultipartUploadState, part_number: int, body) -> MultipartPart:
+        state = decode_upload_state(upload.provider_upload_id or upload.upload_id)
+        part_size = int(state["z"])
+        expected_size = min(part_size, max(0, int(state["s"]) - (part_number - 1) * part_size))
+        content = body if isinstance(body, bytes) else body.read(expected_size + 1)
+        if len(content) != expected_size:
+            raise RemoteProtocolError(f"移动云盘上传分片大小无效：预期 {expected_size} 字节，实际 {len(content)} 字节")
+        plan = self.part_plan(upload, part_number)
+        response = self._http.put(plan.url, content=content, headers=plan.headers)
+        response.raise_for_status()
+        return MultipartPart(part_number, plan.record_etag or f"part:{part_number}", expected_size)
+
     def complete_upload(
         self,
         upload: MultipartUploadState,

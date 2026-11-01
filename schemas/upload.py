@@ -63,6 +63,7 @@ class UploadPartPlan(CloudraveSchema):
     file_field: str = "file"
     record_etag: str | None = None
     response_mode: str = "header"
+    relay_url: str | None = None
 
 
 class UploadSessionPlan(CloudraveSchema):
