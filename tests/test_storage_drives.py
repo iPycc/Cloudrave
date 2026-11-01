@@ -12,6 +12,7 @@ from db.base import create_schema, make_async_engine
 from db.mig.v6 import upgrade as upgrade_v6
 from db.mig.v7 import upgrade as upgrade_v7
 from drives.credentials import CredentialVault
+from drives.drive_wo import DriveWoClient
 from drives.ids import provider_id
 from drives.registry import default_drive_registry
 from models.tables import StoragePolicy
@@ -22,11 +23,25 @@ from store.oss.driver import AliyunOssAdapter
 from store.oss.stream import OssStream
 
 
-def test_builtin_drive_registry_exposes_three_independent_drivers() -> None:
+def test_builtin_drive_registry_exposes_independent_drivers() -> None:
     definitions = default_drive_registry().definitions
-    assert [item.id for item in definitions] == ["local_fs", "tencent_cos", "aliyun_oss"]
+    assert [item.id for item in definitions] == [
+        "local_fs",
+        "tencent_cos",
+        "aliyun_oss",
+        "drive_139",
+        "drive_189",
+        "drive_wo",
+    ]
     assert definitions[2].kind == "object_storage"
     assert definitions[2].credential_fields == ("access_key_id", "access_key_secret")
+
+
+def test_drive_wo_normalizes_url_encoded_cookie_token() -> None:
+    token = "bd1b68af-dab5-4201-a76d-e97797a0507e"
+    encoded = f"%22{token}%22"
+    assert DriveWoClient._extract_token(encoded) == token
+    assert DriveWoClient._extract_token(f"WoCloud-Web-Token={encoded}; other=value") == token
 
 
 @pytest.mark.parametrize(

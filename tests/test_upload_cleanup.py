@@ -72,6 +72,9 @@ async def test_failed_upload_is_cleaned_and_expired() -> None:
         upload_id=None,
         part_size=1,
         size=1,
+        checksum=None,
+        content_type=None,
+        file_name="orphan.bin",
     )
     mount = SimpleNamespace(id=3, policy_id=7)
     policy = SimpleNamespace(id=7, provider=SimpleNamespace(value="tencent_cos"))

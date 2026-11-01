@@ -89,6 +89,8 @@ async def test_sync_parts_replaces_stale_database_records(tmp_path):
 @pytest.mark.asyncio
 async def test_get_upload_reconciles_provider_parts_before_returning_session():
     class _Adapter:
+        capabilities = SimpleNamespace(supports_part_listing=True)
+
         def list_parts(self, policy, mount, upload):
             return [
                 MultipartPart(part_number=1, etag="etag-1", size=5),
