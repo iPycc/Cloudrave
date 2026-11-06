@@ -14,6 +14,7 @@ from urllib.parse import quote, urlsplit
 
 from store.key import logical_key, mount_prefix, physical_key, physical_list_prefix
 from store.oss.stream import OssStream
+from store.oss.download import download_settings
 from store.identity import physical_hash
 from store.errors import storage_error_code
 from store.port import StorageAdapterBase
@@ -86,15 +87,17 @@ class AliyunOssAdapter(StorageAdapterBase):
             "security_token": security_token,
         }
 
-    def _client_for(self, policy: Any) -> Any:
+    def _client_for(self, policy: Any, *, download: bool = False) -> Any:
         if not _OSS_SDK_AVAILABLE:
             raise RuntimeError("Aliyun OSS SDK V2 is not installed; install alibabacloud-oss-v2")
         target = self._target(policy)
+        mode, domain = download_settings(getattr(policy, "extra", None) or {}) if download else ("default", "")
+        endpoint = domain if mode == "origin" else target["endpoint"]
         credential_hash = sha256(
             f"{target['access_key_id']}\0{target['access_key_secret']}\0{target['security_token'] or ''}".encode()
         ).hexdigest()
         cache_key = (
-            str(target["region"]), str(target["endpoint"] or ""), credential_hash
+            str(target["region"]), str(endpoint or ""), mode, credential_hash
         )
         with self._clients_lock:
             client = self._clients.get(cache_key)
@@ -106,8 +109,9 @@ class AliyunOssAdapter(StorageAdapterBase):
                     target["security_token"],
                 )
                 config.region = str(target["region"])
-                if target["endpoint"]:
-                    config.endpoint = str(target["endpoint"])
+                if endpoint:
+                    config.endpoint = str(endpoint)
+                config.use_cname = mode == "origin"
                 client = oss.Client(config)
                 self._clients[cache_key] = client
                 if len(self._clients) > CLIENT_CACHE_SIZE:
@@ -446,11 +450,13 @@ class AliyunOssAdapter(StorageAdapterBase):
         inline: bool = False,
     ) -> PresignedURL:
         ttl = self._ttl(policy) if expires_in is None else int(expires_in)
-        disposition = None
+        if ttl <= 0:
+            raise ValueError("expires_in must be positive")
+        disposition = "inline" if inline else None
         if download_name:
             kind = "inline" if inline else "attachment"
             disposition = f"{kind}; filename*=UTF-8''{quote(download_name)}"
-        result = self._client_for(policy).presign(oss.GetObjectRequest(
+        result = self._client_for(policy, download=True).presign(oss.GetObjectRequest(
             bucket=self._bucket(policy),
             key=self._key(policy, mount, object_key),
             response_content_disposition=disposition,

@@ -120,6 +120,10 @@ class StorageManager:
         current: StoragePolicy | None = None,
     ) -> tuple[str | None, int]:
         definition = self.definition_for(provider)
+        if provider_id(provider) == "aliyun_oss":
+            from store.oss.download import download_settings
+
+            download_settings({**(getattr(current, "extra", None) or {}), **(getattr(payload, "extra", None) or {})})
         submitted = definition.normalize_submitted_credentials(payload)
 
         existing = self.credentials_for(current) if current is not None else {}
