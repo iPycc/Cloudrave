@@ -8,6 +8,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, sta
 from fastapi.responses import Response
 
 from web.mid.auth import get_current_user
+from web.mid.rate import share_password_rate_limit
 from models.tables import Node, ShareRecord, User
 from schemas.common import MessageResponse
 from schemas.preview import PreviewManifestRead
@@ -196,6 +197,7 @@ async def verify_share_password(
     share_id: str,
     request: Request,
     payload: ShareVerifyRequest = Body(default=ShareVerifyRequest()),
+    _rate_limit: None = Depends(share_password_rate_limit),
 ) -> ShareAccessTokenResponse:
     dep = request.app.state.dep
     async with dep.session_scope() as session:

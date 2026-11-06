@@ -98,3 +98,14 @@ async def login_rate_limit(request: Request) -> None:
     """FastAPI dependency for sensitive authentication endpoints."""
     client_ip = request.client.host if request.client else "unknown"
     _check_login_window(client_ip)
+
+
+async def share_password_rate_limit(request: Request, share_id: str) -> None:
+    from security.request_limits import consume_share_attempt
+
+    async with request.app.state.dep.session_scope() as session:
+        allowed = await consume_share_attempt(session,
+            request.client.host if request.client else "unknown", share_id)
+    if not allowed:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            detail="Too many share password attempts", headers={"Retry-After": "60"})
