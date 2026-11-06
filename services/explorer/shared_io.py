@@ -15,6 +15,7 @@ from services.explorer.preview import build_local_preview_response
 from services.explorer.proxy import remote_response
 from services.explorer.shared import SharedService
 from services.explorer.share import require_share_preview
+from services.explorer.write_policy import StorageWritePolicy
 from services.explorer.source import FileSourceService, download_probe_response
 from store.call import call_adapter
 from store.key import managed_key
@@ -76,14 +77,10 @@ class SharedIo:
         target_parent_id: int | None,
     ):
         share, source_node = await self.shared.resolve_node(actor, mount_id, node_id)
-        target_mount = await self.source.mounts.get_by_id(target_mount_id)
-        if target_mount is None or target_mount.owner_id != actor.id or not target_mount.is_enabled:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target mount not found")
-        if bool((target_mount.extra or {}).get("read_only")):
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Target mount is read-only")
-        target_policy = await self.source.policies.get_by_id(target_mount.policy_id)
-        if target_policy is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target storage policy not found")
+        writes = StorageWritePolicy(self.source.nodes.session)
+        target_mount, target_policy = await writes.check(actor, target_mount_id)
+        size = await self._subtree_size(source_node, set())
+        await writes.check(actor, target_mount_id, size)
         if target_parent_id is None:
             parent = await self.source.nodes.ensure_mount_root(
                 owner_id=actor.id,
@@ -97,10 +94,22 @@ class SharedIo:
                 or parent.owner_id != actor.id
                 or parent.mount_id != target_mount.id
                 or parent.type != NodeType.FOLDER
+                or parent.deleted_at is not None
             ):
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target folder not found")
         await self.shared.source.record_download(share)
         return await self._copy_shared_node(actor, source_node, target_mount, target_policy, parent.id)
+
+    async def _subtree_size(self, node, visited: set[int]) -> int:
+        if node.id in visited:
+            raise HTTPException(status_code=409, detail="Invalid shared folder tree")
+        visited.add(node.id)
+        if node.type == NodeType.FILE:
+            return node.size
+        total = 0
+        for child in await self.source.nodes.list_children(node.mount_id, node.id):
+            total += await self._subtree_size(child, visited)
+        return total
 
     async def _copy_shared_node(self, actor: User, source_node, target_mount, target_policy, target_parent_id: int):
         existing = await self.source.nodes.get_child_names(target_mount.id, target_parent_id)

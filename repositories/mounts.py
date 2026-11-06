@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.enums import UploadState
@@ -29,8 +29,14 @@ class BucketMountRepository:
         return await self.session.get(BucketMount, mount_id)
 
     async def get_by_id_for_update(self, mount_id: int) -> BucketMount | None:
+        if self.session.get_bind().dialect.name == "sqlite":
+            # SQLite ignores FOR UPDATE. A write obtains its transaction lock
+            # before quota is read, including concurrent upload reservations.
+            await self.session.execute(update(BucketMount).where(BucketMount.id == mount_id)
+                .values(quota_bytes=BucketMount.quota_bytes).execution_options(synchronize_session=False))
         return await self.session.scalar(
             select(BucketMount).where(BucketMount.id == mount_id).with_for_update()
+            .execution_options(populate_existing=True)
         )
 
     async def list_by_ids(self, mount_ids: list[int]) -> list[BucketMount]:

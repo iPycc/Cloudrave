@@ -50,7 +50,8 @@ class NodeRepository:
         return await self.session.get(Node, node_id)
 
     async def get_by_id_for_update(self, node_id: int) -> Node | None:
-        return await self.session.scalar(select(Node).where(Node.id == node_id).with_for_update())
+        return await self.session.scalar(select(Node).where(Node.id == node_id).with_for_update()
+                                         .execution_options(populate_existing=True))
 
     async def list_by_ids(self, node_ids: list[int]) -> list[Node]:
         if not node_ids:

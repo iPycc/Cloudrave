@@ -38,6 +38,7 @@ from schemas.node import (
 )
 from services.explorer.archive import ArchiveDownloadService
 from services.explorer.access import MountAccessPolicy
+from services.explorer.write_policy import StorageWritePolicy
 from services.explorer.gc import ObjectGc
 from services.user.response import build_avatar_url
 from store.call import call_adapter
@@ -580,6 +581,12 @@ class FileExplorerService:
 
         copied: list[NodeRead] = []
         id_map: dict[int, int] = {}
+        copy_size = 0
+        for root in nodes:
+            descendants = await self.nodes.collect_descendant_ids([root.id])
+            copy_size += sum(item.size for item in await self.nodes.list_by_ids(descendants)
+                             if item.type == NodeType.FILE)
+        await StorageWritePolicy(self.session).check(actor, mount_id, copy_size)
         source_ids = await self.nodes.collect_descendant_ids([node.id for node in nodes])
         source_object_ids = [node.id for node in await self.nodes.list_by_ids(source_ids) if node.type == NodeType.FILE and node.blob_path]
         source_objects = {obj.node_id: obj for obj in await self.objects.get_by_node_ids(source_object_ids)}

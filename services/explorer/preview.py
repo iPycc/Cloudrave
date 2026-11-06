@@ -34,6 +34,7 @@ from schemas.preview import (
 from security.jwt import AuthError, TokenService
 from security.capabilities import Capability, has_capability, require_capability
 from services.explorer.download import DownloadFileService
+from services.explorer.write_policy import StorageWritePolicy
 from services.explorer.view.arc import ARCHIVE_READ_ERRORS, ArcMixin
 from services.explorer.view.base import (
     DERIVED_CACHE_CONTROL,
@@ -490,8 +491,8 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
     ) -> TextContentUpdateRead:
         require_capability(actor, Capability.FILE_EDIT)
         node, mount, policy = await self.resolver.resolve(actor, node_id)
-        if mount.read_only:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bucket mount is read-only")
+        writes = StorageWritePolicy(self.nodes.session)
+        mount, policy = await writes.check(actor, mount.id)
         if preview_kind(node.name) != "text":
             raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="File is not editable text")
         locked_node = await self.nodes.get_by_id_for_update(node.id)
@@ -506,6 +507,7 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
         payload = content.encode("utf-8")
         if len(payload) > self.text_max_bytes:
             raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail="Text file exceeds the online editing limit")
+        await writes.check(actor, mount.id, max(0, len(payload) - node.size))
         record = await self.objects.get_by_node_id(node.id)
         content_type = (record.content_type if record else None) or "text/plain; charset=utf-8"
         adapter = self.storage_manager.get_adapter(policy)
@@ -580,8 +582,7 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
     ) -> Node:
         require_capability(actor, Capability.FILE_EDIT)
         source, mount, policy = await self.resolver.resolve(actor, node_id)
-        if mount.read_only:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bucket mount is read-only")
+        mount, policy = await StorageWritePolicy(self.nodes.session).check(actor, mount.id, len(payload))
         if preview_kind(source.name) != "image":
             raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="File is not an image")
         if len(payload) > 64 * 1024 * 1024:

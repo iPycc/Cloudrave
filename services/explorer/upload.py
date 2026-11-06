@@ -35,6 +35,7 @@ from services.explorer.up_check import (
     validate_part_number,
 )
 from services.explorer.access import MountAccessPolicy
+from services.explorer.write_policy import ensure_capacity
 from services.explorer.up_abort import cleanup_upload
 from services.explorer.up_path import UploadPath
 from services.explorer.up_plan import make_plan, sign_part, sign_put
@@ -81,14 +82,7 @@ class CreateUploadSessionService:
         if await self.nodes.get_child_any(mount.id, parent.id, file_name) is not None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="目标位置已存在同名文件或文件夹")
 
-        if mount.quota_bytes is not None:
-            used_bytes = await self.nodes.mount_file_bytes(mount.id)
-            reserved_bytes = await self.uploads.reserved_bytes_for_mount(mount.id)
-            if used_bytes + reserved_bytes + payload.size > mount.quota_bytes:
-                raise HTTPException(
-                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                    detail="Storage quota exceeded",
-                )
+        await ensure_capacity(mount, payload.size, nodes=self.nodes, uploads=self.uploads)
 
         if payload.checksum:
             existing_object = await self.objects.get_by_checksum(
