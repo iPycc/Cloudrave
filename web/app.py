@@ -18,6 +18,7 @@ from web.mid.log import LoggingMiddleware
 from web.mid.database import DatabaseMaintenanceMiddleware
 from web.mid.rid import RequestIdMiddleware
 from web.mid.sec import SecurityHeadersMiddleware
+from web.mid.upload import AvatarBodyLimitMiddleware
 from web.mid.spa import SpaFallbackMiddleware
 from core.cfg import CloudraveConfig
 from core.log import LogOperation, LogOutcome, configure_logging, get_logger
@@ -148,6 +149,7 @@ def create_app(
         expose_headers=["Accept-Ranges", "Content-Length", "Content-Range", "ETag", "Last-Modified"],
     )
     app.add_middleware(SecurityHeadersMiddleware)
+    app.add_middleware(AvatarBodyLimitMiddleware)
     app.add_middleware(DatabaseMaintenanceMiddleware)
     app.add_middleware(LoggingMiddleware)
     app.add_middleware(RequestIdMiddleware, header_name=config.app.request_id_header)

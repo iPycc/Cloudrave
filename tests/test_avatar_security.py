@@ -5,10 +5,10 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi import HTTPException, UploadFile
 from PIL import Image
-from starlette.requests import Request
 
 from models.enums import UserRole
 from services.user import profile
+from web.mid.upload import AvatarBodyLimitMiddleware
 
 
 @pytest.mark.asyncio
@@ -40,6 +40,33 @@ async def test_avatar_invalid_image_preserves_existing_file(tmp_path):
         await service.upload_avatar(None, user, UploadFile(filename="fake.png", file=BytesIO(b"<html>bad</html>")))
     assert denied.value.status_code == 422
     assert old.read_bytes() == b"existing"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size,expected", [(256, 200), (2048, 413)])
+async def test_avatar_body_limit_handles_missing_content_length_before_handler(size, expected):
+    from fastapi import FastAPI, File
+    app = FastAPI()
+    handled = []
+    @app.post("/api/v1/user/me/avatar")
+    async def upload(file: UploadFile = File(...)):
+        handled.append(True)
+        return {"ok": True}
+    limited = AvatarBodyLimitMiddleware(app, max_bytes=1024)
+    body = (b'--audit\r\nContent-Disposition: form-data; name="file"; filename="x.png"\r\n'
+            b'Content-Type: image/png\r\n\r\n' + b'x' * size + b'\r\n--audit--\r\n')
+    messages = [{"type": "http.request", "body": body[i:i+256], "more_body": i+256 < len(body)}
+                for i in range(0, len(body), 256)]
+    async def receive():
+        return messages.pop(0)
+    sent = []
+    async def send(message):
+        sent.append(message)
+    await limited({"type": "http", "method": "POST", "path": "/api/v1/user/me/avatar",
+        "query_string": b"", "headers": [(b"content-type", b"multipart/form-data; boundary=audit")],
+        "scheme": "http", "server": ("test", 80), "client": ("127.0.0.1", 1), "http_version": "1.1"}, receive, send)
+    assert sent[0]["status"] == expected
+    assert handled == ([True] if expected == 200 else [])
 
 
 @pytest.mark.asyncio
