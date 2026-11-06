@@ -49,11 +49,11 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-        response.headers["Content-Security-Policy"] = (
+        response.headers.setdefault("Content-Security-Policy", (
             _API_DOCS_CONTENT_SECURITY_POLICY
             if request.url.path in _API_DOCS_PATHS
             else _DEFAULT_CONTENT_SECURITY_POLICY
-        )
+        ))
         if request.url.scheme == "https":
             response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         return response
