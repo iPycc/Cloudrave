@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from store.port import StorageAdapterBase
 from store.identity import physical_hash
+from security.local_paths import local_root_parts
 from store.types import (
     MultipartPart,
     MultipartUploadState,
@@ -42,9 +43,8 @@ class LocalFsAdapter(StorageAdapterBase):
 
     def prepare_mount_root(self, mount) -> Path:  # type: ignore[override]
         mount_root = self._resolve_mount_root(mount)
-        self._ensure_directory(mount_root / "objects")
-        self._ensure_directory(mount_root / "trash")
-        self._ensure_directory(mount_root / ".multipart")
+        for directory in ("objects", "trash", ".multipart"):
+            self._ensure_directory(self._contained(mount_root, (mount_root / directory).resolve(), directory))
         return mount_root
 
     def physical_id(self, policy, mount, object_key: str) -> str:
@@ -67,11 +67,15 @@ class LocalFsAdapter(StorageAdapterBase):
         extra = getattr(mount, "extra", {}) or {}
         configured_root = extra.get("storage_root")
         if isinstance(configured_root, str) and configured_root.strip():
-            normalized = configured_root.replace("\\", "/").strip()
-            if normalized.lower().startswith("/upload"):
-                normalized = normalized[7:]
-            normalized = normalized.strip("/")
-            candidate = (base_root / normalized).resolve() if normalized else base_root
+            parts = local_root_parts(configured_root)
+            candidate = base_root.joinpath(*parts).resolve()
+            if extra.get("user_managed") is True:
+                owner_uid = str(extra.get("local_owner_uid") or (parts[0] if parts else ""))
+                if not parts or parts[0] != owner_uid:
+                    raise ValueError("Local storage path does not belong to its owner")
+                # Compare against the lexical owner directory: resolving it first
+                # would allow an owner-directory junction to disguise another tenant.
+                self._contained(base_root / owner_uid, candidate, "storage_root")
             return self._contained(base_root, candidate, "storage_root")
 
         candidate = (base_root / str(mount.mount_slug)).resolve()

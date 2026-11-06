@@ -17,6 +17,7 @@ from drives.ids import (
     TENCENT_COS,
 )
 from store.types import StorageAdapter, StorageCapability
+from security.local_paths import local_root_parts
 
 
 DriveFactory = Callable[[CloudraveConfig, Path], StorageAdapter]
@@ -25,11 +26,11 @@ UserMountValidator = Callable[[Any, str, dict[str, Any]], None]
 
 def _validate_local_user_mount(actor: Any, mount_slug: str, extra: dict[str, Any]) -> None:
     raw_root = str(extra.get("storage_root") or f"/upload/{actor.uid}/{mount_slug}/")
-    normalized = "/" + raw_root.replace("\\", "/").strip("/")
-    owner_root = f"/upload/{actor.uid}"
-    if normalized != owner_root and not normalized.startswith(f"{owner_root}/"):
+    parts = local_root_parts(raw_root)
+    if not parts or parts[0] != actor.uid:
         raise ValueError("Local storage path must stay inside the current user's upload directory")
-    extra["storage_root"] = f"{normalized}/"
+    extra["storage_root"] = f"/upload/{'/'.join(parts)}/"
+    extra["local_owner_uid"] = actor.uid
 
 
 @dataclass(frozen=True, slots=True)
