@@ -3,6 +3,7 @@ import io
 import zipfile
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from datetime import UTC, datetime
 
 import py7zr
 import pytest
@@ -17,6 +18,7 @@ from repositories.objects import ObjectRepository
 from repositories.policies import StoragePolicyRepository
 from repositories.users import UserRepository
 from services.explorer import extract
+from services.explorer.archive_limits import BoundedArchiveFactory
 
 
 async def prepare(w, *, suffix="zip", quota_extra=100, role=UserRole.USER, read_only=False):
@@ -91,3 +93,70 @@ async def test_background_extraction_rechecks_mount_state_before_reading(workspa
     with pytest.raises(HTTPException) as denied:
         await extract._load_extract_source(dep, task, w.node.id, None)
     assert denied.value.status_code == 409
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_user", [True, False])
+async def test_extraction_rejects_jobs_over_per_user_and_process_limits(workspace, monkeypatch, same_user):
+    w = workspace
+    dep = await prepare(w)
+    count = 1 if same_user else extract.MAX_RUNNING_TASKS
+    active = {str(i): SimpleNamespace(owner_id=w.actor.id if same_user else 100 + i, status="running")
+              for i in range(count)}
+    monkeypatch.setattr(extract, "_tasks", active)
+    with pytest.raises(HTTPException) as denied:
+        await extract.start_extract(dep, w.actor.id, w.node.id, None)
+    assert denied.value.status_code == 429
+    assert len(active) == count
+
+
+@pytest.mark.asyncio
+async def test_cancelled_job_releases_task_slot(workspace, monkeypatch):
+    dep = await prepare(workspace)
+    monkeypatch.setattr(extract, "_tasks", {})
+    monkeypatch.setattr(extract, "_running", set())
+    async def blocked(*args):
+        await asyncio.Event().wait()
+    monkeypatch.setattr(extract, "_run_extract", blocked)
+    started = await extract.start_extract(dep, workspace.actor.id, workspace.node.id, None)
+    runners = list(extract._running)
+    runners[0].cancel()
+    await asyncio.gather(*runners, return_exceptions=True)
+    assert not extract._running
+    assert extract._tasks[started.id].status == "failed"
+
+
+def test_completed_task_history_is_bounded_without_removing_active_jobs(monkeypatch):
+    now = datetime.now(UTC)
+    tasks = {str(i): SimpleNamespace(id=str(i), owner_id=i % 2, status="completed", updated_at=now)
+             for i in range(20)}
+    tasks["active"] = SimpleNamespace(id="active", owner_id=1, status="running")
+    monkeypatch.setattr(extract, "_tasks", tasks)
+    monkeypatch.setattr(extract, "MAX_TASK_HISTORY", 3)
+    monkeypatch.setattr(extract, "MAX_USER_HISTORY", 2)
+    extract._trim_history()
+    assert "active" in tasks and len(tasks) <= 4
+    assert sum(task.owner_id == 0 for task in tasks.values()) <= 2
+
+
+def test_7z_output_writer_enforces_actual_output_and_safe_paths(tmp_path):
+    factory = BoundedArchiveFactory(tmp_path, max_total=5, max_entry=4, max_entries=2, check_deadline=lambda: None)
+    writer = factory.create("a.txt")
+    writer.write(b"abc")
+    with pytest.raises(ValueError):
+        writer.write(b"de")
+    other = factory.create("b.txt")
+    with pytest.raises(ValueError):
+        other.write(b"xyz")
+    with pytest.raises(ValueError):
+        factory.create("../outside.txt")
+    assert (tmp_path / "a.txt").read_bytes() == b"abc"
+
+
+@pytest.mark.asyncio
+async def test_archive_source_read_is_bounded(monkeypatch):
+    monkeypatch.setattr(extract, "MAX_ARCHIVE_BYTES", 5)
+    output = io.BytesIO()
+    with pytest.raises(ValueError):
+        await extract._copy_stream(io.BytesIO(b"123456"), output)
+    assert not output.getvalue()

@@ -8,12 +8,14 @@ import inspect
 import logging
 import mimetypes
 import tempfile
+import time
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
+from threading import Event
 from uuid import uuid4
 
 from fastapi import HTTPException, status
@@ -22,6 +24,7 @@ import py7zr
 from models.enums import NodeType, UserStatus
 from security.capabilities import Capability, require_capability
 from services.explorer.write_policy import StorageWritePolicy
+from services.explorer.archive_limits import BoundedArchiveFactory
 from repositories.nodes import _unique_name
 from schemas.task import BackgroundTaskRead
 from store.call import call_adapter
@@ -29,10 +32,16 @@ from store.key import managed_key
 
 
 MAX_ENTRIES = 10_000
-MAX_TOTAL_BYTES = 20 * 1024 * 1024 * 1024
-MAX_ENTRY_BYTES = 4 * 1024 * 1024 * 1024
+MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
+MAX_TOTAL_BYTES = 512 * 1024 * 1024
+MAX_ENTRY_BYTES = 128 * 1024 * 1024
 MAX_COMPRESSION_RATIO = 200
 CHUNK_SIZE = 1024 * 1024
+MAX_RUNNING_TASKS = 4
+MAX_USER_TASKS = 1
+MAX_TASK_HISTORY = 200
+MAX_USER_HISTORY = 50
+TASK_TIMEOUT_SECONDS = 300
 
 LOGGER = logging.getLogger(__name__)
 
@@ -48,6 +57,7 @@ class _Task:
     result_node_id: int | None
     created_at: datetime
     updated_at: datetime
+    deadline: float = 0.0
 
 
 @dataclass(slots=True, frozen=True)
@@ -79,6 +89,7 @@ def _read(task: _Task) -> BackgroundTaskRead:
 
 
 def list_tasks(owner_id: int) -> list[BackgroundTaskRead]:
+    _trim_history()
     return [
         _read(task)
         for task in sorted(_tasks.values(), key=lambda item: item.created_at, reverse=True)
@@ -122,6 +133,10 @@ async def start_extract(
             selected_paths = list(dict.fromkeys(path.replace("\\", "/").strip("/") for path in selected_paths))
 
     now = datetime.now(UTC)
+    active = [task for task in _tasks.values() if task.status in {"pending", "running"}]
+    if len(active) >= MAX_RUNNING_TASKS or sum(task.owner_id == actor_id for task in active) >= MAX_USER_TASKS:
+        raise HTTPException(status_code=429, detail="Archive extraction limit reached", headers={"Retry-After": "30"})
+    _trim_history()
     task = _Task(
         id=str(uuid4()),
         owner_id=actor_id,
@@ -132,6 +147,7 @@ async def start_extract(
         result_node_id=None,
         created_at=now,
         updated_at=now,
+        deadline=time.monotonic() + TASK_TIMEOUT_SECONDS,
     )
     _tasks[task.id] = task
     runner = asyncio.create_task(
@@ -139,7 +155,12 @@ async def start_extract(
         name=f"archive-extract-{task.id}",
     )
     _running.add(runner)
-    runner.add_done_callback(_running.discard)
+    def finished(runner):
+        _running.discard(runner)
+        if task.status in {"pending", "running"}:
+            _update(task, status="failed", detail="任务已取消")
+        _trim_history()
+    runner.add_done_callback(finished)
     return _read(task)
 
 
@@ -147,6 +168,24 @@ def _update(task: _Task, **values) -> None:
     for key, value in values.items():
         setattr(task, key, value)
     task.updated_at = datetime.now(UTC)
+
+
+def _trim_history() -> None:
+    completed = sorted((task for task in _tasks.values() if task.status in {"completed", "failed"}),
+                       key=lambda task: task.updated_at, reverse=True)
+    counts: dict[int, int] = {}
+    retained = 0
+    for task in completed:
+        counts[task.owner_id] = counts.get(task.owner_id, 0) + 1
+        if counts[task.owner_id] > MAX_USER_HISTORY or retained >= MAX_TASK_HISTORY:
+            _tasks.pop(task.id, None)
+        else:
+            retained += 1
+
+
+def _check_deadline(task) -> None:
+    if getattr(task, "deadline", 0) and time.monotonic() > task.deadline:
+        raise TimeoutError("Archive extraction timed out")
 
 
 def _require_actor(actor) -> None:
@@ -188,8 +227,14 @@ async def _call_stream_method(method: Callable[..., Any], *args: Any) -> Any:
     return await result if inspect.isawaitable(result) else result
 
 
-async def _copy_stream(source: Any, target: BinaryIO) -> None:
+async def _copy_stream(source: Any, target: BinaryIO, task=None) -> None:
+    copied = 0
     while chunk := await _call_stream_method(source.read, CHUNK_SIZE):
+        if task is not None:
+            _check_deadline(task)
+        copied += len(chunk)
+        if copied > MAX_ARCHIVE_BYTES:
+            raise ValueError("Archive source is too large")
         await asyncio.to_thread(target.write, chunk)
 
 
@@ -202,11 +247,14 @@ async def _close_stream(source: Any) -> None:
 async def _load_extract_source(dep, task: _Task, node_id: int, target_parent_id: int | None) -> _ExtractSource:
     """Load archive metadata without keeping a transaction over storage I/O."""
 
+    _check_deadline(task)
     async with dep.session_scope() as session:
         nodes = dep.get_node_repository(session)
         node = await nodes.get_by_id(node_id)
         if node is None or node.owner_id != task.owner_id or node.deleted_at is not None or not node.blob_path:
             raise RuntimeError("ZIP source no longer exists")
+        if node.size > MAX_ARCHIVE_BYTES:
+            raise HTTPException(status_code=413, detail="Archive source exceeds 512 MB")
         mount, policy = await _write_context(dep, session, task.owner_id, node.mount_id)
         parent_id = target_parent_id if target_parent_id is not None else node.parent_id
         if parent_id is not None:
@@ -227,6 +275,7 @@ async def _load_extract_source(dep, task: _Task, node_id: int, target_parent_id:
 
 
 async def _create_extract_root(dep, task: _Task, source: _ExtractSource) -> int:
+    _check_deadline(task)
     async with dep.session_scope() as session:
         await _write_context(dep, session, task.owner_id, source.mount.id)
         nodes = dep.get_node_repository(session)
@@ -250,6 +299,7 @@ async def _ensure_folder_path(
 ) -> int:
     cursor: tuple[str, ...] = ()
     for segment in parts:
+        _check_deadline(task)
         next_cursor = (*cursor, segment)
         if next_cursor not in folder_ids:
             async with dep.session_scope() as session:
@@ -284,6 +334,7 @@ async def _persist_uploaded_file(
     """Check quota and store bytes/metadata while holding the same mount lock."""
     object_written = False
     adapter = None
+    _check_deadline(task)
     try:
         async with dep.session_scope() as session:
             mount, policy = await _write_context(dep, session, task.owner_id, source.mount.id, size)
@@ -403,8 +454,25 @@ async def _run_extract_7z(
 
         written = 0
         with tempfile.TemporaryDirectory(prefix="cloudrave-7z-extract-") as target_dir:
-            archive.extract(path=target_dir, targets=[info.filename for info in file_infos])
             extraction_root = Path(target_dir).resolve()
+            cancelled = Event()
+            def check_output():
+                if cancelled.is_set():
+                    raise TimeoutError("Archive extraction cancelled")
+                _check_deadline(task)
+            factory = BoundedArchiveFactory(extraction_root, max_total=MAX_TOTAL_BYTES,
+                max_entry=MAX_ENTRY_BYTES, max_entries=MAX_ENTRIES, check_deadline=check_output)
+            worker = asyncio.create_task(asyncio.to_thread(archive.extract,
+                targets=[info.filename for info in file_infos], factory=factory))
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled.set()
+                try:
+                    await asyncio.shield(worker)
+                except Exception:
+                    pass
+                raise
             for index, info in enumerate(file_infos):
                 parts = _safe_parts(info.filename)
                 if not parts:
@@ -429,6 +497,7 @@ async def _run_extract_7z(
                 digest = hashlib.sha256()
                 with payload_path.open("rb") as entry, tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024) as payload:
                     while chunk := await asyncio.to_thread(entry.read, CHUNK_SIZE):
+                        _check_deadline(task)
                         digest.update(chunk)
                         payload.write(chunk)
                     payload.seek(0)
@@ -466,7 +535,7 @@ async def _run_extract(
                 source_info.blob_path,
             )
             try:
-                await _copy_stream(source_stream, spool)
+                await _copy_stream(source_stream, spool, task)
             finally:
                 await _close_stream(source_stream)
             spool.seek(0)
@@ -546,12 +615,17 @@ async def _run_extract(
                     content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
                     digest = hashlib.sha256()
                     with archive.open(info) as entry, tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024) as payload:
+                        actual_size = 0
                         while chunk := await asyncio.to_thread(entry.read, CHUNK_SIZE):
+                            _check_deadline(task)
+                            actual_size += len(chunk)
+                            if actual_size > MAX_ENTRY_BYTES or written + actual_size > MAX_TOTAL_BYTES:
+                                raise ValueError("Archive output exceeds extraction limits")
                             digest.update(chunk)
                             payload.write(chunk)
                         payload.seek(0)
                         await _persist_uploaded_file(dep, task, source=source_info, parent_id=parent_id,
-                            filename=filename, object_key=object_key, size=info.file_size,
+                            filename=filename, object_key=object_key, size=actual_size,
                             checksum=digest.hexdigest(), content_type=content_type, payload=payload)
                     written += info.file_size
                     _update(
