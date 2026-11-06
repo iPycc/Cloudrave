@@ -204,6 +204,9 @@ class UserMountService:
         busy = await self._mount_is_busy(mount.id)
         deleted_objects = 0
 
+        if not self._is_owned_policy(actor, policy):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                                detail="Administrator-managed mounts cannot be deleted here")
         if delete_objects:
             adapter = self.storage_manager.get_adapter(policy)
             if not hasattr(adapter, "purge_mount") and not hasattr(adapter, "apurge_mount"):
@@ -356,7 +359,7 @@ class UserMountService:
                 OWNER_KEY: actor.id,
                 USER_MANAGED_KEY: True,
             }
-            self._validate_local_root(actor, policy.provider, mount.mount_slug, values["extra"])
+            self._validate_user_mount(actor, policy.provider, mount.mount_slug, dict(mount.extra or {}))
         return StoragePolicyUpdate.model_validate(values)
 
     def _owned_mount_update(
@@ -367,6 +370,11 @@ class UserMountService:
         payload: BucketMountUpdate,
     ) -> BucketMountUpdate:
         values = payload.model_dump(exclude_unset=True)
+        if not self._is_owned_policy(actor, policy):
+            if set(values) - {"name", "provider_label"}:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                                    detail="Mount restrictions are managed by an administrator")
+            return payload
         if "extra" in values:
             values["extra"] = {
                 **(mount.extra or {}),
@@ -376,6 +384,10 @@ class UserMountService:
             }
             slug = str(values.get("mount_slug") or mount.mount_slug)
             self._validate_user_mount(actor, policy.provider, slug, values["extra"])
+        elif "mount_slug" in values:
+            extra = dict(mount.extra or {})
+            self._validate_user_mount(actor, policy.provider, str(values["mount_slug"]), extra)
+            values["extra"] = extra
         return BucketMountUpdate.model_validate(values)
 
     def _validate_user_mount(

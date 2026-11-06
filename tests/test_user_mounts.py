@@ -20,6 +20,7 @@ from repositories.nodes import NodeRepository
 from repositories.policies import StoragePolicyRepository
 from repositories.uploads import UploadRepository
 from schemas.policy import StoragePolicyCreate, StoragePolicyUpdate
+from schemas.mount import BucketMountCreate
 from schemas.user_mount import UserBucketMountCreate, UserMountCreate, UserMountUpdate
 from services.user.mount import OWNER_KEY, USER_MANAGED_KEY, UserMountService
 from store.types import StorageCapability
@@ -132,6 +133,47 @@ def test_guests_cannot_manage_mounts() -> None:
     with pytest.raises(HTTPException) as exc_info:
         require_mount_manager(_user(user_id=3, uid="GUEST001", role=UserRole.GUEST))
     assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("patch", [
+    {"read_only": False}, {"quota_bytes": None}, {"quota_bytes": 999999},
+    {"is_enabled": True}, {"root_path": "elsewhere"}, {"mode": "mirror"},
+    {"extra": {"user_managed": True, "owner_user_id": 1}},
+])
+async def test_user_cannot_change_administrator_mount_restrictions(patch) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with async_sessionmaker(engine, expire_on_commit=False)() as session:
+            actor = _user(user_id=1, uid="USER1")
+            session.add(actor)
+            await session.flush()
+            policy = await StoragePolicyRepository(session).create(StoragePolicyCreate(
+                name="admin-managed", provider="tencent_cos", bucket_name="bucket-123456"))
+            mount = await BucketMountRepository(session).create(actor.id, BucketMountCreate(
+                policy_id=policy.id, name="Restricted", mount_slug="restricted",
+                read_only=True, quota_bytes=1024, is_enabled=False))
+            service = UserMountService(session=session, mounts=BucketMountRepository(session),
+                policies=StoragePolicyRepository(session), nodes=NodeRepository(session),
+                uploads=UploadRepository(session), audits=AuditLogRepository(session),
+                storage_manager=_StorageManager())
+            with pytest.raises(HTTPException) as denied:
+                await service.update_mount(_request(), actor, mount.id, UserMountUpdate(mount=patch))
+            assert denied.value.status_code == 403
+            await session.refresh(mount)
+            assert mount.read_only and mount.quota_bytes == 1024 and not mount.is_enabled
+            renamed = await service.update_mount(_request(), actor, mount.id,
+                UserMountUpdate(mount={"name": "My display name"}))
+            assert renamed.mount.name == "My display name"
+            for delete_objects in (False, True):
+                with pytest.raises(HTTPException) as denied:
+                    await service.delete_mount(_request(), actor, mount.id, delete_objects=delete_objects)
+                assert denied.value.status_code == 403
+            assert await BucketMountRepository(session).get_by_id(mount.id) is not None
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
