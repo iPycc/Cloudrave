@@ -10,6 +10,7 @@ from api.v1 import share as routes
 from api.v1 import shared as mounted_routes
 from models.enums import NodeType
 from services.explorer.shared_io import SharedIo
+from services.explorer.source import FileSourceService
 from web.mid.auth import get_current_user
 
 
@@ -80,3 +81,21 @@ def test_limited_share_blocks_all_preview_paths_and_does_not_issue_head_url(monk
         for path in ("/share/audit/download", "/shared/1/download?node_id=1"):
             assert client.get(path).content == b"downloaded"
         assert counted == ["audit", "audit"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["browser", "cloudrave"])
+async def test_explicit_relay_never_signs_remote_download_url(monkeypatch, transport):
+    from services.explorer import proxy
+    adapter = SimpleNamespace(capabilities=SimpleNamespace(download_transport=transport))
+    source = object.__new__(FileSourceService)
+    source.storage_manager = SimpleNamespace(local_path=lambda *args: None, get_adapter=lambda policy: adapter)
+    calls = []
+    async def relay(request, **kwargs):
+        calls.append(kwargs)
+        return Response(b"proxied")
+    monkeypatch.setattr(proxy, "remote_response", relay)
+    response = await source.response(SimpleNamespace(blob_path="blob/a", name="a.txt"),
+        object(), object(), request=object(), relay=True)
+    assert response.body == b"proxied"
+    assert calls[0]["inline"] is False
