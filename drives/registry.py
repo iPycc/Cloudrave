@@ -176,7 +176,7 @@ def default_drive_registry() -> DriveRegistry:
     registry.register(
         DriverDefinition(
             id=DRIVE_139,
-            label="139zhey",
+            label="139 Cloud",
             kind="consumer_cloud",
             icon="drive_139",
             credential_fields=("authorization", "user_domain_id"),
