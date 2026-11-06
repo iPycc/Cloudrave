@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from datetime import datetime
 from enum import StrEnum
@@ -71,7 +72,11 @@ class CloudraveFormatter(logging.Formatter):
         timestamp = datetime.fromtimestamp(record.created).astimezone().strftime("%Y-%m-%d %H:%M:%S")
         level = f"{record.levelname.upper():<8}"
         source = self._source(record)
-        message = record.getMessage()
+        message = re.sub(
+            r"(?i)([?&](?:client_secret|access_token|refresh_token|code)=)[^\s&#\"']*",
+            r"\1[REDACTED]",
+            record.getMessage(),
+        )
         context = self._context(record)
         if context:
             message = f"{message} [{context}]"

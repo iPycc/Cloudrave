@@ -245,9 +245,10 @@ async def finish_qq_oauth(
         try:
             credentials = await (await _settings_service(request, session)).get_credentials()
             profile = await QQOAuthClient().exchange_code(credentials, code=code)
-        except QQOAuthProtocolError:
+        except QQOAuthProtocolError as exc:
             LOGGER.warning(
-                "QQ OAuth callback failed",
+                "QQ OAuth callback failed: %s",
+                exc,
                 extra={
                     "operation": LogOperation.LOGIN,
                     "resource": "oauth:qq",
