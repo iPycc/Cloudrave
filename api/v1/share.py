@@ -263,7 +263,8 @@ async def download_shared_file(
                 if share.max_downloads is not None:
                     return download_probe_response(node.name, "cloudrave")
                 return await download_service.probe_response(node, mount, policy)
-            response = await download_service.response(node, mount, policy, request=request)
+            response = await download_service.response(node, mount, policy, request=request,
+                                                       relay=share.max_downloads is not None)
         else:
             archive_service = ArchiveDownloadService(
                 mounts=dep.get_mount_repository(session),

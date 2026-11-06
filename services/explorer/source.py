@@ -207,9 +207,9 @@ class FileSourceService:
         adapter = self.storage_manager.get_adapter(policy)
         # Operator drives expose temporary provider URLs that browsers can
         # download without CORS when navigation is handed to a native anchor.
-        # Relay only the fetch-based flows (for example, saving an original
-        # folder tree) that must read the response body from JavaScript.
-        if relay and getattr(adapter.capabilities, "download_transport", "cloudrave") == "browser":
+        # Fetch-based flows and download-limited shares explicitly relay bytes
+        # instead of exposing a reusable provider URL.
+        if relay:
             if request is None:
                 raise RuntimeError("Relayed remote downloads require the current request")
             # Import lazily because the proxy shares the content-disposition helper above.

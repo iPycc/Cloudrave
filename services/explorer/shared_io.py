@@ -60,7 +60,8 @@ class SharedIo:
                 if share.max_downloads is not None:
                     return download_probe_response(node.name, "cloudrave")
                 return await self.source.probe_response(*resolved)
-            response = await self.source.response(*resolved, request=request)
+            response = await self.source.response(*resolved, request=request,
+                                                  relay=share.max_downloads is not None)
         else:
             if request.method == "HEAD":
                 return await self.archive.probe_response([node], filename=node.name)

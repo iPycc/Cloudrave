@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
+from starlette.responses import Response
 
 from api.v1 import share as routes
 from api.v1 import shared as mounted_routes
@@ -20,8 +21,16 @@ async def scope():
 def test_limited_share_blocks_all_preview_paths_and_does_not_issue_head_url(monkeypatch):
     share = SimpleNamespace(id="audit", access=SimpleNamespace(value="public"), max_downloads=1, download_count=0)
     node = SimpleNamespace(id=1, name="file.txt", type=NodeType.FILE)
+    counted = []
 
     class Service:
+        @property
+        def source(self):
+            return self
+
+        async def record_download(self, current):
+            counted.append(current.id)
+
         async def get_share_info(self, share_id):
             return share, [node]
 
@@ -40,6 +49,10 @@ def test_limited_share_blocks_all_preview_paths_and_does_not_issue_head_url(monk
 
         async def probe_response(self, *args):
             pytest.fail("A limited share must not issue an uncounted signed URL")
+
+        async def response(self, *args, **kwargs):
+            assert kwargs["relay"] is True
+            return Response(b"downloaded")
 
     monkeypatch.setattr(routes, "_build_share_service", lambda *args: Service())
     monkeypatch.setattr(routes, "DownloadFileService", Source)
@@ -63,3 +76,7 @@ def test_limited_share_blocks_all_preview_paths_and_does_not_issue_head_url(monk
             assert response.status_code == 204
             assert "x-cloudrave-download-url" not in response.headers
             assert response.headers["x-cloudrave-download-mode"] == "cloudrave"
+        assert counted == []
+        for path in ("/share/audit/download", "/shared/1/download?node_id=1"):
+            assert client.get(path).content == b"downloaded"
+        assert counted == ["audit", "audit"]
