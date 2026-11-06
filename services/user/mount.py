@@ -270,6 +270,26 @@ class UserMountService:
     async def require_owned_mount(self, actor: User, mount_id: int) -> BucketMount:
         return await self._owned_mount(actor, mount_id)
 
+    async def manage_oss_domains(self, request: Request, actor: User, mount_id: int, payload) -> dict:
+        mount = await self._owned_mount(actor, mount_id)
+        policy = await self._policy(mount.policy_id)
+        self._require_owned_policy(actor, policy)
+        if provider_id(policy.provider) != "aliyun_oss":
+            raise HTTPException(status_code=400, detail="仅阿里云 OSS 支持此域名操作")
+        try:
+            result = await call_adapter(self.storage_manager.get_adapter(policy), "manage_domains",
+                                        policy, mount, payload.action, payload.domain)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            from store.errors import storage_error_code
+
+            code = storage_error_code(exc)
+            raise HTTPException(status_code=400, detail=f"OSS 域名操作失败（{code or '请求失败'}），请检查域名验证记录和 RAM 权限。") from exc
+        if payload.action not in {"list", "check"}:
+            await self._audit(request, actor, f"mount.domain.{payload.action}", mount, payload.domain)
+        return result
+
     async def _owned_mount(self, actor: User, mount_id: int, *, for_update: bool = False) -> BucketMount:
         mount = (
             await self.mounts.get_by_id_for_update(mount_id)

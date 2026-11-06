@@ -123,6 +123,35 @@ class AliyunOssAdapter(StorageAdapterBase):
     def prepare_mount_root(self, mount: Any) -> Path:
         return Path(str(getattr(mount, "root_path", "")).strip("/\\"))
 
+    def manage_domains(self, policy: Any, mount: Any, action: str, domain: str = "") -> dict:
+        from store.oss.domains import manage_domains
+
+        client = self._client_for(policy)
+        if action != "check":
+            return manage_domains(client, self._bucket(policy), self._region(policy), action, domain)
+        from types import SimpleNamespace
+        from store.oss.download import domain_url
+
+        normalized = domain_url(domain)
+        result = manage_domains(client, self._bucket(policy), self._region(policy), "list")
+        host = urlsplit(normalized).hostname
+        binding = next((item for item in result["domains"] if item["domain"].lower() == host), None)
+        result.update(domain=host, bound=binding is not None, status=binding["status"] if binding else "Unbound")
+        # Sign a browser test URL without sending server requests to the custom host.
+        # The user can verify DNS, TLS and actual data access in the browser.
+        if binding is None or binding["status"] != "Enabled":
+            return result
+        sample = self.list_objects(policy, mount, max_keys=1)
+        if sample.objects and not sample.objects[0].object_key.endswith("/"):
+            preview_policy = SimpleNamespace(
+                **{name: getattr(policy, name, None) for name in (
+                    "bucket_name", "region", "endpoint", "base_prefix", "credentials", "presign_ttl_seconds",
+                )},
+                extra={**(policy.extra or {}), "download_domain_type": "origin", "download_domain": normalized},
+            )
+            result["test_url"] = self.build_download_url(preview_policy, mount, sample.objects[0].object_key, expires_in=300).url
+        return result
+
     def physical_id(self, policy: Any, mount: Any, object_key: str) -> str:
         return physical_hash(
             self.provider_type,

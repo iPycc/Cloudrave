@@ -9,6 +9,7 @@ from models.tables import User
 from schemas.mount import BucketMountRead, MountUsageRead
 from schemas.sync import MountSyncRead, MountSyncRequest
 from schemas.user_mount import (
+    OssDomainRequest,
     UserMountCreate,
     UserMountDeletePreview,
     UserMountDeleteResult,
@@ -22,6 +23,19 @@ from web.mid.auth import get_current_user
 
 
 router = APIRouter(prefix="/mounts", tags=["mounts"])
+
+
+@router.post("/{mount_id}/oss/domains", response_model=dict[str, object])
+async def manage_oss_domains(
+    mount_id: int,
+    request: Request,
+    payload: OssDomainRequest,
+    current_user: User = Depends(get_current_user),
+) -> dict[str, object]:
+    require_mount_manager(current_user)
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        return await _service(request, session).manage_oss_domains(request, current_user, mount_id, payload)
 
 
 def require_mount_manager(user: User) -> None:

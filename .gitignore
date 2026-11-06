@@ -74,3 +74,4 @@ tests/*
 !tests/test_database_cross_backend_integration.py
 !tests/test_storage_drives.py
 !tests/test_oss_download.py
+!tests/test_oss_domains.py

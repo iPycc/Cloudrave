@@ -75,3 +75,17 @@ class UserMountDeleteResult(CloudraveSchema):
     message: str
     deleted_objects: int = 0
     policy_deleted: bool = False
+
+
+class OssDomainRequest(CloudraveSchema):
+    action: Literal["list", "token", "bind", "unbind", "check"] = "list"
+    domain: str = Field(default="", max_length=255)
+
+    @field_validator("domain")
+    @classmethod
+    def normalize_domain(cls, value: str) -> str:
+        if not value.strip():
+            return ""
+        from store.oss.download import domain_url
+
+        return domain_url(value)
