@@ -14,7 +14,8 @@ from services.explorer.archive import ArchiveService
 from services.explorer.preview import build_local_preview_response
 from services.explorer.proxy import remote_response
 from services.explorer.shared import SharedService
-from services.explorer.source import FileSourceService
+from services.explorer.share import require_share_preview
+from services.explorer.source import FileSourceService, download_probe_response
 from store.call import call_adapter
 from store.key import managed_key
 
@@ -26,7 +27,8 @@ class SharedIo:
         self.archive = archive
 
     async def preview(self, request: Request, actor: User, mount_id: int, node_id: int):
-        _share, node = await self.shared.resolve_node(actor, mount_id, node_id)
+        share, node = await self.shared.resolve_node(actor, mount_id, node_id)
+        require_share_preview(share)
         if node.type != NodeType.FILE:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Folders cannot be previewed")
         node, mount, policy = await self.source.resolve_shared(node.id)
@@ -54,6 +56,8 @@ class SharedIo:
         if node.type == NodeType.FILE:
             resolved = await self.source.resolve_shared(node.id)
             if request.method == "HEAD":
+                if share.max_downloads is not None:
+                    return download_probe_response(node.name, "cloudrave")
                 return await self.source.probe_response(*resolved)
             response = await self.source.response(*resolved, request=request)
         else:
@@ -71,7 +75,7 @@ class SharedIo:
         target_mount_id: int,
         target_parent_id: int | None,
     ):
-        _share, source_node = await self.shared.resolve_node(actor, mount_id, node_id)
+        share, source_node = await self.shared.resolve_node(actor, mount_id, node_id)
         target_mount = await self.source.mounts.get_by_id(target_mount_id)
         if target_mount is None or target_mount.owner_id != actor.id or not target_mount.is_enabled:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target mount not found")
@@ -95,6 +99,7 @@ class SharedIo:
                 or parent.type != NodeType.FOLDER
             ):
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target folder not found")
+        await self.shared.source.record_download(share)
         return await self._copy_shared_node(actor, source_node, target_mount, target_policy, parent.id)
 
     async def _copy_shared_node(self, actor: User, source_node, target_mount, target_policy, target_parent_id: int):

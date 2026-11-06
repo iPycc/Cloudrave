@@ -28,8 +28,8 @@ from services.explorer.preview import (
     relative_preview_url,
 )
 from services.explorer.proxy import remote_response
-from services.explorer.share import ShareService
-from services.explorer.source import content_disposition
+from services.explorer.share import ShareService, require_share_preview
+from services.explorer.source import content_disposition, download_probe_response
 from services.user.response import build_avatar_url
 
 
@@ -260,6 +260,8 @@ async def download_shared_file(
         if len(nodes) == 1 and nodes[0].type.value == "file":
             node, mount, policy = await download_service.resolve_shared(nodes[0].id)
             if request.method == "HEAD":
+                if share.max_downloads is not None:
+                    return download_probe_response(node.name, "cloudrave")
                 return await download_service.probe_response(node, mount, policy)
             response = await download_service.response(node, mount, policy, request=request)
         else:
@@ -294,6 +296,7 @@ async def preview_shared_file(
         service = _build_share_service(request, session)
         share, _ = await service.get_share_info(share_id)
         _require_share_access(service, share, access_token)
+        require_share_preview(share)
         node = await service.resolve_shared_node(share, node_id)
         if node.type.value == "folder":
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Folders cannot be previewed")
@@ -338,6 +341,7 @@ async def preview_shared_manifest(
         service = _build_share_service(request, session)
         share, _ = await service.get_share_info(share_id)
         _require_share_access(service, share, access_token)
+        require_share_preview(share)
         node = await service.resolve_shared_node(share, node_id)
         if node.type.value == "folder":
             raise HTTPException(
@@ -384,6 +388,7 @@ async def preview_shared_archive_entry(
         service = _build_share_service(request, session)
         share, _ = await service.get_share_info(share_id)
         _require_share_access(service, share, access_token)
+        require_share_preview(share)
         node = await service.resolve_shared_node(share, node_id)
         if node.type.value == "folder":
             raise HTTPException(
@@ -420,6 +425,7 @@ async def shared_audio_cover(
         service = _build_share_service(request, session)
         share, _ = await service.get_share_info(share_id)
         _require_share_access(service, share, access_token)
+        require_share_preview(share)
         node = await service.resolve_shared_node(share, node_id)
         if node.type.value == "folder":
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Folders cannot have cover art")

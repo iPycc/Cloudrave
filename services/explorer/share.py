@@ -19,6 +19,14 @@ from schemas.share import ShareCreateRequest, ShareRead, ShareVerifyRequest
 from security.capabilities import Capability, require_capability
 
 
+def require_share_preview(share: ShareRecord) -> None:
+    # Original previews, manifests and archive entries can all expose file bytes
+    # or signed URLs. Limited shares authorize those bytes through downloads only.
+    if share.max_downloads is not None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail="Preview is unavailable for download-limited shares; use download")
+
+
 class ShareService:
     def __init__(
         self,
