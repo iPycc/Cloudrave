@@ -18,6 +18,7 @@ from store.identity import physical_hash
 from store.key import mount_prefix, physical_key, physical_list_prefix
 from store.cos.obj import CosObjectMixin
 from store.cos.upload import CosUploadMixin
+from store.cos.download import download_settings
 from store.types import StorageCapability
 from core.cfg import TencentCosConfig
 
@@ -119,14 +120,17 @@ class TencentCosAdapter(CosObjectMixin, CosUploadMixin, StorageAdapterBase):
             pool_size=self._positive_int(extra.get("pool_max_size", 50), "pool_max_size"),
         )
 
-    def _client_for(self, policy: Any) -> Any:
+    def _client_for(self, policy: Any, *, download: bool = False) -> Any:
         if not _COS_SDK_AVAILABLE:
             raise RuntimeError(
                 "Tencent Cloud COS SDK is not installed; install cos-python-sdk-v5"
             )
         target = self._target(policy)
+        mode, domain, auth = download_settings(getattr(policy, "extra", None) or {})
+        route = (mode, domain, auth) if download else ("default", "", "cos")
+        cache_key = (*target.cache_key, *route)
         with self._clients_lock:
-            client = self._clients.get(target.cache_key)
+            client = self._clients.get(cache_key)
             if client is None:
                 config_kwargs: dict[str, Any] = {
                     "Region": target.region,
@@ -141,12 +145,17 @@ class TencentCosAdapter(CosObjectMixin, CosUploadMixin, StorageAdapterBase):
                 }
                 if target.endpoint:
                     config_kwargs["Endpoint"] = target.endpoint
+                if download and mode != "default":
+                    parsed = urlsplit(domain)
+                    config_kwargs.pop("Endpoint", None)
+                    config_kwargs["Domain"] = parsed.netloc
+                    config_kwargs["Scheme"] = parsed.scheme
                 client = CosS3Client(CosConfig(**config_kwargs), retry=target.retries)
-                self._clients[target.cache_key] = client
+                self._clients[cache_key] = client
                 if len(self._clients) > CLIENT_CACHE_SIZE:
                     self._clients.popitem(last=False)
             else:
-                self._clients.move_to_end(target.cache_key)
+                self._clients.move_to_end(cache_key)
         return client
 
     def clear_client_cache(self) -> None:

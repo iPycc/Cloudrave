@@ -151,6 +151,9 @@ def mount_read(mount, policy=None, storage_manager=None) -> BucketMountRead:
         "scheme",
         "accelerate",
         "path_style",
+        "download_domain_type",
+        "download_domain",
+        "download_cdn_auth",
     ):
         if key in policy_extra:
             extra[key] = policy_extra[key]

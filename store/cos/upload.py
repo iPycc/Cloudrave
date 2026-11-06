@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from urllib.parse import urlencode
 from typing import Any, BinaryIO
 
 from store.types import MultipartPart, MultipartUploadState, PresignedURL, StorageObject, utcnow
+from store.cos.download import download_settings
 from store.cos.sec import (
     assert_encryption,
     encryption_args,
@@ -260,12 +262,23 @@ class CosUploadMixin:
         ttl = self._ttl(policy) if expires_in is None else expires_in
         if ttl <= 0:
             raise ValueError("expires_in must be positive")
-        url = self._client_for(policy).get_presigned_url(
+        mode, _, auth = download_settings(getattr(policy, "extra", None) or {})
+        client = self._client_for(policy, download=True)
+        params = response_params(download_name, inline)
+        if mode == "cdn" and auth == "public":
+            url = client.get_object_url(Bucket=self._bucket(policy), Key=self._key(policy, mount, object_key))
+            if params:
+                url += "?" + urlencode(params)
+            return PresignedURL(method="GET", url=url, expires_at=None)
+        if token := self._target(policy).token:
+            params["x-cos-security-token"] = token
+        url = client.get_presigned_url(
             Method="GET",
             Bucket=self._bucket(policy),
             Key=self._key(policy, mount, object_key),
             Expired=ttl,
-            Params=response_params(download_name, inline),
+            Params=params,
+            SignHost=mode != "cdn",
         )
         return PresignedURL(method="GET", url=url, expires_at=utcnow() + self._seconds(ttl))
 
