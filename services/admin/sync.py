@@ -298,20 +298,26 @@ class MountSyncService:
             return "conflicts"
 
         old_extra = dict(record.extra or {})
-        changed = (
+        content_changed = (
             node.size != item.size
             or node.blob_path != key
             or old_extra.get("etag") != item.etag
             or old_extra.get("last_modified") != item.last_modified
-            or bool(old_extra.get("external_missing"))
         )
-        await self.nodes.reactivate_file(node, blob_path=key, size=item.size)
+        changed = content_changed or bool(old_extra.get("external_missing"))
+        if changed or node.status != NodeStatus.ACTIVE or node.deleted_at is not None:
+            await self.nodes.reactivate_file(node, blob_path=key, size=item.size)
+        # An imported object's checksum describes its previous contents. If the
+        # provider cannot supply a version signal, it cannot be safely reused.
+        checksum = record.checksum
+        if changed or not (item.etag or item.last_modified):
+            checksum = None
         await self.objects.create_or_update(
             node_id=node.id,
             policy_id=mount.policy_id,
             blob_path=key,
             physical_id=physical_id,
-            checksum=record.checksum,
+            checksum=checksum,
             content_type=record.content_type,
             extra=self._object_extra(item, generation),
         )
