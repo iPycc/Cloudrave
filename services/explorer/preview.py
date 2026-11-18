@@ -302,7 +302,8 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
             metadata["public_source_ready"] = office_source.startswith("https://")
         elif kind == "text":
             capabilities.append("syntax")
-            editable = node.size <= self.text_max_bytes
+            imported = record is not None and (record.extra or {}).get("origin") == "bucket_import"
+            editable = node.size <= self.text_max_bytes and not imported
             if editable:
                 capabilities.append("edit")
             metadata["editable"] = editable
@@ -509,6 +510,11 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
             raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail="Text file exceeds the online editing limit")
         await writes.check(actor, mount.id, max(0, len(payload) - node.size))
         record = await self.objects.get_by_node_id(node.id)
+        if record is not None and (record.extra or {}).get("origin") == "bucket_import":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="导入的文件暂不支持在线编辑，以免修改存储桶中的源文件",
+            )
         content_type = (record.content_type if record else None) or "text/plain; charset=utf-8"
         adapter = self.storage_manager.get_adapter(policy)
         if not node.blob_path:
