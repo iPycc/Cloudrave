@@ -940,6 +940,8 @@ def _application_tables():
 
 
 async def _data_summary(connection: AsyncConnection) -> DatabaseDataSummary:
+    from models.tables import SYNC_CLAIM_GATE_KEY
+
     table_names = set(await connection.run_sync(lambda sync: inspect(sync).get_table_names()))
     tables: list[DatabaseTableSummary] = []
     total = 0
@@ -955,7 +957,7 @@ async def _data_summary(connection: AsyncConnection) -> DatabaseDataSummary:
         internal_rows = int(await connection.scalar(
             select(func.count()).select_from(meta).where(
                 ((meta.c.key == "auth.first_admin_user_id") & (meta.c.value == ""))
-                | meta.c.key.in_(["database.instance_id", "database.migration_id"])
+                | meta.c.key.in_(["database.instance_id", "database.migration_id", SYNC_CLAIM_GATE_KEY])
             )
         ) or 0)
         meaningful_rows = max(0, meaningful_rows - internal_rows)

@@ -27,6 +27,9 @@ def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+SYNC_CLAIM_GATE_KEY = "sync.claim_gate"
+
+
 class TimestampMixin:
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

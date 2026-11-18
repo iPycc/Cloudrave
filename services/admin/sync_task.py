@@ -12,11 +12,12 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 import httpx
-from sqlalchemy import and_, delete, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy.orm import aliased
 
 from db.base import session_scope
 from models.enums import UserRole, UserStatus
-from models.tables import BucketMount, MountSyncConflict, MountSyncTask, User
+from models.tables import SYNC_CLAIM_GATE_KEY, BucketMount, MountSyncConflict, MountSyncTask, SystemMeta, User
 from schemas.sync import MountSyncRequest
 from services.admin.scan import BucketScanner
 from services.admin.sync import MountSyncService
@@ -26,6 +27,8 @@ LOGGER = logging.getLogger("cloudrave.sync")
 MAX_RETRIES = 3
 LEASE_DURATION = timedelta(minutes=5)
 LEASE_RENEW_INTERVAL = 60
+MAX_ACTIVE_IMPORTS = 2
+MAX_ACTIVE_IMPORTS_PER_USER = 1
 
 
 def _is_transient(exc: Exception) -> bool:
@@ -195,17 +198,40 @@ class MountSyncWorker:
             return len(ids)
 
     async def _claim(self) -> tuple[str, str] | None:
-        now = datetime.now(UTC)
-        eligible = or_(
-            and_(
-                MountSyncTask.status == "pending",
-                or_(MountSyncTask.lease_expires_at.is_(None), MountSyncTask.lease_expires_at <= now),
-            ),
-            and_(MountSyncTask.status == "running", MountSyncTask.lease_expires_at < now),
-        )
+        # Keep idle polling read-only; serialize admission only when work exists.
         async with session_scope(self.dep.session_factory) as session:
+            candidate = await session.scalar(
+                select(MountSyncTask.id).where(self._eligible(datetime.now(UTC))).limit(1)
+            )
+            if candidate is None:
+                return None
+
+        async with session_scope(self.dep.session_factory) as session:
+            # A no-op write locks the same row on PostgreSQL, MySQL and SQLite.
+            # Claiming a slot and marking a task running share this transaction.
+            await session.execute(
+                update(SystemMeta).where(SystemMeta.key == SYNC_CLAIM_GATE_KEY).values(value=SystemMeta.value)
+            )
+            gate = await session.scalar(select(SystemMeta.key).where(SystemMeta.key == SYNC_CLAIM_GATE_KEY))
+            if gate is None:
+                raise RuntimeError("Import worker coordination row is missing")
+            now = datetime.now(UTC)
+            active_filter = (MountSyncTask.status == "running", MountSyncTask.lease_expires_at > now)
+            active = await session.scalar(select(func.count()).select_from(MountSyncTask).where(*active_filter))
+            if int(active or 0) >= MAX_ACTIVE_IMPORTS:
+                return None
+            running = aliased(MountSyncTask)
+            same_owner_active = (
+                select(func.count(running.id))
+                .where(running.owner_id == MountSyncTask.owner_id, running.status == "running", running.lease_expires_at > now)
+                .correlate(MountSyncTask)
+                .scalar_subquery()
+            )
+            eligible = self._eligible(now)
             task_id = await session.scalar(
-                select(MountSyncTask.id).where(eligible).order_by(MountSyncTask.updated_at, MountSyncTask.id).limit(1)
+                select(MountSyncTask.id)
+                .where(eligible, same_owner_active < MAX_ACTIVE_IMPORTS_PER_USER)
+                .order_by(MountSyncTask.updated_at, MountSyncTask.id).limit(1)
             )
             if task_id is None:
                 return None
@@ -217,6 +243,15 @@ class MountSyncWorker:
                 )
             )
             return (task_id, token) if result.rowcount == 1 else None
+
+    @staticmethod
+    def _eligible(now: datetime):
+        return or_(
+            and_(MountSyncTask.status == "pending",
+                 or_(MountSyncTask.lease_expires_at.is_(None), MountSyncTask.lease_expires_at <= now)),
+            and_(MountSyncTask.status == "running",
+                 or_(MountSyncTask.lease_expires_at.is_(None), MountSyncTask.lease_expires_at < now)),
+        )
 
     async def _renew_lease(self, task_id: str, token: str) -> None:
         while True:
