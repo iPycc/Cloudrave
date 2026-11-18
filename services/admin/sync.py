@@ -63,6 +63,9 @@ class MountSyncService:
     ) -> MountSyncRead:
         mount, policy, expected = await self._claim_page(mount_id, payload)
 
+        if expected.get("phase") == "finalizing":
+            return await self._finalize_page(request, actor, mount_id, expected)
+
         try:
             page = await self.scanner.list_page(
                 policy,
@@ -171,15 +174,9 @@ class MountSyncService:
 
                         next_state["cursor"] = page.next_cursor
                         if page.complete:
-                            missing, synced = await self._finish_generation(
-                                mount,
-                                next_state["generation"],
-                            )
-                            next_state["missing"] = missing
-                            next_state["synced_objects"] = synced
-                            next_state["status"] = "complete"
-                            next_state["completed_at"] = _now()
                             next_state["cursor"] = None
+                            next_state["phase"] = "finalizing"
+                            next_state["finalize_after_id"] = 0
                 except Exception as exc:
                     page_error = exc
                     failed = dict(current)
@@ -323,32 +320,60 @@ class MountSyncService:
         )
         return "updated" if changed else "unchanged"
 
-    async def _finish_generation(self, mount: BucketMount, generation: str) -> tuple[int, int]:
-        missing = 0
-        synced = 0
-        now = datetime.now(UTC)
-        after_id = 0
-        while True:
-            records = await self.objects.list_for_mount_page(mount.id, after_id=after_id, limit=500)
-            if not records:
-                break
+    async def _finalize_page(
+        self, request: Request, actor: User, mount_id: int, expected: dict,
+    ) -> MountSyncRead:
+        async with self.session.begin():
+            mount = await self.mounts.get_by_id_for_update(mount_id)
+            if mount is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bucket mount not found")
+            current = self._state(mount)
+            if not self._same_page(current, expected):
+                return self._read(mount, current)
+            policy = await self.policies.get_by_id(mount.policy_id)
+            if not mount.is_enabled or mount.mode != "mirror" or policy is None or policy.status != "active":
+                current["status"] = "error"
+                current["error"] = "Storage mount changed during synchronization"
+                await self.mounts.save_sync_state(mount, current)
+                return self._read(mount, current)
+
+            records = await self.objects.list_for_mount_page(
+                mount.id, after_id=int(current.get("finalize_after_id", 0)), limit=500,
+            )
+            now = datetime.now(UTC)
+            started_at = datetime.fromisoformat(current["started_at"])
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=UTC)
             for record, node in records:
-                after_id = record.id
+                current["finalize_after_id"] = record.id
                 extra = dict(record.extra or {})
                 if extra.get("origin") != "bucket_import":
                     continue
-                if extra.get("sync_generation") == generation:
-                    synced += 1
+                if extra.get("sync_generation") == current["generation"]:
+                    current["synced_objects"] += 1
+                    continue
+                updated = record.updated_at
+                if updated.tzinfo is None:
+                    updated = updated.replace(tzinfo=UTC)
+                node_updated = node.updated_at
+                if node_updated.tzinfo is None:
+                    node_updated = node_updated.replace(tzinfo=UTC)
+                if updated > started_at or node_updated > started_at:
                     continue
                 if not extra.get("external_missing"):
-                    missing += 1
+                    current["missing"] += 1
                 extra["external_missing"] = True
                 extra["missing_at"] = now.isoformat()
                 record.extra = extra
                 node.status = NodeStatus.DELETED
                 node.deleted_at = now
-            await self.session.flush()
-        return missing, synced
+            if len(records) < 500:
+                current["status"] = "complete"
+                current["completed_at"] = _now()
+                current["phase"] = "complete"
+            await self.mounts.save_sync_state(mount, current)
+            await self._audit(request, actor, mount, current)
+            return self._read(mount, current)
 
     async def _require_mount(self, mount_id: int) -> BucketMount:
         mount = await self.mounts.get_by_id(mount_id)
@@ -362,6 +387,8 @@ class MountSyncService:
             current.get("status") == "running"
             and current.get("generation") == expected.get("generation")
             and current.get("cursor") == expected.get("cursor")
+            and current.get("phase") == expected.get("phase")
+            and current.get("finalize_after_id") == expected.get("finalize_after_id")
         )
 
     @staticmethod
@@ -390,6 +417,7 @@ class MountSyncService:
             "status": "running",
             "generation": uuid4().hex,
             "cursor": None,
+            "phase": "scanning",
             "started_at": _now(),
             "completed_at": None,
             "scanned": 0,
