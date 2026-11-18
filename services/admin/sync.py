@@ -342,6 +342,12 @@ class MountSyncService:
         record = await self.objects.get_by_node_id(node.id)
         if record is None or (record.extra or {}).get("origin") != "bucket_import":
             return "conflicts"
+        if (record.physical_id and record.physical_id != physical_id) or (
+            not record.physical_id and record.blob_path != key
+        ):
+            # A virtual rename or move can leave a different imported object
+            # at this name. Never replace its identity during a rescan.
+            return "conflicts"
 
         old_extra = dict(record.extra or {})
         content_changed = (
