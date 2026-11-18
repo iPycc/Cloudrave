@@ -52,7 +52,7 @@ class ObjectGc:
             identity = record.physical_id
             if not identity:
                 adapter = self.storage_manager.get_adapter(policy)
-                identity = adapter.physical_id(policy, mount, record.blob_path)
+                identity = await call_adapter(adapter, "physical_id", policy, mount, record.blob_path)
                 record.physical_id = identity
                 await self.objects.session.flush()
             identities[record.id] = identity
@@ -64,11 +64,17 @@ class ObjectGc:
             excluding_node_ids=node_ids,
         )
         legacy_refs = await self.objects.referenced_keys(records, excluding_node_ids=node_ids)
+        protected_ids = {
+            identities[record.id]
+            for record in records
+            if record.id in identities and (record.extra or {}).get("origin") == "bucket_import"
+            and (mounts[nodes[record.node_id].mount_id].extra or {}).get("import_delete_source") is not True
+        }
         candidates: dict[str, tuple[int, int, str]] = {}
         for record in records:
             identity = identities.get(record.id)
             node = nodes.get(record.node_id)
-            if not identity or node is None or identity in referenced_ids:
+            if not identity or node is None or identity in referenced_ids or identity in protected_ids:
                 continue
             legacy_key = (record.policy_id, node.mount_id, record.blob_path)
             if legacy_key in legacy_refs:
@@ -113,7 +119,7 @@ class ObjectGc:
                 if mount is None or policy is None:
                     raise RuntimeError("Storage policy or mount no longer exists")
                 adapter = self.storage_manager.get_adapter(policy)
-                current_id = adapter.physical_id(policy, mount, task.blob_path)
+                current_id = await call_adapter(adapter, "physical_id", policy, mount, task.blob_path)
                 if current_id != task.physical_id:
                     raise RuntimeError("Storage mapping changed after cleanup was staged")
                 await self.objects.blobs.deleting(blob)
