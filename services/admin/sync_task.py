@@ -143,31 +143,34 @@ class MountSyncWorker:
     async def _loop(self) -> None:
         while True:
             tracked = False
+            should_sleep = False
             try:
                 if self.manager is not None:
                     tracked = self.manager.begin_business_write()
                     if not tracked:
-                        await asyncio.sleep(self.interval)
-                        continue
-                claimed = await self._claim()
-                if claimed:
-                    heartbeat = asyncio.create_task(self._renew_lease(*claimed), name="mount-sync-lease")
-                    try:
-                        await self._run_page(*claimed)
-                    finally:
-                        heartbeat.cancel()
-                        with suppress(asyncio.CancelledError):
-                            await heartbeat
-                else:
-                    await asyncio.sleep(self.interval)
+                        should_sleep = True
+                if not should_sleep:
+                    claimed = await self._claim()
+                    if claimed:
+                        heartbeat = asyncio.create_task(self._renew_lease(*claimed), name="mount-sync-lease")
+                        try:
+                            await self._run_page(*claimed)
+                        finally:
+                            heartbeat.cancel()
+                            with suppress(asyncio.CancelledError):
+                                await heartbeat
+                    else:
+                        should_sleep = True
             except asyncio.CancelledError:
                 raise
             except Exception:
                 LOGGER.exception("Background synchronization worker failed")
-                await asyncio.sleep(self.interval)
+                should_sleep = True
             finally:
                 if tracked:
                     self.manager.end_business_write()
+            if should_sleep:
+                await asyncio.sleep(self.interval)
 
     async def _claim(self) -> tuple[str, str] | None:
         now = datetime.now(UTC)
