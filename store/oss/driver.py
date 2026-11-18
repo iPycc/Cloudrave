@@ -262,6 +262,24 @@ class AliyunOssAdapter(StorageAdapterBase):
         stored.etag = stored.etag or self._clean_etag(getattr(result, "etag", None))
         return stored
 
+    def put_directory_marker(self, policy: Any, mount: Any, directory: str) -> None:
+        self._require_unversioned(policy)
+        key = self._key(policy, mount, directory).rstrip("/") + "/"
+        if "\x00" in key or len(key.encode("utf-8")) > 1024:
+            raise ValueError("Invalid OSS directory marker key")
+        self._client_for(policy).put_object(oss.PutObjectRequest(
+            bucket=self._bucket(policy), key=key, body=BytesIO(b""),
+            forbid_overwrite=True, **self._encryption_args(policy),
+        ))
+
+    def delete_directory_marker(self, policy: Any, mount: Any, directory: str) -> None:
+        key = self._key(policy, mount, directory).rstrip("/") + "/"
+        if "\x00" in key or len(key.encode("utf-8")) > 1024:
+            raise ValueError("Invalid OSS directory marker key")
+        self._client_for(policy).delete_object(oss.DeleteObjectRequest(
+            bucket=self._bucket(policy), key=key,
+        ))
+
     def open_object(
         self,
         policy: Any,
