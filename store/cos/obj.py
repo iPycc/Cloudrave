@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Iterator
+from contextlib import suppress
+from math import ceil
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from store.types import StorageObject, StorageObjectPage
+from store.types import MultipartPart, StorageObject, StorageObjectPage
 from store.cos.parse import object_from_head, page_from_response
 from store.cos.sec import assert_encryption, encryption_args, metadata_headers
 from store.cos.stream import AsyncCosStream, CosStream
@@ -349,7 +351,12 @@ class CosObjectMixin:
     async def adelete_object(self, policy: Any, mount: Any, object_key: str, *, hard_delete: bool = False) -> bool:
         return await asyncio.to_thread(self.delete_object, policy, mount, object_key, hard_delete=hard_delete)
 
-    def copy_object(self, policy: Any, mount: Any, source_key: str, destination_key: str) -> StorageObject:
+    def copy_object(
+        self, policy: Any, mount: Any, source_key: str, destination_key: str, *,
+        no_overwrite: bool = False,
+    ) -> StorageObject:
+        if no_overwrite:
+            return self._copy_without_overwrite(policy, mount, source_key, destination_key)
         extra = getattr(policy, "extra", None) or {}
         self._client_for(policy).copy(
             Bucket=self._bucket(policy),
@@ -365,5 +372,54 @@ class CosObjectMixin:
         )
         return self.head_object(policy, mount, destination_key, verify_encryption=True)
 
-    async def acopy_object(self, policy: Any, mount: Any, source_key: str, destination_key: str) -> StorageObject:
-        return await asyncio.to_thread(self.copy_object, policy, mount, source_key, destination_key)
+    def _copy_without_overwrite(self, policy: Any, mount: Any, source_key: str, destination_key: str) -> StorageObject:
+        self._require_unversioned(policy)
+        source = self.head_object(policy, mount, source_key)
+        if source.size is None or not source.etag:
+            raise ValueError("COS source size and ETag are required for a protected copy")
+        client = self._client_for(policy)
+        bucket = self._bucket(policy)
+        target = self._key(policy, mount, destination_key)
+        copy_source = {"Bucket": bucket, "Key": self._key(policy, mount, source_key), "Region": self._region(policy)}
+        if source.size <= 5 * 1024 * 1024 * 1024:
+            client.copy_object(
+                Bucket=bucket, Key=target, CopySource=copy_source,
+                CopySourceIfMatch=source.etag,
+                Metadata={"x-cos-forbid-overwrite": "true"},
+                **encryption_args(policy),
+            )
+            return self.head_object(policy, mount, destination_key, verify_encryption=True)
+
+        part_size = max(16 * 1024 * 1024, ceil(source.size / self.capabilities.max_parts))
+        if part_size > self.capabilities.max_part_size:
+            raise ValueError("COS source is too large for multipart copy")
+        upload = self.create_multipart_upload(
+            policy, mount, destination_key, total_size=source.size,
+            mime_type=source.mime_type, metadata=source.metadata,
+        )
+        parts: list[MultipartPart] = []
+        try:
+            for index, start in enumerate(range(0, source.size, part_size), start=1):
+                end = min(start + part_size, source.size) - 1
+                result = client.upload_part_copy(
+                    Bucket=bucket, Key=target, PartNumber=index, UploadId=upload.upload_id,
+                    CopySource=copy_source, CopySourceRange=f"bytes={start}-{end}",
+                    CopySourceIfMatch=source.etag,
+                )
+                etag = str(result.get("ETag") or "")
+                if not etag:
+                    raise RuntimeError("COS did not return a copied part ETag")
+                parts.append(MultipartPart(part_number=index, etag=etag, size=end - start + 1))
+            return self.complete_multipart_upload(policy, mount, upload, parts, no_overwrite=True)
+        except BaseException:
+            with suppress(Exception):
+                self.abort_multipart_upload(policy, mount, upload)
+            raise
+
+    async def acopy_object(
+        self, policy: Any, mount: Any, source_key: str, destination_key: str, *,
+        no_overwrite: bool = False,
+    ) -> StorageObject:
+        return await asyncio.to_thread(
+            self.copy_object, policy, mount, source_key, destination_key, no_overwrite=no_overwrite,
+        )
