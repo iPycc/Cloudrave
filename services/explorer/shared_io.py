@@ -158,7 +158,7 @@ class SharedIo:
             node_id=created.id,
             policy_id=target_policy.id,
             blob_path=object_key,
-            physical_id=target_adapter.physical_id(target_policy, target_mount, object_key),
+            physical_id=await call_adapter(target_adapter, "physical_id", target_policy, target_mount, object_key),
             revive_physical=True,
             content_type=mimetypes.guess_type(name)[0] or "application/octet-stream",
             extra={

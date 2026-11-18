@@ -107,7 +107,7 @@ class CreateUploadSessionService:
                     physical_id=(
                         getattr(existing_object, "physical_id", None)
                         or (
-                            adapter.physical_id(policy, mount, existing_object.blob_path)
+                            await call_adapter(adapter, "physical_id", policy, mount, existing_object.blob_path)
                             if hasattr(adapter, "physical_id")
                             else None
                         )
@@ -475,7 +475,7 @@ class CreateUploadSessionService:
                 node_id=file_node.id,
                 policy_id=policy.id,
                 blob_path=record.path,
-                physical_id=adapter.physical_id(policy, mount, record.path),
+                physical_id=await call_adapter(adapter, "physical_id", policy, mount, record.path),
                 revive_physical=True,
                 checksum=checksum,
                 content_type=record.content_type,

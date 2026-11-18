@@ -514,7 +514,9 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
         if not node.blob_path:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="File has no storage object")
         current_blob = node.blob_path
-        current_physical = (record.physical_id if record else None) or adapter.physical_id(
+        current_physical = (record.physical_id if record else None) or await call_adapter(
+            adapter,
+            "physical_id",
             policy,
             mount,
             current_blob,
@@ -554,7 +556,7 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
             node_id=node.id,
             policy_id=policy.id,
             blob_path=target_blob,
-            physical_id=adapter.physical_id(policy, mount, target_blob),
+            physical_id=await call_adapter(adapter, "physical_id", policy, mount, target_blob),
             revive_physical=True,
             checksum=checksum,
             content_type=content_type,
@@ -638,7 +640,7 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
             node_id=created.id,
             policy_id=policy.id,
             blob_path=object_key,
-            physical_id=adapter.physical_id(policy, mount, object_key),
+            physical_id=await call_adapter(adapter, "physical_id", policy, mount, object_key),
             revive_physical=True,
             checksum=hashlib.sha256(payload).hexdigest(),
             content_type=mime_type,

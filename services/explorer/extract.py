@@ -353,7 +353,7 @@ async def _persist_uploaded_file(
                 parent_id=parent_id, name=target_name, blob_path=object_key, size=size)
             await dep.get_object_repository(session).create_or_update(
                 node_id=created.id, policy_id=policy.id, blob_path=object_key,
-                physical_id=adapter.physical_id(policy, mount, object_key), revive_physical=True,
+                physical_id=await call_adapter(adapter, "physical_id", policy, mount, object_key), revive_physical=True,
                 checksum=checksum, content_type=content_type,
                 extra={"origin": "archive_extract", "etag": getattr(stored, "etag", None)})
         return target_name

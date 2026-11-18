@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from repositories.mounts import BucketMountRepository
 from repositories.objects import ObjectRepository
 from repositories.policies import StoragePolicyRepository
+from store.call import call_adapter
 from store.manager import StorageManager
 
 
@@ -43,7 +44,7 @@ class ObjectIdService:
                     continue
                 try:
                     adapter = self.storage_manager.get_adapter(policy)
-                    value = adapter.physical_id(policy, mount, record.blob_path)
+                    value = await call_adapter(adapter, "physical_id", policy, mount, record.blob_path)
                 except (KeyError, RuntimeError, TypeError, ValueError):
                     failed += 1
                     continue

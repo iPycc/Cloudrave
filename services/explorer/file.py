@@ -401,7 +401,7 @@ class FileExplorerService:
                 node_id=node.id,
                 policy_id=policy.id,
                 blob_path=object_key,
-                physical_id=adapter.physical_id(policy, mount, object_key),
+                physical_id=await call_adapter(adapter, "physical_id", policy, mount, object_key),
                 revive_physical=True,
                 checksum=hashlib.sha256(b"").hexdigest(),
                 content_type=content_type,
@@ -606,7 +606,7 @@ class FileExplorerService:
                 blob_path=source_obj.blob_path,
                 physical_id=(
                     source_obj.physical_id
-                    or adapter.physical_id(policy, mount, source_obj.blob_path)
+                    or await call_adapter(adapter, "physical_id", policy, mount, source_obj.blob_path)
                 ),
                 checksum=source_obj.checksum,
                 content_type=source_obj.content_type,
