@@ -27,9 +27,14 @@ class CosUploadMixin:
         *,
         mime_type: str | None = None,
         metadata: dict[str, str] | None = None,
+        no_overwrite: bool = False,
     ) -> PresignedURL:
+        if no_overwrite:
+            self._require_unversioned(policy)
         ttl = self._ttl(policy)
         headers = signed_encryption_headers(policy)
+        if no_overwrite:
+            headers["x-cos-forbid-overwrite"] = "true"
         if mime_type:
             headers["Content-Type"] = mime_type
         headers.update(metadata_headers(metadata))
@@ -57,6 +62,7 @@ class CosUploadMixin:
         *,
         mime_type: str | None = None,
         metadata: dict[str, str] | None = None,
+        no_overwrite: bool = False,
     ) -> PresignedURL:
         return await asyncio.to_thread(
             self.presign_put,
@@ -65,6 +71,7 @@ class CosUploadMixin:
             object_key,
             mime_type=mime_type,
             metadata=metadata,
+            no_overwrite=no_overwrite,
         )
 
     def create_multipart_upload(
@@ -203,6 +210,7 @@ class CosUploadMixin:
         *,
         mime_type: str | None = None,
         metadata: dict[str, str] | None = None,
+        no_overwrite: bool = False,
     ) -> StorageObject:
         if not parts:
             raise ValueError("at least one multipart part is required")
@@ -215,6 +223,9 @@ class CosUploadMixin:
             if not part.etag:
                 raise ValueError("every multipart part requires an ETag")
             seen.add(part.part_number)
+        if no_overwrite:
+            self._require_unversioned(policy)
+        headers = {"Metadata": {"x-cos-forbid-overwrite": "true"}} if no_overwrite else {}
         self._client_for(policy).complete_multipart_upload(
             Bucket=self._bucket(policy),
             Key=self._key(policy, mount, upload.object_key),
@@ -225,6 +236,7 @@ class CosUploadMixin:
                     for part in ordered
                 ]
             },
+            **headers,
         )
         completed = self.head_object(policy, mount, upload.object_key, verify_encryption=True)
         if upload.total_size is not None and completed.size != upload.total_size:

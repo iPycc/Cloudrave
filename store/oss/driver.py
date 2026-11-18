@@ -243,13 +243,17 @@ class AliyunOssAdapter(StorageAdapterBase):
         *,
         mime_type: str | None = None,
         metadata: dict[str, str] | None = None,
+        no_overwrite: bool = False,
     ) -> StorageObject:
+        if no_overwrite:
+            self._require_unversioned(policy)
         result = self._client_for(policy).put_object(oss.PutObjectRequest(
             bucket=self._bucket(policy),
             key=self._key(policy, mount, object_key),
             body=body,
             content_type=mime_type,
             metadata=metadata or None,
+            forbid_overwrite=True if no_overwrite else None,
             **self._encryption_args(policy),
         ))
         stored = self.head_object(policy, mount, object_key)
@@ -271,12 +275,18 @@ class AliyunOssAdapter(StorageAdapterBase):
         ))
         return OssStream(result.body)
 
-    def copy_object(self, policy: Any, mount: Any, source_key: str, destination_key: str) -> StorageObject:
+    def copy_object(
+        self, policy: Any, mount: Any, source_key: str, destination_key: str, *,
+        no_overwrite: bool = False,
+    ) -> StorageObject:
+        if no_overwrite:
+            self._require_unversioned(policy)
         self._client_for(policy).copy_object(oss.CopyObjectRequest(
             bucket=self._bucket(policy),
             key=self._key(policy, mount, destination_key),
             source_bucket=self._bucket(policy),
             source_key=self._key(policy, mount, source_key),
+            forbid_overwrite=True if no_overwrite else None,
             **self._encryption_args(policy),
         ))
         return self.head_object(policy, mount, destination_key)
@@ -327,13 +337,17 @@ class AliyunOssAdapter(StorageAdapterBase):
         *,
         mime_type: str | None = None,
         metadata: dict[str, str] | None = None,
+        no_overwrite: bool = False,
     ) -> PresignedURL:
+        if no_overwrite:
+            self._require_unversioned(policy)
         ttl = self._ttl(policy)
         result = self._client_for(policy).presign(oss.PutObjectRequest(
             bucket=self._bucket(policy),
             key=self._key(policy, mount, object_key),
             content_type=mime_type,
             metadata=metadata or None,
+            forbid_overwrite=True if no_overwrite else None,
             **self._encryption_args(policy),
         ), expires=timedelta(seconds=ttl))
         return self._presigned(result, ttl)
@@ -442,6 +456,7 @@ class AliyunOssAdapter(StorageAdapterBase):
         mount: Any,
         upload: MultipartUploadState,
         parts: list[MultipartPart],
+        no_overwrite: bool = False,
         **_: Any,
     ) -> StorageObject:
         if not parts:
@@ -449,10 +464,13 @@ class AliyunOssAdapter(StorageAdapterBase):
         ordered = sorted(parts, key=lambda item: item.part_number)
         if len({item.part_number for item in ordered}) != len(ordered):
             raise ValueError("Multipart part numbers must be unique")
+        if no_overwrite:
+            self._require_unversioned(policy)
         self._client_for(policy).complete_multipart_upload(oss.CompleteMultipartUploadRequest(
             bucket=self._bucket(policy),
             key=self._key(policy, mount, upload.object_key),
             upload_id=upload.upload_id,
+            forbid_overwrite=True if no_overwrite else None,
             complete_multipart_upload=oss.CompleteMultipartUpload(parts=[
                 oss.UploadPart(part_number=item.part_number, etag=item.etag) for item in ordered
             ]),
@@ -579,6 +597,15 @@ class AliyunOssAdapter(StorageAdapterBase):
 
     def _bucket(self, policy: Any) -> str:
         return str(self._target(policy)["bucket"])
+
+    def _require_unversioned(self, policy: Any) -> None:
+        result = self._client_for(policy).get_bucket_versioning(
+            oss.GetBucketVersioningRequest(bucket=self._bucket(policy))
+        )
+        if not hasattr(result, "version_status"):
+            raise ValueError("Could not verify OSS bucket versioning")
+        if str(getattr(result, "version_status", "") or "").lower() not in {"", "disabled"}:
+            raise ValueError("OSS bucket versioning must be disabled for overwrite-protected writes")
 
     def _region(self, policy: Any) -> str:
         return str(self._target(policy)["region"])

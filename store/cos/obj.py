@@ -260,12 +260,17 @@ class CosObjectMixin:
         *,
         mime_type: str | None = None,
         metadata: dict[str, str] | None = None,
+        no_overwrite: bool = False,
     ) -> StorageObject:
+        if no_overwrite:
+            self._require_unversioned(policy)
         kwargs: dict[str, Any] = encryption_args(policy)
         if mime_type:
             kwargs["ContentType"] = mime_type
         if metadata:
             kwargs["Metadata"] = metadata_headers(metadata)
+        if no_overwrite:
+            kwargs.setdefault("Metadata", {})["x-cos-forbid-overwrite"] = "true"
         response = self._client_for(policy).put_object(
             Bucket=self._bucket(policy),
             Key=self._key(policy, mount, object_key),
