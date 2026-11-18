@@ -123,6 +123,7 @@ async def list_sync_tasks(
                 "created": int(state.get("created", 0)),
                 "updated": int(state.get("updated", 0)),
                 "conflicts": int(state.get("conflicts", 0)),
+                "skipped": int(state.get("skipped", 0)),
                 "missing": int(state.get("missing", 0)),
             }))
         return tasks

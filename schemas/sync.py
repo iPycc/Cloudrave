@@ -29,6 +29,7 @@ class MountSyncRead(CloudraveSchema):
     updated: int = 0
     unchanged: int = 0
     conflicts: int = 0
+    skipped: int = 0
     missing: int = 0
     synced_objects: int = 0
     error: str | None = None

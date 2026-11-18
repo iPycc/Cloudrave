@@ -41,4 +41,5 @@ class MountSyncTaskRead(CloudraveSchema):
     created: int = 0
     updated: int = 0
     conflicts: int = 0
+    skipped: int = 0
     missing: int = 0

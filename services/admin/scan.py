@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from models.tables import BucketMount, StoragePolicy
 from store.manager import StorageManager
-from store.key import is_managed_key
+from store.key import LEGACY_MANAGED_PREFIX
 from store.call import call_adapter
 
 
@@ -53,7 +53,11 @@ class BucketScanner:
         items: list[BucketItem] = []
         for raw in page.objects:
             physical_key = str(raw.storage_path).replace("\\", "/")
-            if not raw.object_key or physical_key.endswith("/") or is_managed_key(raw.object_key):
+            if (
+                not raw.object_key or physical_key.endswith("/")
+                or raw.object_key == LEGACY_MANAGED_PREFIX
+                or raw.object_key.startswith(f"{LEGACY_MANAGED_PREFIX}/")
+            ):
                 continue
             if hasattr(adapter, "listed_physical_id"):
                 identity = await call_adapter(adapter, "listed_physical_id", policy, mount, raw)

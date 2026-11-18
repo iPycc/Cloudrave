@@ -184,7 +184,7 @@ class MountSyncService:
                                 next_state["generation"],
                                 cache,
                             )
-                            next_state[outcome] += 1
+                            next_state[outcome] = next_state.get(outcome, 0) + 1
 
                         next_state["cursor"] = page.next_cursor
                         if page.complete:
@@ -249,6 +249,9 @@ class MountSyncService:
         physical_id = item.physical_id or hashlib.sha256(
             f"{mount.policy_id}\0{item.physical_key}".encode()
         ).hexdigest()
+        references = await self.objects.list_physical_in_mount(mount.id, mount.policy_id, physical_id, key)
+        if any((record.extra or {}).get("origin") != "bucket_import" for record in references):
+            return "skipped"
         try:
             await self.objects.blobs.ensure(physical_id)
         except BlobUnavailable:
@@ -284,6 +287,8 @@ class MountSyncService:
 
         file_name = parts[-1]
         node = await self.nodes.get_child_any(mount.id, parent_id, file_name)
+        if references and all(node is None or record.node_id != node.id for record in references):
+            return "conflicts"
         if node is None:
             node = await self.nodes.create_file(
                 owner_id=mount.owner_id,
@@ -454,6 +459,7 @@ class MountSyncService:
             "updated": 0,
             "unchanged": 0,
             "conflicts": 0,
+            "skipped": 0,
             "missing": 0,
             "synced_objects": 0,
             "error": None,
@@ -474,6 +480,7 @@ class MountSyncService:
                 "updated": 0,
                 "unchanged": 0,
                 "conflicts": 0,
+                "skipped": 0,
                 "missing": 0,
                 "synced_objects": 0,
                 "error": None,

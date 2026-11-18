@@ -24,6 +24,23 @@ class ObjectRepository:
         result = await self.session.scalars(select(ObjectRecord).where(ObjectRecord.node_id.in_(node_ids)))
         return list(result)
 
+    async def list_physical_in_mount(
+        self, mount_id: int, policy_id: int, physical_id: str, blob_path: str,
+    ) -> list[ObjectRecord]:
+        statement = (
+            select(ObjectRecord)
+            .join(Node, Node.id == ObjectRecord.node_id)
+            .where(
+                Node.mount_id == mount_id,
+                or_(
+                    ObjectRecord.physical_id == physical_id,
+                    (ObjectRecord.physical_id.is_(None) & (ObjectRecord.policy_id == policy_id)
+                     & (ObjectRecord.blob_path == blob_path)),
+                ),
+            )
+        )
+        return list(await self.session.scalars(statement))
+
     async def get_by_checksum(
         self,
         checksum: str,
