@@ -17,6 +17,7 @@ from urllib.parse import quote, urlsplit
 from store.key import logical_key, mount_prefix, physical_key, physical_list_prefix
 from store.oss.stream import OssStream
 from store.oss.download import download_settings
+from store.oss.copy import CopySnapshot, read_copy_snapshot
 from store.identity import physical_hash
 from store.errors import storage_error_code
 from store.port import StorageAdapterBase
@@ -301,11 +302,15 @@ class AliyunOssAdapter(StorageAdapterBase):
     ) -> StorageObject:
         if no_overwrite:
             self._require_unversioned(policy)
-            source = self.head_object(policy, mount, source_key)
-            if source.size is None or not source.etag:
-                raise ValueError("OSS source size and ETag are required for a protected copy")
+            if self._key(policy, mount, source_key) == self._key(policy, mount, destination_key):
+                raise ValueError("OSS protected copy requires a different destination")
+            client = self._client_for(policy)
+            bucket = self._bucket(policy)
+            source = read_copy_snapshot(client, oss, bucket, self._key(policy, mount, source_key))
             if source.size > 1024 * 1024 * 1024:
-                return self._copy_multipart_without_overwrite(policy, mount, source, destination_key)
+                if source.content_md5:
+                    raise ValueError("OSS multipart copy cannot preserve the source Content-MD5")
+                return self._copy_multipart_without_overwrite(policy, mount, source_key, source, destination_key)
         else:
             source = None
         self._client_for(policy).copy_object(oss.CopyObjectRequest(
@@ -315,25 +320,23 @@ class AliyunOssAdapter(StorageAdapterBase):
             source_key=self._key(policy, mount, source_key),
             forbid_overwrite=True if no_overwrite else None,
             if_match=source.etag if source is not None else None,
-            **self._encryption_args(policy),
+            object_acl=source.acl if source is not None else None,
+            storage_class=source.storage_class if source is not None else None,
+            **(source.encryption_args() if source is not None else self._encryption_args(policy)),
         ))
+        if source is not None:
+            self._verify_protected_copy(policy, mount, source_key, destination_key, source)
         return self.head_object(policy, mount, destination_key)
 
     def _copy_multipart_without_overwrite(
-        self, policy: Any, mount: Any, source: StorageObject, destination_key: str,
+        self, policy: Any, mount: Any, source_key: str, source: CopySnapshot, destination_key: str,
     ) -> StorageObject:
-        if source.size is None or not source.etag:
-            raise ValueError("OSS source size and ETag are required for a protected copy")
         part_size = max(16 * 1024 * 1024, ceil(source.size / self.capabilities.max_parts))
         if part_size > self.capabilities.max_part_size:
             raise ValueError("OSS source is too large for multipart copy")
-        metadata = {
-            key: value for key, value in source.metadata.items()
-            if key not in {"server_side_encryption", "server_side_encryption_key_id"}
-        }
         upload = self.create_multipart_upload(
             policy, mount, destination_key, total_size=source.size,
-            mime_type=source.mime_type, metadata=metadata,
+            mime_type=source.content_type, metadata=dict(source.metadata), _copy_snapshot=source,
         )
         parts: list[MultipartPart] = []
         client = self._client_for(policy)
@@ -344,18 +347,39 @@ class AliyunOssAdapter(StorageAdapterBase):
                 result = client.upload_part_copy(oss.UploadPartCopyRequest(
                     bucket=bucket, key=self._key(policy, mount, destination_key),
                     upload_id=upload.upload_id, part_number=index,
-                    source_bucket=bucket, source_key=self._key(policy, mount, source.object_key),
+                    source_bucket=bucket, source_key=self._key(policy, mount, source_key),
                     source_range=f"bytes={start}-{end}", if_match=source.etag,
                 ))
                 etag = self._clean_etag(getattr(result, "etag", None))
                 if not etag:
                     raise RuntimeError("OSS did not return a copied part ETag")
                 parts.append(MultipartPart(part_number=index, etag=etag, size=end - start + 1))
-            return self.complete_multipart_upload(policy, mount, upload, parts, no_overwrite=True)
+            if read_copy_snapshot(client, oss, bucket, self._key(policy, mount, source_key)) != source:
+                raise RuntimeError("OSS source changed during the protected copy")
+            result = self.complete_multipart_upload(
+                policy, mount, upload, parts, no_overwrite=True, object_acl=source.acl,
+            )
+            self._verify_protected_copy(policy, mount, source_key, destination_key, source)
+            return result
         except BaseException:
             with suppress(Exception):
                 self.abort_multipart_upload(policy, mount, upload)
             raise
+
+    def _verify_protected_copy(
+        self, policy: Any, mount: Any, source_key: str, destination_key: str, source: CopySnapshot,
+    ) -> None:
+        client = self._client_for(policy)
+        bucket = self._bucket(policy)
+        target = read_copy_snapshot(client, oss, bucket, self._key(policy, mount, destination_key))
+        if target.preserved_attributes() != source.preserved_attributes():
+            raise RuntimeError("OSS copied object attributes differ from the source")
+        if source.crc64 and source.crc64 != target.crc64:
+            raise RuntimeError("OSS copied object checksum differs from the source")
+        if source.content_md5 and source.content_md5 != target.content_md5:
+            raise RuntimeError("OSS copied object Content-MD5 differs from the source")
+        if read_copy_snapshot(client, oss, bucket, self._key(policy, mount, source_key)) != source:
+            raise RuntimeError("OSS source changed during the protected copy")
 
     def delete_object(self, policy: Any, mount: Any, object_key: str, *, hard_delete: bool = False) -> bool:
         client = self._client_for(policy)
@@ -427,15 +451,27 @@ class AliyunOssAdapter(StorageAdapterBase):
         total_size: int | None = None,
         mime_type: str | None = None,
         metadata: dict[str, str] | None = None,
+        _copy_snapshot: CopySnapshot | None = None,
     ) -> MultipartUploadState:
         # OSS signs these as x-oss-meta-* headers and does not allow underscores in their names.
-        oss_metadata = {key.replace("_", "-"): value for key, value in (metadata or {}).items() if value}
+        oss_metadata = (dict(_copy_snapshot.metadata) if _copy_snapshot is not None else
+                        {key.replace("_", "-"): value for key, value in (metadata or {}).items() if value})
+        copy_args = {} if _copy_snapshot is None else {
+            "cache_control": _copy_snapshot.cache_control,
+            "content_disposition": _copy_snapshot.content_disposition,
+            "content_encoding": _copy_snapshot.content_encoding,
+            "expires": _copy_snapshot.expires,
+            "storage_class": _copy_snapshot.storage_class,
+            "tagging": _copy_snapshot.tagging_header(),
+            "forbid_overwrite": True,
+        }
         result = self._client_for(policy).initiate_multipart_upload(oss.InitiateMultipartUploadRequest(
             bucket=self._bucket(policy),
             key=self._key(policy, mount, object_key),
             content_type=mime_type,
             metadata=oss_metadata or None,
-            **self._encryption_args(policy),
+            **copy_args,
+            **(_copy_snapshot.encryption_args() if _copy_snapshot is not None else self._encryption_args(policy)),
         ))
         upload_id = str(getattr(result, "upload_id", ""))
         if not upload_id:
@@ -523,6 +559,7 @@ class AliyunOssAdapter(StorageAdapterBase):
         upload: MultipartUploadState,
         parts: list[MultipartPart],
         no_overwrite: bool = False,
+        object_acl: str | None = None,
         **_: Any,
     ) -> StorageObject:
         if not parts:
@@ -537,6 +574,7 @@ class AliyunOssAdapter(StorageAdapterBase):
             key=self._key(policy, mount, upload.object_key),
             upload_id=upload.upload_id,
             forbid_overwrite=True if no_overwrite else None,
+            object_acl=object_acl,
             complete_multipart_upload=oss.CompleteMultipartUpload(parts=[
                 oss.UploadPart(part_number=item.part_number, etag=item.etag) for item in ordered
             ]),
