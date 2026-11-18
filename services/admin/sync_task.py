@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 from fastapi import HTTPException
+import httpx
 from sqlalchemy import and_, or_, select, update
 
 from db.base import session_scope
@@ -18,8 +19,27 @@ from models.tables import BucketMount, MountSyncTask, User
 from schemas.sync import MountSyncRequest
 from services.admin.scan import BucketScanner
 from services.admin.sync import MountSyncService
+from store.errors import storage_error_code, unwrap_storage_error
 
 LOGGER = logging.getLogger("cloudrave.sync")
+MAX_RETRIES = 3
+
+
+def _is_transient(exc: Exception) -> bool:
+    cause = exc.__cause__ if isinstance(exc.__cause__, Exception) else exc
+    cause = unwrap_storage_error(cause)
+    if isinstance(cause, (TimeoutError, ConnectionError, httpx.TimeoutException, httpx.NetworkError)):
+        return True
+    if storage_error_code(cause) in {"SlowDown", "RequestTimeout", "ServiceUnavailable", "InternalError"}:
+        return True
+    get_status = getattr(cause, "get_status_code", None)
+    status = get_status() if callable(get_status) else getattr(cause, "status_code", None)
+    if status is None:
+        status = getattr(getattr(cause, "response", None), "status_code", None)
+    try:
+        return int(status) == 429 or 500 <= int(status) <= 599
+    except (TypeError, ValueError):
+        return False
 
 
 def sync_service(dep, session) -> MountSyncService:
@@ -58,6 +78,7 @@ async def start_sync_task(dep, session, mount: BucketMount, owner_id: int) -> Mo
             raise HTTPException(status_code=409, detail="存储配置已更改，请取消旧任务后重新导入")
         state["status"] = "running"
         state["error"] = None
+        state["retry_count"] = 0
     else:
         state = MountSyncService._new_state()
         state["mapping"] = MountSyncService.mapping_signature(policy, mount)
@@ -143,7 +164,10 @@ class MountSyncWorker:
     async def _claim(self) -> tuple[str, str] | None:
         now = datetime.now(UTC)
         eligible = or_(
-            MountSyncTask.status == "pending",
+            and_(
+                MountSyncTask.status == "pending",
+                or_(MountSyncTask.lease_expires_at.is_(None), MountSyncTask.lease_expires_at <= now),
+            ),
             and_(MountSyncTask.status == "running", MountSyncTask.lease_expires_at < now),
         )
         async with session_scope(self.dep.session_factory) as session:
@@ -186,7 +210,9 @@ class MountSyncWorker:
                         raise RuntimeError("存储同步失败，请检查连接后重试")
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            if _is_transient(exc) and await self._schedule_retry(task_id, token):
+                return
             error = "同步未完成，请检查存储连接或重新授权后重试"
             complete = False
         async with session_scope(self.dep.session_factory) as session:
@@ -200,3 +226,32 @@ class MountSyncWorker:
                 .where(MountSyncTask.id == task_id, MountSyncTask.lease_token == token, MountSyncTask.status == "running")
                 .values(**values)
             )
+
+    async def _schedule_retry(self, task_id: str, token: str) -> bool:
+        async with session_scope(self.dep.session_factory) as session:
+            task = await session.get(MountSyncTask, task_id)
+            if task is None:
+                return False
+            mount = await self.dep.get_mount_repository(session).get_by_id_for_update(task.mount_id)
+            task = await session.scalar(
+                select(MountSyncTask).where(MountSyncTask.id == task_id)
+                .with_for_update().execution_options(populate_existing=True)
+            )
+            if mount is None or task is None or task.lease_token != token or task.status != "running":
+                return False
+            state = MountSyncService._state(mount)
+            attempts = int(state.get("retry_count", 0))
+            if state.get("generation") != task.generation or state.get("status") not in {"running", "error"}:
+                return False
+            if attempts >= MAX_RETRIES:
+                return False
+            state["status"] = "running"
+            state["error"] = None
+            state["retry_count"] = attempts + 1
+            await self.dep.get_mount_repository(session).save_sync_state(mount, state)
+            task.status = "pending"
+            task.error = "存储服务暂时不可用，正在重试"
+            task.lease_token = None
+            task.lease_expires_at = datetime.now(UTC) + timedelta(seconds=2 ** (attempts + 1))
+            await session.flush()
+            return True

@@ -200,6 +200,7 @@ class MountSyncService:
                     result = self._read(mount, failed)
                 else:
                     next_state["error"] = None
+                    next_state["retry_count"] = 0
                     await self.mounts.save_sync_state(mount, next_state)
                     await self._audit(request, actor, mount, next_state)
                     result = self._read(mount, next_state)
@@ -429,6 +430,7 @@ class MountSyncService:
                 current["status"] = "complete"
                 current["completed_at"] = _now()
                 current["phase"] = "complete"
+            current["retry_count"] = 0
             await self.mounts.save_sync_state(mount, current)
             await self._audit(request, actor, mount, current)
             return self._read(mount, current)
