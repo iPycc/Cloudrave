@@ -23,6 +23,8 @@ from store.errors import storage_error_code, unwrap_storage_error
 
 LOGGER = logging.getLogger("cloudrave.sync")
 MAX_RETRIES = 3
+LEASE_DURATION = timedelta(minutes=5)
+LEASE_RENEW_INTERVAL = 60
 
 
 def _is_transient(exc: Exception) -> bool:
@@ -149,7 +151,13 @@ class MountSyncWorker:
                         continue
                 claimed = await self._claim()
                 if claimed:
-                    await self._run_page(*claimed)
+                    heartbeat = asyncio.create_task(self._renew_lease(*claimed), name="mount-sync-lease")
+                    try:
+                        await self._run_page(*claimed)
+                    finally:
+                        heartbeat.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await heartbeat
                 else:
                     await asyncio.sleep(self.interval)
             except asyncio.CancelledError:
@@ -179,11 +187,33 @@ class MountSyncWorker:
             token = str(uuid4())
             result = await session.execute(
                 update(MountSyncTask).where(MountSyncTask.id == task_id, eligible).values(
-                    status="running", lease_token=token, lease_expires_at=now + timedelta(minutes=5),
+                    status="running", lease_token=token, lease_expires_at=now + LEASE_DURATION,
                     updated_at=now,
                 )
             )
             return (task_id, token) if result.rowcount == 1 else None
+
+    async def _renew_lease(self, task_id: str, token: str) -> None:
+        while True:
+            await asyncio.sleep(LEASE_RENEW_INTERVAL)
+            try:
+                now = datetime.now(UTC)
+                async with session_scope(self.dep.session_factory) as session:
+                    result = await session.execute(
+                        update(MountSyncTask).where(
+                            MountSyncTask.id == task_id,
+                            MountSyncTask.status == "running",
+                            MountSyncTask.lease_token == token,
+                            MountSyncTask.lease_expires_at > now,
+                        ).values(lease_expires_at=now + LEASE_DURATION)
+                    )
+                    if result.rowcount != 1:
+                        return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A transient database error may recover before the lease expires.
+                LOGGER.exception("Could not renew synchronization task lease")
 
     async def _run_page(self, task_id: str, token: str) -> None:
         request = SimpleNamespace(client=None, headers={}, state=SimpleNamespace(request_id=f"sync-{task_id}"))
@@ -203,7 +233,8 @@ class MountSyncWorker:
                 complete = state.get("generation") == task.generation and state.get("status") == "complete"
                 if not complete:
                     result = await sync_service(self.dep, session).run(
-                        request, actor, task.mount_id, MountSyncRequest(page_size=200), generation=task.generation,
+                        request, actor, task.mount_id, MountSyncRequest(page_size=200),
+                        generation=task.generation, lease=(task_id, token),
                     )
                     complete = result.complete
                     if result.status == "failed":

@@ -9,11 +9,12 @@ import json
 from uuid import uuid4
 
 from fastapi import HTTPException, Request, status
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.enums import NodeStatus, NodeType
-from models.tables import BucketMount, Node, StoragePolicy, User
+from models.tables import BucketMount, MountSyncTask, Node, StoragePolicy, User
 from repositories.audit_logs import AuditLogRepository
 from repositories.blobs import BlobUnavailable
 from repositories.mounts import BucketMountRepository
@@ -63,11 +64,12 @@ class MountSyncService:
         payload: MountSyncRequest,
         *,
         generation: str | None = None,
+        lease: tuple[str, str] | None = None,
     ) -> MountSyncRead:
         mount, policy, expected = await self._claim_page(mount_id, payload, generation=generation)
 
         if expected.get("phase") == "finalizing":
-            return await self._finalize_page(request, actor, mount_id, expected)
+            return await self._finalize_page(request, actor, mount_id, expected, lease=lease)
 
         try:
             page = await self.scanner.list_page(
@@ -77,10 +79,10 @@ class MountSyncService:
                 page_size=payload.page_size,
             )
         except Exception as exc:
-            await self._record_error(mount_id, expected, exc)
+            await self._record_error(mount_id, expected, exc, lease=lease)
             raise self._sync_error(exc) from exc
 
-        return await self._apply_page(request, actor, mount_id, expected, policy, page)
+        return await self._apply_page(request, actor, mount_id, expected, policy, page, lease=lease)
 
     async def _claim_page(
         self,
@@ -135,6 +137,8 @@ class MountSyncService:
         expected: dict,
         policy: StoragePolicy,
         page: BucketPage,
+        *,
+        lease: tuple[str, str] | None = None,
     ) -> MountSyncRead:
         page_error: Exception | None = None
         result: MountSyncRead
@@ -143,6 +147,7 @@ class MountSyncService:
             mount = await self.mounts.get_by_id_for_update(mount_id)
             if mount is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bucket mount not found")
+            await self._require_lease(mount_id, lease)
             await self.session.refresh(mount)
             current = self._state(mount)
             current_policy = await self.policies.get_by_id(mount.policy_id)
@@ -209,11 +214,14 @@ class MountSyncService:
             raise self._sync_error(page_error) from page_error
         return result
 
-    async def _record_error(self, mount_id: int, expected: dict, exc: Exception) -> None:
+    async def _record_error(
+        self, mount_id: int, expected: dict, exc: Exception, *, lease: tuple[str, str] | None = None,
+    ) -> None:
         async with self.session.begin():
             mount = await self.mounts.get_by_id_for_update(mount_id)
             if mount is None:
                 return
+            await self._require_lease(mount_id, lease)
             await self.session.refresh(mount)
             current = self._state(mount)
             if not self._same_page(current, expected):
@@ -384,11 +392,13 @@ class MountSyncService:
 
     async def _finalize_page(
         self, request: Request, actor: User, mount_id: int, expected: dict,
+        *, lease: tuple[str, str] | None = None,
     ) -> MountSyncRead:
         async with self.session.begin():
             mount = await self.mounts.get_by_id_for_update(mount_id)
             if mount is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bucket mount not found")
+            await self._require_lease(mount_id, lease)
             current = self._state(mount)
             if not self._same_page(current, expected):
                 return self._read(mount, current)
@@ -446,6 +456,22 @@ class MountSyncService:
             await self.mounts.save_sync_state(mount, current)
             await self._audit(request, actor, mount, current)
             return self._read(mount, current)
+
+    async def _require_lease(self, mount_id: int, lease: tuple[str, str] | None) -> None:
+        if lease is None:
+            return
+        task_id, token = lease
+        task = await self.session.scalar(
+            select(MountSyncTask.id).where(
+                MountSyncTask.id == task_id,
+                MountSyncTask.mount_id == mount_id,
+                MountSyncTask.status == "running",
+                MountSyncTask.lease_token == token,
+                MountSyncTask.lease_expires_at > datetime.now(UTC),
+            ).with_for_update()
+        )
+        if task is None:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Synchronization task lease expired")
 
     async def _require_mount(self, mount_id: int) -> BucketMount:
         mount = await self.mounts.get_by_id(mount_id)
