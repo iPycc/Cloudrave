@@ -220,6 +220,22 @@ async def start_google_oauth_link(
     return _authorization_redirect(request, dep.config, credentials, flow=flow)
 
 
+@router.get("/test", dependencies=[Depends(login_rate_limit)])
+async def test_google_oauth(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+) -> RedirectResponse:
+    require_admin(current_user)
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        try:
+            credentials = await (await _settings_service(request, session)).get_credentials(allow_disabled=True)
+        except GoogleOAuthProtocolError:
+            return _test_redirect("not_configured")
+    signed = _encode_link_flow(current_user.uid, dep.config.auth.jwt_secret + ":google-oauth-test")
+    return _authorization_redirect(request, dep.config, credentials, flow="test:" + signed[5:])
+
+
 @router.get("/callback", dependencies=[Depends(login_rate_limit)])
 async def finish_google_oauth(
     request: Request,
@@ -230,8 +246,13 @@ async def finish_google_oauth(
     dep = request.app.state.dep
     flow = request.cookies.get(GOOGLE_FLOW_COOKIE, "login")
     is_link_flow = flow.startswith("link:")
+    is_test_flow = flow.startswith("test:")
     link_user_uid = _decode_link_flow(flow, dep.config.auth.jwt_secret) if is_link_flow else None
-    error_redirect = _link_redirect if is_link_flow else _login_redirect
+    test_user_uid = (
+        _decode_link_flow("link:" + flow[5:], dep.config.auth.jwt_secret + ":google-oauth-test")
+        if is_test_flow else None
+    )
+    error_redirect = _test_redirect if is_test_flow else _link_redirect if is_link_flow else _login_redirect
     expected_state = request.cookies.get(GOOGLE_STATE_COOKIE, "")
     verifier = request.cookies.get(GOOGLE_VERIFIER_COOKIE, "")
     if error or not code:
@@ -240,10 +261,12 @@ async def finish_google_oauth(
         return _clear_flow_cookies(error_redirect("invalid_state"), request, dep.config)
     if is_link_flow and link_user_uid is None:
         return _clear_flow_cookies(_link_redirect("invalid_state"), request, dep.config)
+    if is_test_flow and test_user_uid is None:
+        return _clear_flow_cookies(_test_redirect("invalid_state"), request, dep.config)
 
     async with dep.session_scope() as session:
         try:
-            credentials = await (await _settings_service(request, session)).get_credentials()
+            credentials = await (await _settings_service(request, session)).get_credentials(allow_disabled=is_test_flow)
             profile = await GoogleOAuthClient().exchange_code(
                 credentials,
                 code=code,
@@ -262,6 +285,12 @@ async def finish_google_oauth(
                 },
             )
             return _clear_flow_cookies(error_redirect("provider_error"), request, dep.config)
+
+        if is_test_flow:
+            user = await dep.get_user_repository(session).get_by_uid(test_user_uid)
+            if user is None or user.status != UserStatus.ACTIVE or user.role != UserRole.ADMIN:
+                return _clear_flow_cookies(_test_redirect("account_not_found"), request, dep.config)
+            return _clear_flow_cookies(_test_redirect("success"), request, dep.config)
 
         avatar_url = await _cache_google_avatar(dep, profile)
         identities = OAuthIdentityRepository(session)
@@ -385,6 +414,10 @@ def _login_result_redirect(result_code: str) -> RedirectResponse:
 
 def _link_redirect(result_code: str) -> RedirectResponse:
     return _oauth_complete_redirect("link", result_code)
+
+
+def _test_redirect(result_code: str) -> RedirectResponse:
+    return _oauth_complete_redirect("test", result_code)
 
 
 def _oauth_complete_redirect(flow: str, result_code: str) -> RedirectResponse:

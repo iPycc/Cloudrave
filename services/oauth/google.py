@@ -174,10 +174,10 @@ class GoogleOAuthSettingsService:
         )
         return await self.get_admin()
 
-    async def get_credentials(self) -> GoogleOAuthCredentials:
+    async def get_credentials(self, *, allow_disabled: bool = False) -> GoogleOAuthCredentials:
         raw = await self.repository.get()
         secret = self._decrypt_secret(raw)
-        if not self._is_ready(raw) or not secret:
+        if not self._is_ready(raw, allow_disabled=allow_disabled) or not secret:
             raise GoogleOAuthProtocolError("Google OAuth is not configured")
         return GoogleOAuthCredentials(
             client_id=str(raw.get("client_id") or ""),
@@ -191,9 +191,9 @@ class GoogleOAuthSettingsService:
             return ""
         return f"{self.site_url}/api/v1/oauth/google/callback"
 
-    def _is_ready(self, raw: dict[str, object]) -> bool:
+    def _is_ready(self, raw: dict[str, object], *, allow_disabled: bool = False) -> bool:
         return bool(
-            raw.get("enabled")
+            (allow_disabled or raw.get("enabled"))
             and str(raw.get("client_id") or "").strip()
             and self._decrypt_secret(raw)
             and self.callback_url
