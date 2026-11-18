@@ -139,6 +139,7 @@ a = Analysis(
         # Storage adapters
         "store.local.fs",
         "store.cos.driver",
+        "store.cos.copy",
         "store.cos.cors",
         "store.cos.key",
         "store.cos.obj",
