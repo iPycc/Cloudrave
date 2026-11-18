@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from schemas.common import CloudraveSchema
 
@@ -32,3 +32,8 @@ class MountSyncRead(CloudraveSchema):
     missing: int = 0
     synced_objects: int = 0
     error: str | None = None
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def normalize_status(cls, value: str) -> str:
+        return {"complete": "completed", "error": "failed"}.get(value, value)

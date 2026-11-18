@@ -92,6 +92,11 @@ class BucketMountRead(BucketMountBase):
     driver_kind: str = ""
     driver_capabilities: list[str] = Field(default_factory=list)
 
+    @field_validator("sync_status", mode="before")
+    @classmethod
+    def normalize_sync_status(cls, value: str) -> str:
+        return {"complete": "completed", "error": "failed"}.get(value, value)
+
 
 class MountUsageRead(CloudraveSchema):
     mount_id: int
