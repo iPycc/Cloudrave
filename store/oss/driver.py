@@ -670,7 +670,7 @@ class AliyunOssAdapter(StorageAdapterBase):
         )
         if not hasattr(result, "version_status"):
             raise ValueError("Could not verify OSS bucket versioning")
-        if str(getattr(result, "version_status", "") or "").lower() not in {"", "disabled"}:
+        if str(getattr(result, "version_status", "") or "").strip():
             raise ValueError("OSS bucket versioning must be disabled for overwrite-protected writes")
 
     def _region(self, policy: Any) -> str:

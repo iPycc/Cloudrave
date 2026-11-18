@@ -182,7 +182,7 @@ class TencentCosAdapter(CosObjectMixin, CosUploadMixin, StorageAdapterBase):
         result = self._client_for(policy).get_bucket_versioning(Bucket=self._bucket(policy))
         if not isinstance(result, dict) or ("Status" not in result and result not in ({}, {"VersioningConfiguration": None})):
             raise ValueError("Could not verify COS bucket versioning")
-        if str(result.get("Status") or "").lower() not in {"", "disabled"}:
+        if str(result.get("Status") or "").strip():
             raise ValueError("COS bucket versioning must be disabled for overwrite-protected writes")
 
     def _mount_prefix(self, policy: Any, mount: Any) -> str:
