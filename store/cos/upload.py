@@ -9,6 +9,7 @@ from typing import Any, BinaryIO
 
 from store.types import MultipartPart, MultipartUploadState, PresignedURL, StorageObject, utcnow
 from store.cos.download import download_settings
+from store.cos.copy import CopySnapshot
 from store.cos.sec import (
     assert_encryption,
     encryption_args,
@@ -83,12 +84,20 @@ class CosUploadMixin:
         total_size: int | None = None,
         mime_type: str | None = None,
         metadata: dict[str, str] | None = None,
+        _copy_snapshot: CopySnapshot | None = None,
     ) -> MultipartUploadState:
-        kwargs: dict[str, Any] = encryption_args(policy)
-        if mime_type:
-            kwargs["ContentType"] = mime_type
-        if metadata:
-            kwargs["Metadata"] = metadata_headers(metadata)
+        if _copy_snapshot is None:
+            kwargs: dict[str, Any] = encryption_args(policy)
+            if mime_type:
+                kwargs["ContentType"] = mime_type
+            if metadata:
+                kwargs["Metadata"] = metadata_headers(metadata)
+        else:
+            kwargs = _copy_snapshot.write_args()
+            kwargs["ACL"] = _copy_snapshot.initial_acl()
+            kwargs["Metadata"] = {f"x-cos-meta-{key}": value for key, value in _copy_snapshot.metadata}
+            if _copy_snapshot.tags:
+                kwargs["Tagging"] = _copy_snapshot.tagging_header()
         response = self._client_for(policy).create_multipart_upload(
             Bucket=self._bucket(policy),
             Key=self._key(policy, mount, object_key),
@@ -211,6 +220,7 @@ class CosUploadMixin:
         mime_type: str | None = None,
         metadata: dict[str, str] | None = None,
         no_overwrite: bool = False,
+        _verify_encryption: bool = True,
     ) -> StorageObject:
         if not parts:
             raise ValueError("at least one multipart part is required")
@@ -238,7 +248,7 @@ class CosUploadMixin:
             },
             **headers,
         )
-        completed = self.head_object(policy, mount, upload.object_key, verify_encryption=True)
+        completed = self.head_object(policy, mount, upload.object_key, verify_encryption=_verify_encryption)
         if upload.total_size is not None and completed.size != upload.total_size:
             raise RuntimeError(
                 f"COS multipart size mismatch: expected {upload.total_size}, received {completed.size}"

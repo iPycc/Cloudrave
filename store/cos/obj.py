@@ -11,6 +11,7 @@ from typing import Any, BinaryIO
 
 from store.types import MultipartPart, StorageObject, StorageObjectPage
 from store.cos.parse import object_from_head, page_from_response
+from store.cos.copy import CopySnapshot, read_copy_snapshot
 from store.cos.sec import assert_encryption, encryption_args, metadata_headers
 from store.cos.stream import AsyncCosStream, CosStream
 
@@ -390,28 +391,38 @@ class CosObjectMixin:
 
     def _copy_without_overwrite(self, policy: Any, mount: Any, source_key: str, destination_key: str) -> StorageObject:
         self._require_unversioned(policy)
-        source = self.head_object(policy, mount, source_key)
-        if source.size is None or not source.etag:
-            raise ValueError("COS source size and ETag are required for a protected copy")
         client = self._client_for(policy)
         bucket = self._bucket(policy)
         target = self._key(policy, mount, destination_key)
-        copy_source = {"Bucket": bucket, "Key": self._key(policy, mount, source_key), "Region": self._region(policy)}
+        source_path = self._key(policy, mount, source_key)
+        if source_path == target:
+            raise ValueError("COS protected copy requires a different destination")
+        source = read_copy_snapshot(client, bucket, source_path)
+        copy_source = {"Bucket": bucket, "Key": source_path, "Region": self._region(policy)}
         if source.size <= 5 * 1024 * 1024 * 1024:
+            attributes = source.write_args()
+            # COS copies the metadata headers itself in Copy mode.
+            attributes = {key: value for key, value in attributes.items() if key in {
+                "StorageClass", "ServerSideEncryption", "SSEKMSKeyId", "SSEKMSContext",
+            }}
             client.copy_object(
                 Bucket=bucket, Key=target, CopySource=copy_source,
                 CopySourceIfMatch=source.etag,
+                ACL=source.initial_acl(),
                 Metadata={"x-cos-forbid-overwrite": "true"},
-                **encryption_args(policy),
+                **attributes,
             )
-            return self.head_object(policy, mount, destination_key, verify_encryption=True)
+            self._finish_protected_copy(client, bucket, source_path, target, source)
+            return self.head_object(policy, mount, destination_key)
 
+        if source.content_md5:
+            raise ValueError("COS multipart copy cannot preserve the source Content-MD5")
         part_size = max(16 * 1024 * 1024, ceil(source.size / self.capabilities.max_parts))
         if part_size > self.capabilities.max_part_size:
             raise ValueError("COS source is too large for multipart copy")
         upload = self.create_multipart_upload(
             policy, mount, destination_key, total_size=source.size,
-            mime_type=source.mime_type, metadata=source.metadata,
+            _copy_snapshot=source,
         )
         parts: list[MultipartPart] = []
         try:
@@ -426,11 +437,31 @@ class CosObjectMixin:
                 if not etag:
                     raise RuntimeError("COS did not return a copied part ETag")
                 parts.append(MultipartPart(part_number=index, etag=etag, size=end - start + 1))
-            return self.complete_multipart_upload(policy, mount, upload, parts, no_overwrite=True)
+            if read_copy_snapshot(client, bucket, source_path) != source:
+                raise RuntimeError("COS source changed during the protected copy")
+            result = self.complete_multipart_upload(
+                policy, mount, upload, parts, no_overwrite=True, _verify_encryption=False,
+            )
+            self._finish_protected_copy(client, bucket, source_path, target, source)
+            return result
         except BaseException:
             with suppress(Exception):
                 self.abort_multipart_upload(policy, mount, upload)
             raise
+
+    @staticmethod
+    def _finish_protected_copy(client: Any, bucket: str, source_path: str, target: str, source: CopySnapshot) -> None:
+        if source.acl_mode != "default":
+            client.put_object_acl(Bucket=bucket, Key=target, AccessControlPolicy=source.acl_policy())
+        copied = read_copy_snapshot(client, bucket, target)
+        if copied.preserved_attributes() != source.preserved_attributes():
+            raise RuntimeError("COS copied object attributes differ from the source")
+        if source.crc64 and source.crc64 != copied.crc64:
+            raise RuntimeError("COS copied object checksum differs from the source")
+        if source.content_md5 and source.content_md5 != copied.content_md5:
+            raise RuntimeError("COS copied object Content-MD5 differs from the source")
+        if read_copy_snapshot(client, bucket, source_path) != source:
+            raise RuntimeError("COS source changed during the protected copy")
 
     async def acopy_object(
         self, policy: Any, mount: Any, source_key: str, destination_key: str, *,
