@@ -307,6 +307,8 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
             if editable:
                 capabilities.append("edit")
             metadata["editable"] = editable
+            if imported:
+                metadata["read_only_reason"] = "导入的源文件暂不支持在线编辑"
             metadata["max_bytes"] = self.text_max_bytes
         elif kind == "archive":
             capabilities.append("list-entries")
