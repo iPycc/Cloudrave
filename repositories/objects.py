@@ -231,6 +231,10 @@ class ObjectRepository:
             .where(Node.mount_id == mount_id, ObjectRecord.id > after_id)
             .order_by(ObjectRecord.id.asc())
             .limit(limit)
+            # Finalization checks timestamps before marking a source missing.
+            # Lock both rows until that decision commits so a concurrent file
+            # operation cannot be silently overwritten between read and write.
+            .with_for_update()
         )
         return list(rows.tuples())
 
