@@ -8,6 +8,7 @@ from models.tables import BucketMount, StoragePolicy
 from store.manager import StorageManager
 from store.key import LEGACY_MANAGED_PREFIX
 from store.call import call_adapter
+from store.errors import is_not_found
 
 
 @dataclass(slots=True, frozen=True)
@@ -91,8 +92,10 @@ class BucketScanner:
         adapter = self.storage_manager.get_adapter(policy)
         try:
             await call_adapter(adapter, "head_object", policy, mount, key)
-        except Exception:
-            return False
+        except Exception as exc:
+            if is_not_found(exc):
+                return False
+            raise
         return True
 
 
