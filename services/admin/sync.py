@@ -270,6 +270,9 @@ class MountSyncService:
         ).hexdigest()
         references = await self.objects.list_physical_in_mount(mount.id, mount.policy_id, physical_id, key)
         if any((record.extra or {}).get("origin") != "bucket_import" for record in references):
+            for record in references:
+                if (record.extra or {}).get("origin") == "bucket_import":
+                    record.extra = {**record.extra, "sync_generation": generation}
             return "skipped"
         try:
             await self.objects.blobs.ensure(physical_id)
@@ -307,6 +310,13 @@ class MountSyncService:
         file_name = parts[-1]
         node = await self.nodes.get_child_any(mount.id, parent_id, file_name)
         if references and all(node is None or record.node_id != node.id for record in references):
+            for record in references:
+                extra = dict(record.extra or {})
+                if (extra.get("etag") != item.etag or extra.get("last_modified") != item.last_modified
+                        or not (item.etag or item.last_modified)):
+                    record.checksum = None
+                extra["sync_generation"] = generation
+                record.extra = extra
             return "conflicts"
         if node is None:
             node = await self.nodes.create_file(
