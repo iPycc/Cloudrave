@@ -221,6 +221,19 @@ class BucketMount(Base, TimestampMixin):
             return 0
 
 
+class MountSyncTask(Base, TimestampMixin):
+    __tablename__ = "mount_sync_tasks"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    mount_id: Mapped[int] = mapped_column(ForeignKey("bucket_mounts.id", ondelete="CASCADE"), unique=True, index=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    generation: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    lease_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class Node(Base, TimestampMixin):
     __tablename__ = "nodes"
 

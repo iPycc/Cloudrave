@@ -7,9 +7,10 @@ from pathlib import Path
 
 from fastapi import APIRouter, Body, Depends, File, Form, Header, HTTPException, Request, UploadFile, status
 from fastapi.responses import Response
+from sqlalchemy import select
 
 from web.mid.auth import get_current_user
-from models.tables import User
+from models.tables import BucketMount, MountSyncTask, User
 from schemas.preview import (
     OfficeCardPreviewRead,
     ArchiveEntryPageRead,
@@ -21,7 +22,7 @@ from schemas.preview import (
     TextContentUpdateRead,
 )
 from schemas.node import NodeRead
-from schemas.task import ArchiveExtractRequest, BackgroundTaskRead
+from schemas.task import ArchiveExtractRequest, BackgroundTaskRead, MountSyncTaskRead
 from services.explorer.extract import list_tasks, start_extract
 from services.explorer.preview import (
     DERIVED_CACHE_CONTROL,
@@ -98,6 +99,33 @@ async def list_background_tasks(
     current_user: User = Depends(get_current_user),
 ) -> list[BackgroundTaskRead]:
     return list_tasks(current_user.id)
+
+
+@router.get("/sync-tasks", response_model=list[MountSyncTaskRead])
+async def list_sync_tasks(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+) -> list[MountSyncTaskRead]:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        rows = await session.execute(
+            select(MountSyncTask, BucketMount)
+            .join(BucketMount, BucketMount.id == MountSyncTask.mount_id)
+            .where(MountSyncTask.owner_id == current_user.id, BucketMount.owner_id == current_user.id)
+            .order_by(MountSyncTask.updated_at.desc())
+        )
+        tasks = []
+        for task, mount in rows:
+            state = (mount.extra or {}).get("_sync") or {}
+            tasks.append(MountSyncTaskRead.model_validate(task).model_copy(update={
+                "name": mount.name,
+                "scanned": int(state.get("scanned", 0)),
+                "created": int(state.get("created", 0)),
+                "updated": int(state.get("updated", 0)),
+                "conflicts": int(state.get("conflicts", 0)),
+                "missing": int(state.get("missing", 0)),
+            }))
+        return tasks
 
 
 @router.get("/preview/{node_id}/archive/entry")

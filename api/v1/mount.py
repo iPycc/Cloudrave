@@ -6,8 +6,10 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, sta
 
 from models.enums import UserRole
 from models.tables import User
+from models.tables import MountSyncTask
 from schemas.mount import BucketMountRead, MountUsageRead
 from schemas.sync import MountSyncRead, MountSyncRequest
+from schemas.task import MountSyncTaskRead
 from schemas.user_mount import (
     OssDomainRequest,
     UserMountCreate,
@@ -18,6 +20,7 @@ from schemas.user_mount import (
 )
 from services.admin.scan import BucketScanner
 from services.admin.sync import MountSyncService
+from services.admin.sync_task import start_sync_task, stop_sync_task
 from services.user.mount import UserMountService
 from web.mid.auth import get_current_user
 
@@ -204,3 +207,41 @@ async def sync_mount(
     async with dep.session_scope() as session:
         await _service(request, session).require_owned_mount(current_user, mount_id)
         return await _sync_service(request, session).run(request, current_user, mount_id, payload)
+
+
+@router.post("/{mount_id}/sync/task", response_model=MountSyncTaskRead, status_code=202)
+async def start_mount_sync_task(
+    mount_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+) -> MountSyncTaskRead:
+    require_mount_manager(current_user)
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        mount = await _service(request, session).require_owned_mount(current_user, mount_id)
+        task = await start_sync_task(dep, session, mount, current_user.id)
+        return MountSyncTaskRead.model_validate(task)
+
+
+@router.post("/{mount_id}/sync/task/{task_id}/{action}", response_model=MountSyncTaskRead)
+async def control_mount_sync_task(
+    mount_id: int,
+    task_id: str,
+    action: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+) -> MountSyncTaskRead:
+    require_mount_manager(current_user)
+    if action not in {"pause", "cancel", "resume"}:
+        raise HTTPException(status_code=404, detail="Unknown task action")
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        mount = await _service(request, session).require_owned_mount(current_user, mount_id)
+        task = await session.get(MountSyncTask, task_id)
+        if task is None or task.mount_id != mount.id or task.owner_id != current_user.id:
+            raise HTTPException(status_code=404, detail="Synchronization task not found")
+        if action == "resume":
+            task = await start_sync_task(dep, session, mount, current_user.id)
+        else:
+            task = await stop_sync_task(dep, session, task, current_user.id, cancel=action == "cancel")
+        return MountSyncTaskRead.model_validate(task)

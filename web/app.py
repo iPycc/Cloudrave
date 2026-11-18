@@ -23,6 +23,7 @@ from web.mid.spa import SpaFallbackMiddleware
 from core.cfg import CloudraveConfig
 from core.log import LogOperation, LogOutcome, configure_logging, get_logger
 from services.admin.database import DatabaseMigrationManager
+from services.admin.sync_task import MountSyncWorker
 
 
 LOGGER = get_logger("cloudrave.lifecycle")
@@ -92,10 +93,13 @@ async def lifespan(app: FastAPI):
             "outcome": LogOutcome.SUCCESS,
         },
     )
+    sync_worker = MountSyncWorker(dep, database_manager)
+    sync_worker.start()
     try:
         yield
     finally:
         LOGGER.info("Closing application services.")
+        await sync_worker.stop()
         await dep.disconnect()
         LOGGER.info(
             "Application services stopped cleanly.",

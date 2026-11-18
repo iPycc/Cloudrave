@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import hashlib
+import json
 from uuid import uuid4
 
 from fastapi import HTTPException, Request, status
@@ -60,8 +61,10 @@ class MountSyncService:
         actor: User,
         mount_id: int,
         payload: MountSyncRequest,
+        *,
+        generation: str | None = None,
     ) -> MountSyncRead:
-        mount, policy, expected = await self._claim_page(mount_id, payload)
+        mount, policy, expected = await self._claim_page(mount_id, payload, generation=generation)
 
         if expected.get("phase") == "finalizing":
             return await self._finalize_page(request, actor, mount_id, expected)
@@ -83,6 +86,8 @@ class MountSyncService:
         self,
         mount_id: int,
         payload: MountSyncRequest,
+        *,
+        generation: str | None = None,
     ) -> tuple[BucketMount, StoragePolicy, dict]:
         mount = await self.mounts.get_by_id_for_update(mount_id)
         if mount is None:
@@ -105,8 +110,16 @@ class MountSyncService:
             )
 
         state = self._state(mount)
+        if generation is not None and (
+            state.get("generation") != generation or state.get("status") != "running"
+        ):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Synchronization task is no longer active")
         if payload.restart or state.get("status") != "running":
             state = self._new_state()
+            state["mapping"] = self.mapping_signature(policy, mount)
+            await self.mounts.save_sync_state(mount, state)
+        elif not state.get("mapping"):
+            state["mapping"] = self.mapping_signature(policy, mount)
             await self.mounts.save_sync_state(mount, state)
 
         # Release the row lock before the remote provider request. The generation and
@@ -133,6 +146,8 @@ class MountSyncService:
             await self.session.refresh(mount)
             current = self._state(mount)
             current_policy = await self.policies.get_by_id(mount.policy_id)
+            if current_policy is not None:
+                await self.session.refresh(current_policy)
 
             invalid_reason: str | None = None
             if not mount.is_enabled:
@@ -144,19 +159,18 @@ class MountSyncService:
                 or current_policy is None
                 or current_policy.status != "active"
                 or not self.scanner.storage_manager.get_adapter(current_policy).capabilities.supports_mirror
+                or current.get("mapping") != self.mapping_signature(current_policy, mount)
             ):
                 invalid_reason = "Storage policy changed while the sync page was in flight"
 
-            if invalid_reason is not None:
+            if not self._same_page(current, expected):
+                result = self._read(mount, current)
+            elif invalid_reason is not None:
                 failed = dict(current)
                 failed["status"] = "error"
                 failed["error"] = invalid_reason
                 await self.mounts.save_sync_state(mount, failed)
                 result = self._read(mount, failed)
-            elif not self._same_page(current, expected):
-                # Another request already applied this cursor (or restarted the
-                # generation). Discard the stale provider response without replaying it.
-                result = self._read(mount, current)
             else:
                 next_state = dict(current)
                 cache = _PageCache(policy=policy)
@@ -331,7 +345,12 @@ class MountSyncService:
             if not self._same_page(current, expected):
                 return self._read(mount, current)
             policy = await self.policies.get_by_id(mount.policy_id)
-            if not mount.is_enabled or mount.mode != "mirror" or policy is None or policy.status != "active":
+            if policy is not None:
+                await self.session.refresh(policy)
+            if (
+                not mount.is_enabled or mount.mode != "mirror" or policy is None or policy.status != "active"
+                or current.get("mapping") != self.mapping_signature(policy, mount)
+            ):
                 current["status"] = "error"
                 current["error"] = "Storage mount changed during synchronization"
                 await self.mounts.save_sync_state(mount, current)
@@ -410,6 +429,16 @@ class MountSyncService:
             "sync_generation": generation,
             "external_missing": False,
         }
+
+    @staticmethod
+    def mapping_signature(policy: StoragePolicy, mount: BucketMount) -> str:
+        values = [
+            policy.id, policy.provider, policy.bucket_name, policy.region, policy.endpoint, policy.base_prefix,
+            mount.root_path, (mount.extra or {}).get("legacy_prefixed_keys", False),
+            (mount.extra or {}).get("storage_root"), (policy.extra or {}).get("root_id"),
+            (mount.extra or {}).get("root_id"),
+        ]
+        return hashlib.sha256(json.dumps(values, ensure_ascii=False, default=str).encode()).hexdigest()
 
     @staticmethod
     def _new_state() -> dict:

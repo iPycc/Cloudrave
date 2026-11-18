@@ -7,6 +7,7 @@ from db.mig.row import SchemaMigration
 from models.tables import (
     AuditLog,
     BucketMount,
+    MountSyncTask,
     Node,
     ObjectRecord,
     OAuthIdentity,
@@ -26,6 +27,7 @@ from models.tables import (
 __all__ = [
     "AuditLog",
     "BucketMount",
+    "MountSyncTask",
     "BlobRef",
     "GcTask",
     "Node",

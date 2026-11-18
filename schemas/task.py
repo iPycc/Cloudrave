@@ -26,3 +26,19 @@ class BackgroundTaskRead(CloudraveSchema):
     result_node_id: int | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class MountSyncTaskRead(CloudraveSchema):
+    id: str
+    mount_id: int
+    owner_id: int
+    status: Literal["pending", "running", "paused", "completed", "failed", "canceled"]
+    error: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    name: str | None = None
+    scanned: int = 0
+    created: int = 0
+    updated: int = 0
+    conflicts: int = 0
+    missing: int = 0
