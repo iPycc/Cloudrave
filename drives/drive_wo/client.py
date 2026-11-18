@@ -470,11 +470,10 @@ class DriveWoClient:
                     for entry in self.list_children(str(state["p"]))
                     if not entry.is_dir
                     and entry.name == str(state["n"])
-                    and entry.size == int(state["s"])
                 ]
                 if len(matches) > 1:
                     raise RemoteProtocolError("联通云盘返回多个同名文件，无法确认上传结果")
-                if matches:
+                if matches and matches[0].size == int(state["s"]):
                     return matches[0]
                 if attempt < 9:
                     time.sleep(min(0.2 * (attempt + 1), 1.0))
