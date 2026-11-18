@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime
-from pathlib import PurePath
+from pathlib import PurePath, PurePosixPath
+from string import Formatter
 from typing import Any
 from uuid import uuid4
 
@@ -21,18 +22,67 @@ def managed_key(
     *,
     now: datetime | None = None,
     style: str = "readable",
+    directory: str = "",
+    template: str | None = None,
 ) -> str:
     _ = owner_id, now or datetime.now(UTC)
     suffix = PurePath(filename).suffix.lower()
     if len(suffix) > 16 or not re.fullmatch(r"\.[a-z0-9]+", suffix):
         suffix = ""
+    safe_name = PurePath(filename).name.replace("/", "_").replace("\\", "_")
     blob_id = uuid4().hex
-    if style == "opaque":
-        object_name = f"{blob_id}{suffix}"
-    else:
-        safe_name = PurePath(filename).name.replace("/", "_").replace("\\", "_")
-        object_name = f"{blob_id}-{safe_name}"
-    return join_object_key(MANAGED_PREFIX, object_name)
+    if template is None:
+        object_name = f"{blob_id}{suffix}" if style == "opaque" else f"{blob_id}-{safe_name}"
+        return join_object_key(MANAGED_PREFIX, object_name)
+    return format_object_key(template, directory=directory, filename=safe_name, blob_id=blob_id)
+
+
+def format_object_key(template: str, *, directory: str, filename: str, blob_id: str) -> str:
+    """Render a mount-relative object key from validated path components."""
+
+    if not template or "\\" in template or template.startswith("/") or template.endswith("/"):
+        raise ValueError("Invalid object key template")
+    directory_parts = directory.split("/") if directory else []
+    if any(not part or part in {".", ".."} or "\\" in part or "\x00" in part for part in directory_parts):
+        raise ValueError("Invalid directory path")
+    if not filename or filename in {".", ".."} or "/" in filename or "\\" in filename:
+        raise ValueError("Invalid file name")
+    path = PurePosixPath(filename)
+    values = {"filename": filename, "stem": path.stem, "ext": path.suffix, "blob_id": blob_id}
+    parts: list[str] = []
+    fields: set[str] = set()
+    for segment in template.split("/"):
+        if segment == "{dir}":
+            if "dir" in fields:
+                raise ValueError("Template may contain the directory variable only once")
+            fields.add("dir")
+            parts.extend(directory_parts)
+            continue
+        if not segment:
+            raise ValueError("Empty template segment")
+        fragments: list[str] = []
+        try:
+            for literal, field, specification, conversion in Formatter().parse(segment):
+                fragments.append(literal)
+                if field is not None:
+                    if field not in values or specification or conversion:
+                        raise ValueError("Unknown or invalid template variable")
+                    fields.add(field)
+                    fragments.append(values[field])
+        except ValueError as exc:
+            raise ValueError("Invalid object key template") from exc
+        part = "".join(fragments)
+        if not part or part in {".", ".."} or "/" in part or "\\" in part or "\x00" in part:
+            raise ValueError("Invalid object key segment")
+        parts.append(part)
+    if "dir" not in fields or not fields.intersection({"filename", "stem", "blob_id"}):
+        raise ValueError("Template must contain a directory and a file name variable")
+    result = "/".join(parts)
+    if not result or len(result.encode("utf-8")) > 1024:
+        raise ValueError("Object key exceeds the storage limit")
+    if result == LEGACY_MANAGED_PREFIX or result.startswith(f"{LEGACY_MANAGED_PREFIX}/"):
+        raise ValueError("Object key uses a reserved prefix")
+    return result
 
 
 def is_managed_key(value: str) -> bool:
