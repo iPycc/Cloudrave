@@ -12,6 +12,7 @@ import binascii
 import hashlib
 import json
 import mimetypes
+import re
 import time
 from http.cookies import SimpleCookie
 from secrets import randbelow
@@ -346,6 +347,12 @@ class DriveWoClient:
         mime_type: str | None,
     ) -> str:
         _ = provider_checksum
+        # Browser responses may be hidden by CORS. A unique managed name that
+        # did not exist before this session gives the later lookup an identity
+        # signal in addition to name and size. Existing sessions without this
+        # evidence must not infer success from a pre-existing object.
+        unique_name = bool(re.match(r"^[0-9a-f]{32}(?:-|\.|$)", file_name))
+        prior_match = any(entry.name == file_name for entry in self.list_children(parent_id))
         return encode_upload_state({
             "i": f"{int(time.time() * 1000)}{randbelow(1000):03d}",
             "b": time.strftime("%Y%m%d%H%M%S"),
@@ -357,6 +364,7 @@ class DriveWoClient:
             "m": mime_type or mimetypes.guess_type(file_name)[0] or "application/octet-stream",
             "f": self._file_type(file_name),
             "u": self._upload_zone(),
+            "q": unique_name and not prior_match,
         })
 
     def part_plan(self, upload: MultipartUploadState, part_number: int) -> PresignedURL:
@@ -451,22 +459,23 @@ class DriveWoClient:
             if part.etag.startswith("remote:"):
                 remote_id = part.etag.split(":", 1)[1]
         if not remote_id:
+            if state.get("q") is not True:
+                raise RemoteProtocolError("联通云盘未返回文件身份，无法确认上传结果，请取消旧任务后重新上传，或使用中转上传")
             # Direct browser uploads have an opaque response because WoPan's
             # upload host does not publish CORS response headers. The completed
             # object can appear in the file list slightly after the last part.
             for attempt in range(10):
-                match = next(
-                    (
-                        entry
-                        for entry in self.list_children(str(state["p"]))
-                        if not entry.is_dir
-                        and entry.name == str(state["n"])
-                        and entry.size == int(state["s"])
-                    ),
-                    None,
-                )
-                if match is not None:
-                    return match
+                matches = [
+                    entry
+                    for entry in self.list_children(str(state["p"]))
+                    if not entry.is_dir
+                    and entry.name == str(state["n"])
+                    and entry.size == int(state["s"])
+                ]
+                if len(matches) > 1:
+                    raise RemoteProtocolError("联通云盘返回多个同名文件，无法确认上传结果")
+                if matches:
+                    return matches[0]
                 if attempt < 9:
                     time.sleep(min(0.2 * (attempt + 1), 1.0))
             raise RemoteProtocolError("联通云盘直传完成后未找到文件")
