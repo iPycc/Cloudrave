@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, urlencode
 
+from store.errors import storage_error_code
+
 
 @dataclass(frozen=True, slots=True)
 class CopySnapshot:
@@ -52,6 +54,13 @@ class CopySnapshot:
 def read_copy_snapshot(client: Any, oss: Any, bucket: str, key: str) -> CopySnapshot:
     """Read the identity and attributes needed to verify a copy; never change the source."""
 
+    try:
+        client.get_symlink(oss.GetSymlinkRequest(bucket=bucket, key=key))
+    except Exception as exc:
+        if storage_error_code(exc) != "NotSymlink":
+            raise
+    else:
+        raise ValueError("OSS symbolic links require a separate migration")
     head = client.head_object(oss.HeadObjectRequest(bucket=bucket, key=key))
     size = getattr(head, "content_length", None)
     etag = str(getattr(head, "etag", "") or "").strip('"')

@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import quote, urlencode
 
 from store.cos.parse import header, metadata, one_or_many
+from store.errors import storage_error_code
 
 
 def _acl_parts(acl: dict[str, Any]) -> tuple[str, tuple[tuple[str, str, str, str], ...]]:
@@ -73,6 +74,13 @@ class CopySnapshot:
 
 
 def read_copy_snapshot(client: Any, bucket: str, key: str) -> CopySnapshot:
+    try:
+        client.get_symlink(Bucket=bucket, SymlinkName=key)
+    except Exception as exc:
+        if storage_error_code(exc) != "NotSymlink":
+            raise
+    else:
+        raise ValueError("COS symbolic links require a separate migration")
     head = client.head_object(Bucket=bucket, Key=key)
     raw_size = header(head, "content-length")
     etag = header(head, "etag")
