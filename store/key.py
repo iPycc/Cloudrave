@@ -131,6 +131,14 @@ def physical_key(policy: Any, mount: Any, object_key: str) -> str:
     return f"{prefix}/{logical}"
 
 
+def validate_physical_key(key: str, *, max_bytes: int, provider: str) -> str:
+    """Validate the complete provider key, including the configured mount prefix."""
+
+    if not key or "\x00" in key or len(key.encode("utf-8")) > max_bytes:
+        raise ValueError(f"{provider} object key exceeds the provider limit or contains NUL")
+    return key
+
+
 def physical_list_prefix(policy: Any, mount: Any, prefix: str = "") -> str:
     mounted = mount_prefix(policy, mount)
     if not prefix:

@@ -298,18 +298,14 @@ class CosObjectMixin:
 
     def put_directory_marker(self, policy: Any, mount: Any, directory: str) -> None:
         self._require_unversioned(policy)
-        key = self._key(policy, mount, directory).rstrip("/") + "/"
-        if "\x00" in key or len(key.encode("utf-8")) > 1024:
-            raise ValueError("Invalid COS directory marker key")
+        key = self._validate_physical_key(self._key(policy, mount, directory).rstrip("/") + "/")
         self._client_for(policy).put_object(
             Bucket=self._bucket(policy), Key=key, Body=b"",
             Metadata={"x-cos-forbid-overwrite": "true"}, **encryption_args(policy),
         )
 
     def delete_directory_marker(self, policy: Any, mount: Any, directory: str) -> None:
-        key = self._key(policy, mount, directory).rstrip("/") + "/"
-        if "\x00" in key or len(key.encode("utf-8")) > 1024:
-            raise ValueError("Invalid COS directory marker key")
+        key = self._validate_physical_key(self._key(policy, mount, directory).rstrip("/") + "/")
         self._client_for(policy).delete_object(Bucket=self._bucket(policy), Key=key)
 
     def _get_object_response(

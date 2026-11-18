@@ -14,7 +14,7 @@ from threading import Lock
 from typing import Any, BinaryIO
 from urllib.parse import quote, urlsplit
 
-from store.key import logical_key, mount_prefix, physical_key, physical_list_prefix
+from store.key import logical_key, mount_prefix, physical_key, physical_list_prefix, validate_physical_key
 from store.oss.stream import OssStream
 from store.oss.download import download_settings
 from store.oss.copy import CopySnapshot, read_copy_snapshot
@@ -265,18 +265,14 @@ class AliyunOssAdapter(StorageAdapterBase):
 
     def put_directory_marker(self, policy: Any, mount: Any, directory: str) -> None:
         self._require_unversioned(policy)
-        key = self._key(policy, mount, directory).rstrip("/") + "/"
-        if "\x00" in key or len(key.encode("utf-8")) > 1024:
-            raise ValueError("Invalid OSS directory marker key")
+        key = self._validate_physical_key(self._key(policy, mount, directory).rstrip("/") + "/")
         self._client_for(policy).put_object(oss.PutObjectRequest(
             bucket=self._bucket(policy), key=key, body=BytesIO(b""),
             forbid_overwrite=True, **self._encryption_args(policy),
         ))
 
     def delete_directory_marker(self, policy: Any, mount: Any, directory: str) -> None:
-        key = self._key(policy, mount, directory).rstrip("/") + "/"
-        if "\x00" in key or len(key.encode("utf-8")) > 1024:
-            raise ValueError("Invalid OSS directory marker key")
+        key = self._validate_physical_key(self._key(policy, mount, directory).rstrip("/") + "/")
         self._client_for(policy).delete_object(oss.DeleteObjectRequest(
             bucket=self._bucket(policy), key=key,
         ))
@@ -715,7 +711,11 @@ class AliyunOssAdapter(StorageAdapterBase):
         return str(self._target(policy)["region"])
 
     def _key(self, policy: Any, mount: Any, object_key: str) -> str:
-        return physical_key(policy, mount, object_key)
+        return self._validate_physical_key(physical_key(policy, mount, object_key))
+
+    @staticmethod
+    def _validate_physical_key(key: str) -> str:
+        return validate_physical_key(key, max_bytes=1023, provider="OSS")
 
     def _list_prefix(self, policy: Any, mount: Any, prefix: str = "") -> str:
         return physical_list_prefix(policy, mount, prefix)

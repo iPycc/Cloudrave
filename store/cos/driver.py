@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 from store.port import StorageAdapterBase
 from store.cos.cors import RULE_ID, configured_origins, merge_rule
 from store.identity import physical_hash
-from store.key import mount_prefix, physical_key, physical_list_prefix
+from store.key import mount_prefix, physical_key, physical_list_prefix, validate_physical_key
 from store.cos.obj import CosObjectMixin
 from store.cos.upload import CosUploadMixin
 from store.cos.download import download_settings
@@ -173,7 +173,14 @@ class TencentCosAdapter(CosObjectMixin, CosUploadMixin, StorageAdapterBase):
         return self._target(policy).region
 
     def _key(self, policy: Any, mount: Any, object_key: str) -> str:
-        return physical_key(policy, mount, object_key)
+        return self._validate_physical_key(physical_key(policy, mount, object_key))
+
+    @staticmethod
+    def _validate_physical_key(key: str) -> str:
+        key = validate_physical_key(key, max_bytes=850, provider="COS")
+        if any(character in key for character in "\x18\x19\x1a\x1b"):
+            raise ValueError("COS object key contains an unsupported control character")
+        return key
 
     def _list_prefix(self, policy: Any, mount: Any, prefix: str = "") -> str:
         return physical_list_prefix(policy, mount, prefix)
