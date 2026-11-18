@@ -248,7 +248,9 @@ class MountSyncService:
         generation: str,
         cache: _PageCache,
     ) -> str:
-        key = item.key.strip("/")
+        if item.key.startswith("/") or "\\" in item.key or "\x00" in item.key:
+            return "conflicts"
+        key = item.key[:-1] if item.is_directory and item.key.endswith("/") else item.key
         if not key:
             return "conflicts"
         parts = key.split("/")

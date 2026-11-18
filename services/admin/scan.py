@@ -62,7 +62,11 @@ class BucketScanner:
             ):
                 continue
             is_directory = raw.metadata.get("is_directory_marker") is True
-            if is_directory:
+            logical = str(raw.object_key)
+            candidate = logical[:-1] if is_directory and logical.endswith("/") else logical
+            invalid = (logical.startswith("/") or "\\" in logical or "\x00" in logical or not candidate
+                       or any(not part or part in {".", ".."} or len(part) > 255 for part in candidate.split("/")))
+            if is_directory or invalid:
                 identity = ""
             elif hasattr(adapter, "listed_physical_id"):
                 identity = await call_adapter(adapter, "listed_physical_id", policy, mount, raw)

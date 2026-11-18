@@ -13,7 +13,7 @@ def utcnow() -> datetime:
 
 
 def normalize_object_key(value: str) -> str:
-    candidate = value.replace("\\", "/").strip()
+    candidate = value.replace("\\", "/")
     candidate = candidate.lstrip("/")
     if not candidate:
         raise ValueError("object key is required")

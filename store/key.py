@@ -98,7 +98,8 @@ def clean_prefix(value: str | None) -> str:
 
     if not value or not value.strip("/\\ "):
         return ""
-    return normalize_object_key(value)
+    # Keep the historical trimming behavior for configured mount prefixes.
+    return normalize_object_key(value.strip())
 
 
 def mount_prefix(policy: Any, mount: Any) -> str:
@@ -141,7 +142,9 @@ def physical_list_prefix(policy: Any, mount: Any, prefix: str = "") -> str:
 
 
 def logical_key(policy: Any, mount: Any, key: str) -> str:
-    normalized = normalize_object_key(key)
+    # Listing must retain the exact provider key. Invalid virtual path segments
+    # are reported as import conflicts instead of being silently normalized.
+    normalized = str(key)
     prefix = mount_prefix(policy, mount)
     if not prefix:
         return normalized
