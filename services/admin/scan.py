@@ -55,11 +55,15 @@ class BucketScanner:
             physical_key = str(raw.storage_path).replace("\\", "/")
             if not raw.object_key or physical_key.endswith("/") or is_managed_key(raw.object_key):
                 continue
+            if hasattr(adapter, "listed_physical_id"):
+                identity = await call_adapter(adapter, "listed_physical_id", policy, mount, raw)
+            else:
+                identity = await call_adapter(adapter, "physical_id", policy, mount, raw.object_key)
             items.append(
                 BucketItem(
                     key=raw.object_key,
                     physical_key=physical_key,
-                    physical_id=adapter.physical_id(policy, mount, raw.object_key),
+                    physical_id=identity,
                     size=int(raw.size or 0),
                     etag=_optional_text(raw.etag, strip_quotes=True),
                     last_modified=_optional_text(raw.metadata.get("last_modified")),
