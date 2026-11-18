@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from fastapi import HTTPException, status
 
@@ -14,6 +15,18 @@ from store.errors import storage_error_code
 
 
 PRESIGN_WINDOW = 3
+LOGGER = logging.getLogger("cloudrave.upload")
+
+
+async def _abort_unplanned_upload(adapter, policy, mount, upload) -> None:
+    try:
+        await call_adapter(adapter, "abort_multipart_upload", policy, mount, upload)
+    except Exception as exc:
+        LOGGER.warning(
+            "Could not abort an unplanned multipart upload for mount %s (provider code %s)",
+            mount.id,
+            storage_error_code(exc) or "unknown",
+        )
 
 
 def _window(extra: dict) -> int:
@@ -130,20 +143,24 @@ async def make_plan(*, uploads, storage_manager, policy, mount, parent, file_nam
                 detail="阿里云 OSS 拒绝了分片上传签名，请检查存储配置中的 Bucket 地域、Endpoint 和 AccessKey。",
             ) from exc
         raise
-    record = await uploads.create_session(
-        owner_id=mount.owner_id,
-        mount_id=mount.id,
-        node_id=parent.id if parent else None,
-        path=object_key,
-        mode=UploadMode.MULTIPART,
-        upload_id=upload.upload_id,
-        file_name=file_name,
-        content_type=payload.content_type,
-        size=payload.size,
-        part_size=size,
-        checksum=payload.checksum,
-        provider_checksum=payload.provider_checksum,
-    )
+    try:
+        record = await uploads.create_session(
+            owner_id=mount.owner_id,
+            mount_id=mount.id,
+            node_id=parent.id if parent else None,
+            path=object_key,
+            mode=UploadMode.MULTIPART,
+            upload_id=upload.upload_id,
+            file_name=file_name,
+            content_type=payload.content_type,
+            size=payload.size,
+            part_size=size,
+            checksum=payload.checksum,
+            provider_checksum=payload.provider_checksum,
+        )
+    except BaseException:
+        await asyncio.shield(_abort_unplanned_upload(adapter, policy, mount, upload))
+        raise
     extra = policy.extra or {}
     window = (
         0
@@ -165,9 +182,18 @@ async def make_plan(*, uploads, storage_manager, policy, mount, parent, file_nam
             if getattr(adapter, "supports_relay_upload", False)
             else None
         )
-        urls = await asyncio.gather(
-            *(sign_part(adapter, policy, mount, upload, number, relay_url=relay_url) for number in range(1, window + 1))
-        )
+        try:
+            results = await asyncio.gather(
+                *(sign_part(adapter, policy, mount, upload, number, relay_url=relay_url) for number in range(1, window + 1)),
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+            urls = results
+        except BaseException:
+            await asyncio.shield(_abort_unplanned_upload(adapter, policy, mount, upload))
+            raise
     return record, UploadSessionPlan(
         session_id=record.id,
         upload_mode=UploadMode.MULTIPART,
