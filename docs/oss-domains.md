@@ -29,3 +29,7 @@ Cloudrave 不接收或保存证书私钥，也不自动修改 DNS。
 
 自动化测试覆盖真实 SDK 离线签名、STS、中文路径、下载文件名、客户端缓存切换、上传隔离、绑定操作及归属检查。
 上线前需使用真实 Bucket 完成私有文件下载、预览、分享、域名绑定和 DNS/TLS 联调。
+
+## 分片上传签名错误
+
+如果 OSS 返回 `SignatureDoesNotMatch`，先核对存储设置里的地域和访问密钥。比如广州 Bucket 的地域是 `cn-guangzhou`，公网 Endpoint 可留空让 SDK 自动生成，也可填 `https://oss-cn-guangzhou.aliyuncs.com`。自定义下载域名填写在下载域名一栏。详见[阿里云 OSS 签名错误排查](https://www.alibabacloud.com/help/en/oss/user-guide/0002-00000201)。

@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 
+from fastapi import HTTPException, status
+
 from models.enums import UploadMode
 from schemas.upload import UploadPartPlan, UploadSessionPlan
 from services.explorer.up_check import apply_threshold, choose_mode, choose_part_size, part_count, validate_part_count
 from store.call import call_adapter
+from store.errors import storage_error_code
 
 
 PRESIGN_WINDOW = 3
@@ -104,21 +107,29 @@ async def make_plan(*, uploads, storage_manager, policy, mount, parent, file_nam
             required_response_headers=[],
         )
 
-    upload = await call_adapter(
-        adapter,
-        "create_multipart_upload",
-        policy,
-        mount,
-        object_key,
-        total_size=payload.size,
-        mime_type=payload.content_type,
-        metadata={
-            "sha256": payload.checksum or "",
-            "provider_checksum": payload.provider_checksum or "",
-            "file_name": file_name,
-            "part_size": str(size),
-        },
-    )
+    try:
+        upload = await call_adapter(
+            adapter,
+            "create_multipart_upload",
+            policy,
+            mount,
+            object_key,
+            total_size=payload.size,
+            mime_type=payload.content_type,
+            metadata={
+                "sha256": payload.checksum or "",
+                "provider_checksum": payload.provider_checksum or "",
+                "file_name": file_name,
+                "part_size": str(size),
+            },
+        )
+    except Exception as exc:
+        if adapter.provider_type == "aliyun_oss" and storage_error_code(exc) == "SignatureDoesNotMatch":
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="阿里云 OSS 拒绝了分片上传签名，请检查存储配置中的 Bucket 地域、Endpoint 和 AccessKey。",
+            ) from exc
+        raise
     record = await uploads.create_session(
         owner_id=mount.owner_id,
         mount_id=mount.id,

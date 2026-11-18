@@ -346,11 +346,13 @@ class AliyunOssAdapter(StorageAdapterBase):
         mime_type: str | None = None,
         metadata: dict[str, str] | None = None,
     ) -> MultipartUploadState:
+        # OSS signs these as x-oss-meta-* headers and does not allow underscores in their names.
+        oss_metadata = {key.replace("_", "-"): value for key, value in (metadata or {}).items() if value}
         result = self._client_for(policy).initiate_multipart_upload(oss.InitiateMultipartUploadRequest(
             bucket=self._bucket(policy),
             key=self._key(policy, mount, object_key),
             content_type=mime_type,
-            metadata=metadata or None,
+            metadata=oss_metadata or None,
             **self._encryption_args(policy),
         ))
         upload_id = str(getattr(result, "upload_id", ""))
