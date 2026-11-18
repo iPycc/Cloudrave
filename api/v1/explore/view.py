@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import mimetypes
+import json
 from pathlib import Path
 
-from fastapi import APIRouter, Body, Depends, File, Form, Header, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, Body, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import Response
 from sqlalchemy import select
 
 from web.mid.auth import get_current_user
-from models.tables import BucketMount, MountSyncTask, User
+from models.tables import BucketMount, MountSyncConflict, MountSyncTask, User
 from schemas.preview import (
     OfficeCardPreviewRead,
     ArchiveEntryPageRead,
@@ -22,7 +23,7 @@ from schemas.preview import (
     TextContentUpdateRead,
 )
 from schemas.node import NodeRead
-from schemas.task import ArchiveExtractRequest, BackgroundTaskRead, MountSyncTaskRead
+from schemas.task import ArchiveExtractRequest, BackgroundTaskRead, MountSyncConflictPage, MountSyncConflictRead, MountSyncTaskRead
 from services.explorer.extract import list_tasks, start_extract
 from services.explorer.preview import (
     DERIVED_CACHE_CONTROL,
@@ -127,6 +128,39 @@ async def list_sync_tasks(
                 "missing": int(state.get("missing", 0)),
             }))
         return tasks
+
+
+@router.get("/sync-tasks/{task_id}/conflicts", response_model=MountSyncConflictPage)
+async def list_sync_conflicts(
+    task_id: str,
+    request: Request,
+    after_id: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=200),
+    current_user: User = Depends(get_current_user),
+) -> MountSyncConflictPage:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        task = await session.scalar(
+            select(MountSyncTask).join(BucketMount, BucketMount.id == MountSyncTask.mount_id).where(
+                MountSyncTask.id == task_id,
+                MountSyncTask.owner_id == current_user.id,
+                BucketMount.owner_id == current_user.id,
+            )
+        )
+        if task is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Synchronization task not found")
+        rows = list(await session.scalars(
+            select(MountSyncConflict).where(
+                MountSyncConflict.mount_id == task.mount_id,
+                MountSyncConflict.generation == task.generation,
+                MountSyncConflict.id > after_id,
+            ).order_by(MountSyncConflict.id).limit(limit + 1)
+        ))
+        selected = rows[:limit]
+        return MountSyncConflictPage(
+            items=[MountSyncConflictRead(id=row.id, key=json.loads(row.key_json), reason=row.reason) for row in selected],
+            next_after_id=selected[-1].id if len(rows) > limit else None,
+        )
 
 
 @router.get("/preview/{node_id}/archive/entry")

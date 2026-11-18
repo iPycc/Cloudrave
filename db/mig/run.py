@@ -17,6 +17,7 @@ from db.mig.v5 import upgrade as upgrade_v5
 from db.mig.v6 import upgrade as upgrade_v6
 from db.mig.v7 import upgrade as upgrade_v7
 from db.mig.v8 import upgrade as upgrade_v8
+from db.mig.v9 import upgrade as upgrade_v9
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +36,7 @@ MIGRATIONS = (
     Migration(6, "drive-credentials", upgrade_v6),
     Migration(7, "normalize-drive-ids", upgrade_v7),
     Migration(8, "direct-operator-drive-uploads", upgrade_v8),
+    Migration(9, "mount-sync-conflicts", upgrade_v9),
 )
 
 

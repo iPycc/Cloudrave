@@ -234,6 +234,23 @@ class MountSyncTask(Base, TimestampMixin):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class MountSyncConflict(Base):
+    __tablename__ = "mount_sync_conflicts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    mount_id: Mapped[int] = mapped_column(ForeignKey("bucket_mounts.id", ondelete="CASCADE"))
+    generation: Mapped[str] = mapped_column(String(32))
+    key_hash: Mapped[str] = mapped_column(String(64))
+    key_json: Mapped[str] = mapped_column(Text)
+    reason: Mapped[str] = mapped_column(String(40))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("mount_id", "generation", "key_hash", name="uq_sync_conflict_identity"),
+        Index("ix_sync_conflict_page", "mount_id", "generation", "id"),
+    )
+
+
 class Node(Base, TimestampMixin):
     __tablename__ = "nodes"
 

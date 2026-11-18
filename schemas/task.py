@@ -43,3 +43,14 @@ class MountSyncTaskRead(CloudraveSchema):
     conflicts: int = 0
     skipped: int = 0
     missing: int = 0
+
+
+class MountSyncConflictRead(CloudraveSchema):
+    id: int
+    key: str
+    reason: Literal["invalid_path", "folder_conflict", "source_unavailable", "indexed_elsewhere", "name_conflict"]
+
+
+class MountSyncConflictPage(CloudraveSchema):
+    items: list[MountSyncConflictRead]
+    next_after_id: int | None = None

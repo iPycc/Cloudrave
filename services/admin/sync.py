@@ -14,7 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.enums import NodeStatus, NodeType
-from models.tables import BucketMount, MountSyncTask, Node, StoragePolicy, User
+from models.tables import BucketMount, MountSyncConflict, MountSyncTask, Node, StoragePolicy, User
 from repositories.audit_logs import AuditLogRepository
 from repositories.blobs import BlobUnavailable
 from repositories.mounts import BucketMountRepository
@@ -181,15 +181,40 @@ class MountSyncService:
                 cache = _PageCache(policy=policy)
                 try:
                     async with self.session.begin_nested():
+                        conflicts: dict[str, tuple[str, str]] = {}
                         for item in page.items:
                             next_state["scanned"] += 1
-                            outcome = await self._upsert_item(
+                            outcome, reason = await self._upsert_item(
                                 mount,
                                 item,
                                 next_state["generation"],
                                 cache,
                             )
-                            next_state[outcome] = next_state.get(outcome, 0) + 1
+                            if outcome == "conflicts":
+                                encoded = json.dumps(item.key, ensure_ascii=True)
+                                identity = hashlib.sha256(encoded.encode("ascii")).hexdigest()
+                                conflicts[identity] = (encoded, reason or "name_conflict")
+                            else:
+                                next_state[outcome] = next_state.get(outcome, 0) + 1
+
+                        if conflicts:
+                            existing: set[str] = set()
+                            identities = list(conflicts)
+                            for offset in range(0, len(identities), 400):
+                                existing.update(await self.session.scalars(
+                                    select(MountSyncConflict.key_hash).where(
+                                        MountSyncConflict.mount_id == mount.id,
+                                        MountSyncConflict.generation == next_state["generation"],
+                                        MountSyncConflict.key_hash.in_(identities[offset:offset + 400]),
+                                    )
+                                ))
+                            for identity, (encoded, reason) in conflicts.items():
+                                if identity not in existing:
+                                    self.session.add(MountSyncConflict(
+                                        mount_id=mount.id, generation=next_state["generation"],
+                                        key_hash=identity, key_json=encoded, reason=reason,
+                                    ))
+                                    next_state["conflicts"] = next_state.get("conflicts", 0) + 1
 
                         next_state["cursor"] = page.next_cursor
                         if page.complete:
@@ -247,15 +272,15 @@ class MountSyncService:
         item: BucketItem,
         generation: str,
         cache: _PageCache,
-    ) -> str:
+    ) -> tuple[str, str | None]:
         if item.key.startswith("/") or "\\" in item.key or "\x00" in item.key:
-            return "conflicts"
+            return "conflicts", "invalid_path"
         key = item.key[:-1] if item.is_directory and item.key.endswith("/") else item.key
         if not key:
-            return "conflicts"
+            return "conflicts", "invalid_path"
         parts = key.split("/")
         if any(not part or part in {".", ".."} or len(part) > 255 for part in parts):
-            return "conflicts"
+            return "conflicts", "invalid_path"
 
         if item.is_directory:
             if cache.root is None:
@@ -271,10 +296,10 @@ class MountSyncService:
                         owner_id=mount.owner_id, mount_id=mount.id, parent_id=parent_id, name=name,
                     )
                 except (IntegrityError, ValueError):
-                    return "conflicts"
+                    return "conflicts", "folder_conflict"
                 created = created or existing is None
                 parent_id = folder.id
-            return "created" if created else "unchanged"
+            return ("created" if created else "unchanged"), None
 
         physical_id = item.physical_id or hashlib.sha256(
             f"{mount.policy_id}\0{item.physical_key}".encode()
@@ -284,12 +309,12 @@ class MountSyncService:
             if (record.extra or {}).get("origin") == "bucket_import":
                 record.extra = {**record.extra, "sync_generation": generation}
         if any((record.extra or {}).get("origin") != "bucket_import" for record in references):
-            return "skipped"
+            return "skipped", None
         try:
             await self.objects.blobs.ensure(physical_id)
         except BlobUnavailable:
             if cache.policy is None or not await self.scanner.exists(cache.policy, mount, key):
-                return "conflicts"
+                return "conflicts", "source_unavailable"
             await self.objects.blobs.ensure(physical_id, revive=True)
 
         if cache.root is None:
@@ -312,10 +337,10 @@ class MountSyncService:
                         name=folder_name,
                     )
                 except (IntegrityError, ValueError):
-                    return "conflicts"
+                    return "conflicts", "folder_conflict"
                 cache.folders[cache_key] = folder
             if folder is None or folder.type != NodeType.FOLDER or folder.deleted_at is not None:
-                return "conflicts"
+                return "conflicts", "folder_conflict"
             parent_id = folder.id
 
         file_name = parts[-1]
@@ -328,7 +353,7 @@ class MountSyncService:
                     record.checksum = None
                 extra["sync_generation"] = generation
                 record.extra = extra
-            return "conflicts"
+            return "conflicts", "indexed_elsewhere"
         if node is None:
             node = await self.nodes.create_file(
                 owner_id=mount.owner_id,
@@ -345,19 +370,19 @@ class MountSyncService:
                 physical_id=physical_id,
                 extra=self._object_extra(item, generation),
             )
-            return "created"
+            return "created", None
         if node.type != NodeType.FILE:
-            return "conflicts"
+            return "conflicts", "folder_conflict"
 
         record = await self.objects.get_by_node_id(node.id)
         if record is None or (record.extra or {}).get("origin") != "bucket_import":
-            return "conflicts"
+            return "conflicts", "name_conflict"
         if (record.physical_id and record.physical_id != physical_id) or (
             not record.physical_id and record.blob_path != key
         ):
             # A virtual rename or move can leave a different imported object
             # at this name. Never replace its identity during a rescan.
-            return "conflicts"
+            return "conflicts", "name_conflict"
 
         old_extra = dict(record.extra or {})
         content_changed = (
@@ -390,7 +415,7 @@ class MountSyncService:
             content_type=record.content_type,
             extra=self._object_extra(item, generation),
         )
-        return "updated" if changed else "unchanged"
+        return ("updated" if changed else "unchanged"), None
 
     async def _finalize_page(
         self, request: Request, actor: User, mount_id: int, expected: dict,

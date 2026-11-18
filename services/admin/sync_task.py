@@ -6,16 +6,17 @@ import asyncio
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 import logging
+import time
 from types import SimpleNamespace
 from uuid import uuid4
 
 from fastapi import HTTPException
 import httpx
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, delete, or_, select, update
 
 from db.base import session_scope
 from models.enums import UserRole, UserStatus
-from models.tables import BucketMount, MountSyncTask, User
+from models.tables import BucketMount, MountSyncConflict, MountSyncTask, User
 from schemas.sync import MountSyncRequest
 from services.admin.scan import BucketScanner
 from services.admin.sync import MountSyncService
@@ -128,6 +129,7 @@ class MountSyncWorker:
         self.manager = manager
         self.interval = interval
         self.task: asyncio.Task | None = None
+        self._next_conflict_prune = 0.0
 
     def start(self) -> None:
         if self.task is None or self.task.done():
@@ -160,6 +162,11 @@ class MountSyncWorker:
                             with suppress(asyncio.CancelledError):
                                 await heartbeat
                     else:
+                        now = time.monotonic()
+                        if now >= self._next_conflict_prune:
+                            self._next_conflict_prune = now + 60
+                            if await self._prune_obsolete_conflicts():
+                                self._next_conflict_prune = now + self.interval
                         should_sleep = True
             except asyncio.CancelledError:
                 raise
@@ -171,6 +178,21 @@ class MountSyncWorker:
                     self.manager.end_business_write()
             if should_sleep:
                 await asyncio.sleep(self.interval)
+
+    async def _prune_obsolete_conflicts(self) -> int:
+        # A mount keeps one visible task. Older generations are inaccessible once
+        # a new task starts, so remove them in short batches while the worker is idle.
+        async with session_scope(self.dep.session_factory) as session:
+            ids = list(await session.scalars(
+                select(MountSyncConflict.id)
+                .join(MountSyncTask, MountSyncTask.mount_id == MountSyncConflict.mount_id)
+                .where(MountSyncConflict.generation != MountSyncTask.generation)
+                .order_by(MountSyncConflict.id)
+                .limit(200)
+            ))
+            if ids:
+                await session.execute(delete(MountSyncConflict).where(MountSyncConflict.id.in_(ids)))
+            return len(ids)
 
     async def _claim(self) -> tuple[str, str] | None:
         now = datetime.now(UTC)
