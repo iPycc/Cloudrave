@@ -200,9 +200,11 @@ class AliyunOssAdapter(StorageAdapterBase):
                 metadata={
                     "last_modified": str(getattr(item, "last_modified", "") or ""),
                     "storage_class": str(getattr(item, "storage_class", "") or ""),
+                    "is_directory_marker": item.key.endswith("/"),
                 },
             )
             for item in (getattr(result, "contents", None) or [])
+            if logical_key(policy, mount, item.key)
         ]
         prefixes = [
             logical_key(policy, mount, item.prefix.rstrip("/")) + "/"

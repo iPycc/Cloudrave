@@ -56,7 +56,7 @@ def page_from_response(adapter: Any, policy: Any, mount: Any, response: dict[str
     for item in one_or_many(response.get("Contents")):
         physical = str(item.get("Key", ""))
         last_physical = physical or last_physical
-        if not physical or physical.endswith("/"):
+        if not physical:
             continue
         relative = logical_key(policy, mount, physical)
         if not relative:  # Ignore a directory-marker object at the mount root.
@@ -72,6 +72,7 @@ def page_from_response(adapter: Any, policy: Any, mount: Any, response: dict[str
                 metadata={
                     "last_modified": str(item.get("LastModified", "")),
                     "storage_class": str(item.get("StorageClass", "")),
+                    "is_directory_marker": physical.endswith("/"),
                 },
             )
         )

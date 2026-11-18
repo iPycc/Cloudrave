@@ -246,6 +246,25 @@ class MountSyncService:
         if any(not part or part in {".", ".."} or len(part) > 255 for part in parts):
             return "conflicts"
 
+        if item.is_directory:
+            if cache.root is None:
+                cache.root = await self.nodes.ensure_mount_root(
+                    owner_id=mount.owner_id, mount_id=mount.id, name=mount.name,
+                )
+            parent_id = cache.root.id
+            created = False
+            for name in parts:
+                existing = await self.nodes.get_child_any(mount.id, parent_id, name)
+                try:
+                    folder = await self.nodes.ensure_folder(
+                        owner_id=mount.owner_id, mount_id=mount.id, parent_id=parent_id, name=name,
+                    )
+                except (IntegrityError, ValueError):
+                    return "conflicts"
+                created = created or existing is None
+                parent_id = folder.id
+            return "created" if created else "unchanged"
+
         physical_id = item.physical_id or hashlib.sha256(
             f"{mount.policy_id}\0{item.physical_key}".encode()
         ).hexdigest()

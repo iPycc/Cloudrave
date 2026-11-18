@@ -19,6 +19,7 @@ class BucketItem:
     last_modified: str | None
     storage_class: str | None
     physical_id: str = ""
+    is_directory: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -54,12 +55,15 @@ class BucketScanner:
         for raw in page.objects:
             physical_key = str(raw.storage_path).replace("\\", "/")
             if (
-                not raw.object_key or physical_key.endswith("/")
+                not raw.object_key
                 or raw.object_key == LEGACY_MANAGED_PREFIX
                 or raw.object_key.startswith(f"{LEGACY_MANAGED_PREFIX}/")
             ):
                 continue
-            if hasattr(adapter, "listed_physical_id"):
+            is_directory = raw.metadata.get("is_directory_marker") is True
+            if is_directory:
+                identity = ""
+            elif hasattr(adapter, "listed_physical_id"):
                 identity = await call_adapter(adapter, "listed_physical_id", policy, mount, raw)
             else:
                 identity = await call_adapter(adapter, "physical_id", policy, mount, raw.object_key)
@@ -72,6 +76,7 @@ class BucketScanner:
                     etag=_optional_text(raw.etag, strip_quotes=True),
                     last_modified=_optional_text(raw.metadata.get("last_modified")),
                     storage_class=_optional_text(raw.metadata.get("storage_class")),
+                    is_directory=is_directory,
                 )
             )
         if page.is_truncated and (not page.next_marker or page.next_marker == cursor):
