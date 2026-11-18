@@ -269,10 +269,10 @@ class MountSyncService:
             f"{mount.policy_id}\0{item.physical_key}".encode()
         ).hexdigest()
         references = await self.objects.list_physical_in_mount(mount.id, mount.policy_id, physical_id, key)
+        for record in references:
+            if (record.extra or {}).get("origin") == "bucket_import":
+                record.extra = {**record.extra, "sync_generation": generation}
         if any((record.extra or {}).get("origin") != "bucket_import" for record in references):
-            for record in references:
-                if (record.extra or {}).get("origin") == "bucket_import":
-                    record.extra = {**record.extra, "sync_generation": generation}
             return "skipped"
         try:
             await self.objects.blobs.ensure(physical_id)
@@ -350,7 +350,12 @@ class MountSyncService:
             or old_extra.get("last_modified") != item.last_modified
         )
         changed = content_changed or bool(old_extra.get("external_missing"))
-        if changed or node.status != NodeStatus.ACTIVE or node.deleted_at is not None:
+        in_recycle_bin = node.deleted_at is not None and not old_extra.get("external_missing")
+        if in_recycle_bin and content_changed:
+            node.blob_path = key
+            node.size = item.size
+            node.updated_at = datetime.now(UTC)
+        elif not in_recycle_bin and (changed or node.status != NodeStatus.ACTIVE or node.deleted_at is not None):
             await self.nodes.reactivate_file(node, blob_path=key, size=item.size)
         # An imported object's checksum describes its previous contents. If the
         # provider cannot supply a version signal, it cannot be safely reused.
