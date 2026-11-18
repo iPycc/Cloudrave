@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Iterator
+from contextlib import suppress
 from datetime import timedelta
 from hashlib import sha256
 from io import BytesIO
+from math import ceil
 from pathlib import Path
 from threading import Lock
 from typing import Any, BinaryIO
@@ -281,15 +283,61 @@ class AliyunOssAdapter(StorageAdapterBase):
     ) -> StorageObject:
         if no_overwrite:
             self._require_unversioned(policy)
+            source = self.head_object(policy, mount, source_key)
+            if source.size is None or not source.etag:
+                raise ValueError("OSS source size and ETag are required for a protected copy")
+            if source.size > 1024 * 1024 * 1024:
+                return self._copy_multipart_without_overwrite(policy, mount, source, destination_key)
+        else:
+            source = None
         self._client_for(policy).copy_object(oss.CopyObjectRequest(
             bucket=self._bucket(policy),
             key=self._key(policy, mount, destination_key),
             source_bucket=self._bucket(policy),
             source_key=self._key(policy, mount, source_key),
             forbid_overwrite=True if no_overwrite else None,
+            if_match=source.etag if source is not None else None,
             **self._encryption_args(policy),
         ))
         return self.head_object(policy, mount, destination_key)
+
+    def _copy_multipart_without_overwrite(
+        self, policy: Any, mount: Any, source: StorageObject, destination_key: str,
+    ) -> StorageObject:
+        if source.size is None or not source.etag:
+            raise ValueError("OSS source size and ETag are required for a protected copy")
+        part_size = max(16 * 1024 * 1024, ceil(source.size / self.capabilities.max_parts))
+        if part_size > self.capabilities.max_part_size:
+            raise ValueError("OSS source is too large for multipart copy")
+        metadata = {
+            key: value for key, value in source.metadata.items()
+            if key not in {"server_side_encryption", "server_side_encryption_key_id"}
+        }
+        upload = self.create_multipart_upload(
+            policy, mount, destination_key, total_size=source.size,
+            mime_type=source.mime_type, metadata=metadata,
+        )
+        parts: list[MultipartPart] = []
+        client = self._client_for(policy)
+        bucket = self._bucket(policy)
+        try:
+            for index, start in enumerate(range(0, source.size, part_size), start=1):
+                end = min(start + part_size, source.size) - 1
+                result = client.upload_part_copy(oss.UploadPartCopyRequest(
+                    bucket=bucket, key=self._key(policy, mount, destination_key),
+                    upload_id=upload.upload_id, part_number=index,
+                    source_bucket=bucket, source_key=self._key(policy, mount, source.object_key),
+                    source_range=f"bytes={start}-{end}", if_match=source.etag,
+                ))
+                etag = self._clean_etag(getattr(result, "etag", None))
+                if not etag:
+                    raise RuntimeError("OSS did not return a copied part ETag")
+                parts.append(MultipartPart(part_number=index, etag=etag, size=end - start + 1))
+            return self.complete_multipart_upload(policy, mount, upload, parts, no_overwrite=True)
+        except BaseException:
+            with suppress(Exception):
+                self.abort_multipart_upload(policy, mount, upload)
+            raise
 
     def delete_object(self, policy: Any, mount: Any, object_key: str, *, hard_delete: bool = False) -> bool:
         client = self._client_for(policy)
