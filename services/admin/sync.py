@@ -351,7 +351,9 @@ class MountSyncService:
             or old_extra.get("last_modified") != item.last_modified
         )
         changed = content_changed or bool(old_extra.get("external_missing"))
-        in_recycle_bin = node.deleted_at is not None and not old_extra.get("external_missing")
+        in_recycle_bin = node.deleted_at is not None and (
+            not old_extra.get("external_missing") or old_extra.get("missing_while_recycled") is True
+        )
         if in_recycle_bin and content_changed:
             node.blob_path = key
             node.size = item.size
@@ -421,11 +423,15 @@ class MountSyncService:
                     continue
                 if not extra.get("external_missing"):
                     current["missing"] += 1
+                    extra["missing_while_recycled"] = node.deleted_at is not None
+                elif node.deleted_at is None:
+                    extra["missing_while_recycled"] = False
                 extra["external_missing"] = True
                 extra["missing_at"] = now.isoformat()
                 record.extra = extra
-                node.status = NodeStatus.DELETED
-                node.deleted_at = now
+                if not extra.get("missing_while_recycled") or node.deleted_at is None:
+                    node.status = NodeStatus.DELETED
+                    node.deleted_at = now
             if len(records) < 500:
                 current["status"] = "complete"
                 current["completed_at"] = _now()
