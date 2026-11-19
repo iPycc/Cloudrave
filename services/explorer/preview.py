@@ -544,10 +544,15 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
             if references > 1
             else current_blob
         )
-        extra = dict(record.extra if record else {})
+        extra = dict((record.extra or {}) if record else {})
+        # These fields identify the previous object, not the bytes being saved.
+        # Do not send them back as custom object metadata or retain them if the
+        # provider omits the corresponding fields in its response.
+        for key in ("etag", "version_id", "last_modified"):
+            extra.pop(key, None)
         if target_blob != current_blob:
             extra["origin"] = "managed_edit"
-        await call_adapter(
+        stored = await call_adapter(
             adapter,
             "put_object",
             policy,
@@ -557,6 +562,12 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
             mime_type=content_type,
             metadata=extra,
         )
+        if getattr(stored, "etag", None):
+            extra["etag"] = stored.etag
+        if getattr(stored, "version_id", None):
+            extra["version_id"] = stored.version_id
+        if getattr(stored, "last_modified", None):
+            extra["last_modified"] = str(stored.last_modified)
         checksum = hashlib.sha256(payload).hexdigest()
         node.blob_path = target_blob
         await self.nodes.update_file_metadata(node, size=len(payload))
