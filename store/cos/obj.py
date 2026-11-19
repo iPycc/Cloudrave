@@ -12,6 +12,7 @@ from typing import Any, BinaryIO
 from store.types import MultipartPart, StorageObject, StorageObjectPage
 from store.cos.parse import header, object_from_head, page_from_response
 from store.cos.copy import CopySnapshot, read_copy_snapshot
+from store.copy_guard import require_source_identity
 from store.cos.sec import assert_encryption, encryption_args, metadata_headers
 from store.cos.stream import AsyncCosStream, CosStream
 
@@ -375,9 +376,12 @@ class CosObjectMixin:
     def copy_object(
         self, policy: Any, mount: Any, source_key: str, destination_key: str, *,
         no_overwrite: bool = False,
+        expected_source_identity: dict[str, str | int] | None = None,
     ) -> StorageObject:
+        if expected_source_identity is not None and not no_overwrite:
+            raise ValueError("Source identity requires an overwrite-protected copy")
         if no_overwrite:
-            return self._copy_without_overwrite(policy, mount, source_key, destination_key)
+            return self._copy_without_overwrite(policy, mount, source_key, destination_key, expected_source_identity)
         extra = getattr(policy, "extra", None) or {}
         self._client_for(policy).copy(
             Bucket=self._bucket(policy),
@@ -393,7 +397,8 @@ class CosObjectMixin:
         )
         return self.head_object(policy, mount, destination_key, verify_encryption=True)
 
-    def _copy_without_overwrite(self, policy: Any, mount: Any, source_key: str, destination_key: str) -> StorageObject:
+    def _copy_without_overwrite(self, policy: Any, mount: Any, source_key: str, destination_key: str,
+                                expected_source_identity: dict[str, str | int] | None = None) -> StorageObject:
         self._require_unversioned(policy)
         client = self._client_for(policy)
         bucket = self._bucket(policy)
@@ -402,6 +407,7 @@ class CosObjectMixin:
         if source_path == target:
             raise ValueError("COS protected copy requires a different destination")
         source = read_copy_snapshot(client, bucket, source_path)
+        require_source_identity(source, expected_source_identity)
         copy_source = {"Bucket": bucket, "Key": source_path, "Region": self._region(policy)}
         if source.size <= 5 * 1024 * 1024 * 1024:
             attributes = source.write_args()
@@ -470,7 +476,9 @@ class CosObjectMixin:
     async def acopy_object(
         self, policy: Any, mount: Any, source_key: str, destination_key: str, *,
         no_overwrite: bool = False,
+        expected_source_identity: dict[str, str | int] | None = None,
     ) -> StorageObject:
         return await asyncio.to_thread(
             self.copy_object, policy, mount, source_key, destination_key, no_overwrite=no_overwrite,
+            expected_source_identity=expected_source_identity,
         )

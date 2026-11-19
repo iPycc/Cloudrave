@@ -287,6 +287,7 @@ class PathPlanEntry(Base):
     target_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     path_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     source_physical_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_identity_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     size: Mapped[int] = mapped_column(BigInteger, default=0)
     status: Mapped[str] = mapped_column(String(16))
     reason: Mapped[str | None] = mapped_column(String(40), nullable=True)

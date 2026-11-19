@@ -47,6 +47,7 @@ def object_from_head(adapter: Any, policy: Any, mount: Any, object_key: str, res
         version_id=header(response, "x-cos-version-id"),
         mime_type=header(response, "content-type"),
         metadata=metadata(response),
+        last_modified=header(response, "last-modified"),
     )
 
 

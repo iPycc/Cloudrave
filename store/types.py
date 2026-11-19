@@ -80,6 +80,7 @@ class StorageObject:
     version_id: str | None = None
     mime_type: str | None = None
     metadata: dict[str, str] = field(default_factory=dict)
+    last_modified: datetime | str | None = None
 
 
 @dataclass(slots=True)

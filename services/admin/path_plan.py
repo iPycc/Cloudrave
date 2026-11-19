@@ -19,6 +19,7 @@ from models.tables import BucketMount, Node, ObjectRecord, PathPlanEntry, PathPl
 from services.admin.sync import MountSyncService
 from services.admin.task_claim import LEASE_DURATION, claim_task
 from store.call import call_adapter
+from store.copy_guard import source_identity
 from store.errors import is_not_found
 from store.key import format_directory_key, format_object_key
 
@@ -254,6 +255,11 @@ class PathPlanWorker:
                 if not exists or source.size is None or int(source.size) != item["size"] or (expected_etag and expected_etag != actual_etag):
                     item["reason"] = "source_changed"
                     continue
+                try:
+                    item["source_identity"] = source_identity(source.size, source.etag, source.last_modified)
+                except (ValueError, TypeError, OverflowError):
+                    item["reason"] = "source_identity_unavailable"
+                    continue
                 if source_key == physical_target:
                     item["unchanged"] = True
                     continue
@@ -303,6 +309,7 @@ class PathPlanWorker:
                 session.add(PathPlanEntry(task_id=task.id, node_id=item["id"], kind=item["kind"],
                     source_json=_json(item["source"]), target_json=_json(item["target"]), target_hash=target_hash,
                     path_fingerprint=item["fingerprint"], source_physical_id=item["physical_id"],
+                    source_identity_json=_json(item["source_identity"]) if item.get("source_identity") else None,
                     size=item["size"], status=status, reason=item["reason"]))
                 # autoflush is disabled; subsequent duplicate checks must see this entry.
                 await session.flush()

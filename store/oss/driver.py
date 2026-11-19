@@ -18,6 +18,7 @@ from store.key import logical_key, mount_prefix, physical_key, physical_list_pre
 from store.oss.stream import OssStream
 from store.oss.download import download_settings
 from store.oss.copy import CopySnapshot, read_copy_snapshot
+from store.copy_guard import require_source_identity
 from store.identity import physical_hash
 from store.errors import storage_error_code
 from store.port import StorageAdapterBase
@@ -303,7 +304,10 @@ class AliyunOssAdapter(StorageAdapterBase):
     def copy_object(
         self, policy: Any, mount: Any, source_key: str, destination_key: str, *,
         no_overwrite: bool = False,
+        expected_source_identity: dict[str, str | int] | None = None,
     ) -> StorageObject:
+        if expected_source_identity is not None and not no_overwrite:
+            raise ValueError("Source identity requires an overwrite-protected copy")
         if no_overwrite:
             self._require_unversioned(policy)
             if self._key(policy, mount, source_key) == self._key(policy, mount, destination_key):
@@ -311,6 +315,7 @@ class AliyunOssAdapter(StorageAdapterBase):
             client = self._client_for(policy)
             bucket = self._bucket(policy)
             source = read_copy_snapshot(client, oss, bucket, self._key(policy, mount, source_key))
+            require_source_identity(source, expected_source_identity)
             if source.size > 1024 * 1024 * 1024:
                 if source.content_md5:
                     raise ValueError("OSS multipart copy cannot preserve the source Content-MD5")
@@ -686,6 +691,7 @@ class AliyunOssAdapter(StorageAdapterBase):
             version_id=getattr(result, "version_id", None),
             mime_type=getattr(result, "content_type", None),
             metadata=metadata,
+            last_modified=getattr(result, "last_modified", None),
         )
 
     def _encryption_args(self, policy: Any) -> dict[str, str]:
