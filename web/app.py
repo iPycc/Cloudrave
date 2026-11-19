@@ -24,6 +24,7 @@ from core.cfg import CloudraveConfig
 from core.log import LogOperation, LogOutcome, configure_logging, get_logger
 from services.admin.database import DatabaseMigrationManager
 from services.admin.sync_task import MountSyncWorker
+from services.admin.path_plan import PathPlanWorker
 
 
 LOGGER = get_logger("cloudrave.lifecycle")
@@ -95,10 +96,13 @@ async def lifespan(app: FastAPI):
     )
     sync_worker = MountSyncWorker(dep, database_manager)
     sync_worker.start()
+    path_plan_worker = PathPlanWorker(dep, database_manager)
+    path_plan_worker.start()
     try:
         yield
     finally:
         LOGGER.info("Closing application services.")
+        await path_plan_worker.stop()
         await sync_worker.stop()
         await dep.disconnect()
         LOGGER.info(

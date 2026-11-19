@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from store.types import MultipartPart, StorageObject, StorageObjectPage
-from store.cos.parse import object_from_head, page_from_response
+from store.cos.parse import header, object_from_head, page_from_response
 from store.cos.copy import CopySnapshot, read_copy_snapshot
 from store.cos.sec import assert_encryption, encryption_args, metadata_headers
 from store.cos.stream import AsyncCosStream, CosStream
@@ -303,6 +303,14 @@ class CosObjectMixin:
             Bucket=self._bucket(policy), Key=key, Body=b"",
             Metadata={"x-cos-forbid-overwrite": "true"}, **encryption_args(policy),
         )
+
+    def head_directory_marker(self, policy: Any, mount: Any, directory: str) -> int:
+        key = self._validate_physical_key(self._key(policy, mount, directory).rstrip("/") + "/")
+        response = self._client_for(policy).head_object(Bucket=self._bucket(policy), Key=key)
+        size = header(response, "content-length")
+        if size is None:
+            raise RuntimeError("COS directory marker size is unavailable")
+        return int(size)
 
     def delete_directory_marker(self, policy: Any, mount: Any, directory: str) -> None:
         key = self._validate_physical_key(self._key(policy, mount, directory).rstrip("/") + "/")

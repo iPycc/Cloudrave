@@ -1,0 +1,316 @@
+"""Read-only, resumable preflight for a future storage-key migration."""
+
+from __future__ import annotations
+
+import asyncio
+from contextlib import suppress
+from datetime import UTC, datetime
+import hashlib
+import json
+import logging
+from uuid import NAMESPACE_URL, uuid5
+
+from fastapi import HTTPException
+from sqlalchemy import func, select, update
+
+from db.base import session_scope
+from models.enums import NodeStatus, NodeType, UserRole, UserStatus
+from models.tables import BucketMount, Node, ObjectRecord, PathPlanEntry, PathPlanTask, User
+from services.admin.sync import MountSyncService
+from services.admin.task_claim import LEASE_DURATION, claim_task
+from store.call import call_adapter
+from store.errors import is_not_found
+from store.key import format_directory_key, format_object_key
+
+LOGGER = logging.getLogger("cloudrave.path_plan")
+PAGE_SIZE = 25
+
+
+def _json(value):
+    return json.dumps(value, ensure_ascii=True, separators=(",", ":"), default=str)
+
+
+def _digest(value):
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+async def start_path_plan(dep, session, mount_id: int, owner_id: int, template: str):
+    try:
+        format_object_key(template, directory="sample", filename="sample.txt", blob_id="0" * 32)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"路径模板无效：{exc}") from exc
+    mount = await dep.get_mount_repository(session).get_by_id_for_update(mount_id)
+    if mount is None or mount.owner_id != owner_id:
+        raise HTTPException(status_code=404, detail="Bucket mount not found")
+    policy = await dep.get_policy_repository(session).get_by_id(mount.policy_id)
+    if not mount.is_enabled or policy is None or policy.status != "active":
+        raise HTTPException(status_code=409, detail="存储当前不可用")
+    if policy.provider not in {"tencent_cos", "aliyun_oss"}:
+        raise HTTPException(status_code=400, detail="当前仅支持 COS 和 OSS 路径预检查")
+    if (mount.extra or {}).get("legacy_prefixed_keys"):
+        raise HTTPException(status_code=409, detail="旧版前缀映射暂不支持路径预检查")
+    active = await session.scalar(select(PathPlanTask).where(
+        PathPlanTask.mount_id == mount.id, PathPlanTask.status.in_(("pending", "running", "paused", "failed")),
+    ).order_by(PathPlanTask.created_at.desc()).limit(1))
+    if active:
+        if active.template == template and active.status in {"pending", "running"}:
+            return active
+        raise HTTPException(status_code=409, detail="该存储已有未完成的路径预检查，请先取消")
+    maximum = await session.scalar(select(func.max(Node.id)).where(Node.mount_id == mount.id))
+    task = PathPlanTask(mount_id=mount.id, owner_id=owner_id, template=template,
+                        mapping=MountSyncService.mapping_signature(policy, mount), max_node_id=maximum or 0)
+    session.add(task)
+    await session.flush()
+    return task
+
+
+async def control_path_plan(dep, session, mount_id, task_id, owner_id, action):
+    mount = await dep.get_mount_repository(session).get_by_id_for_update(mount_id)
+    if mount is None or mount.owner_id != owner_id:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task = await session.scalar(select(PathPlanTask).where(
+        PathPlanTask.id == task_id, PathPlanTask.mount_id == mount_id, PathPlanTask.owner_id == owner_id,
+    ).with_for_update().execution_options(populate_existing=True))
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if action == "resume" and task.status in {"paused", "failed"}:
+        policy = await dep.get_policy_repository(session).get_by_id(mount.policy_id)
+        if not mount.is_enabled or policy is None or policy.status != "active" or task.mapping != MountSyncService.mapping_signature(policy, mount):
+            raise HTTPException(status_code=409, detail="存储配置已更改，请取消后重新检查")
+        task.status = "pending"
+        task.error = None
+    elif action in {"pause", "cancel"} and task.status in {"pending", "running", "paused", "failed"}:
+        task.status = "paused" if action == "pause" else "canceled"
+    else:
+        raise HTTPException(status_code=409, detail="任务状态不允许此操作")
+    task.lease_token = None
+    task.lease_expires_at = None
+    await session.flush()
+    return task
+
+
+async def _snapshot(session, node, task):
+    """Build the logical path and a fingerprint of all its ancestors."""
+    chain = []
+    current = node
+    seen = set()
+    while current is not None:
+        if current.id in seen or current.mount_id != task.mount_id or current.owner_id != task.owner_id:
+            raise ValueError("invalid_tree")
+        seen.add(current.id)
+        chain.append([current.id, current.parent_id, current.name, str(current.status), str(current.updated_at)])
+        if current.status != NodeStatus.ACTIVE or current.deleted_at is not None:
+            raise ValueError("invalid_tree")
+        if current.parent_id is None:
+            break
+        current = await session.get(Node, current.parent_id)
+    if current is None or len(chain) < 2:
+        raise ValueError("invalid_tree")
+    components = [item[2] for item in reversed(chain[:-1])]
+    record = await session.scalar(select(ObjectRecord).where(ObjectRecord.node_id == node.id)) if node.type == NodeType.FILE else None
+    record_state = None if record is None else [record.id, record.policy_id, record.blob_path, record.physical_id, record.extra, str(record.updated_at)]
+    fingerprint = _digest(_json([chain, node.size, record_state]))
+    return components, record, fingerprint
+
+
+async def _exists(adapter, policy, mount, key, *, folder=False):
+    try:
+        value = await call_adapter(adapter, "head_directory_marker" if folder else "head_object", policy, mount, key)
+        return True, value
+    except Exception as exc:
+        if is_not_found(exc):
+            return False, None
+        raise
+
+
+class PathPlanWorker:
+    def __init__(self, dep, manager=None, *, interval=1.0):
+        self.dep, self.manager, self.interval = dep, manager, interval
+        self.task = None
+
+    def start(self):
+        if self.task is None or self.task.done():
+            self.task = asyncio.create_task(self._loop(), name="path-plan-worker")
+
+    async def stop(self):
+        if self.task is not None:
+            self.task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.task
+            self.task = None
+
+    async def _loop(self):
+        while True:
+            tracked = False
+            claimed = None
+            try:
+                if self.manager is None or (tracked := self.manager.begin_business_write()):
+                    claimed = await claim_task(self.dep.session_factory, PathPlanTask)
+                    if claimed:
+                        heartbeat = asyncio.create_task(self._heartbeat(*claimed))
+                        try:
+                            await self._page(*claimed)
+                        finally:
+                            heartbeat.cancel()
+                            with suppress(asyncio.CancelledError):
+                                await heartbeat
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception("Path precheck worker failed")
+            finally:
+                if tracked:
+                    self.manager.end_business_write()
+            if claimed is None:
+                await asyncio.sleep(self.interval)
+
+    async def _heartbeat(self, task_id, token):
+        while True:
+            await asyncio.sleep(60)
+            try:
+                now = datetime.now(UTC)
+                async with session_scope(self.dep.session_factory) as session:
+                    result = await session.execute(update(PathPlanTask).where(
+                        PathPlanTask.id == task_id, PathPlanTask.status == "running",
+                        PathPlanTask.lease_token == token, PathPlanTask.lease_expires_at > now,
+                    ).values(lease_expires_at=now + LEASE_DURATION))
+                    if result.rowcount != 1:
+                        return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception("Could not renew path precheck lease")
+
+    async def _page(self, task_id, token):
+        try:
+            await self._scan_page(task_id, token)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception("Path precheck failed for task %s", task_id)
+            async with session_scope(self.dep.session_factory) as session:
+                await session.execute(update(PathPlanTask).where(
+                    PathPlanTask.id == task_id, PathPlanTask.status == "running", PathPlanTask.lease_token == token,
+                    PathPlanTask.lease_expires_at > datetime.now(UTC),
+                ).values(status="failed", lease_token=None, lease_expires_at=None,
+                         error="预检查未完成，请检查存储连接、权限和配置后重试"))
+
+    async def _scan_page(self, task_id, token):
+        items = []
+        async with session_scope(self.dep.session_factory) as session:
+            task = await session.get(PathPlanTask, task_id)
+            if task is None or task.status != "running" or task.lease_token != token:
+                return
+            actor = await session.get(User, task.owner_id)
+            mount = await session.get(BucketMount, task.mount_id)
+            policy = await self.dep.get_policy_repository(session).get_by_id(mount.policy_id) if mount else None
+            if (actor is None or actor.status != UserStatus.ACTIVE or actor.role == UserRole.GUEST or
+                mount is None or mount.owner_id != task.owner_id or not mount.is_enabled or policy is None or
+                policy.status != "active" or task.mapping != MountSyncService.mapping_signature(policy, mount)):
+                raise RuntimeError("Storage or account changed")
+            rows = list(await session.scalars(select(Node).where(
+                Node.mount_id == task.mount_id, Node.id > task.cursor, Node.id <= task.max_node_id,
+                Node.parent_id.is_not(None), Node.status == NodeStatus.ACTIVE, Node.deleted_at.is_(None),
+            ).order_by(Node.id).limit(PAGE_SIZE)))
+            for node in rows:
+                item = {"id": node.id, "kind": node.type.value, "size": node.size, "source": None,
+                        "target": None, "fingerprint": None, "physical_id": None, "reason": None}
+                try:
+                    components, record, fingerprint = await _snapshot(session, node, task)
+                    item["fingerprint"] = fingerprint
+                    if node.type == NodeType.FILE:
+                        if record is None or record.policy_id != policy.id:
+                            raise ValueError("source_missing")
+                        item["source"], item["physical_id"] = record.blob_path, record.physical_id
+                        item["etag"] = (record.extra or {}).get("etag")
+                        item["target"] = format_object_key(task.template, directory="/".join(components[:-1]),
+                            filename=components[-1], blob_id=uuid5(NAMESPACE_URL, f"cloudrave:{mount.id}:{node.id}").hex)
+                        if (record.extra or {}).get("origin") == "bucket_import":
+                            raise ValueError("external_readonly")
+                    else:
+                        item["target"] = format_directory_key(task.template, "/".join(components))
+                except ValueError as exc:
+                    item["reason"] = str(exc) if str(exc) in {"source_missing", "external_readonly", "invalid_tree"} else "invalid_path"
+                items.append(item)
+            cursor = task.cursor
+            adapter = self.dep.storage_manager.get_adapter(policy)
+
+        # All provider calls happen outside the database transaction.
+        await call_adapter(adapter, "_require_unversioned", policy)
+        for item in items:
+            if item["reason"]:
+                continue
+            try:
+                physical_target = adapter._validate_physical_key(adapter._key(policy, mount, item["target"]) + ("/" if item["kind"] == "folder" else ""))
+                item["target_hash"] = _digest(physical_target)
+                source_key = adapter._key(policy, mount, item["source"]) if item["kind"] == "file" else None
+            except ValueError:
+                item["reason"] = "invalid_path"
+                continue
+            if item["kind"] == "file":
+                exists, source = await _exists(adapter, policy, mount, item["source"])
+                expected_etag = str(item.get("etag") or "").strip('"')
+                actual_etag = str(source.etag or "").strip('"') if exists else ""
+                if not exists or source.size is None or int(source.size) != item["size"] or (expected_etag and expected_etag != actual_etag):
+                    item["reason"] = "source_changed"
+                    continue
+                if source_key == physical_target:
+                    item["unchanged"] = True
+                    continue
+            exists, _ = await _exists(adapter, policy, mount, item["target"], folder=item["kind"] == "folder")
+            if exists:
+                item["reason"] = "target_exists"
+
+        async with session_scope(self.dep.session_factory) as session:
+            locked_mount = await self.dep.get_mount_repository(session).get_by_id_for_update(mount.id)
+            task = await session.scalar(select(PathPlanTask).where(
+                PathPlanTask.id == task_id, PathPlanTask.status == "running", PathPlanTask.lease_token == token,
+                PathPlanTask.lease_expires_at > datetime.now(UTC),
+            ).with_for_update().execution_options(populate_existing=True))
+            if task is None or task.cursor != cursor:
+                return
+            current_policy = await self.dep.get_policy_repository(session).get_by_id(locked_mount.policy_id) if locked_mount else None
+            if (locked_mount is None or locked_mount.owner_id != task.owner_id or not locked_mount.is_enabled or
+                current_policy is None or current_policy.status != "active" or task.mapping != MountSyncService.mapping_signature(current_policy, locked_mount)):
+                raise RuntimeError("Storage configuration changed")
+            for item in items:
+                node = await session.get(Node, item["id"])
+                if item["fingerprint"] is not None:
+                    try:
+                        if node is None or (await _snapshot(session, node, task))[2] != item["fingerprint"]:
+                            item["reason"] = "changed_during_scan"
+                    except ValueError:
+                        item["reason"] = "changed_during_scan"
+                target_hash = item.get("target_hash")
+                if target_hash:
+                    prior = list(await session.scalars(select(PathPlanEntry).where(
+                        PathPlanEntry.task_id == task.id, PathPlanEntry.target_hash == target_hash)))
+                    if prior:
+                        item["reason"] = "duplicate_target"
+                        for previous in prior:
+                            if previous.status == "ready":
+                                previous.status, previous.reason = "conflict", "duplicate_target"
+                                task.ready -= 1
+                                task.conflicts += 1
+                                task.bytes_to_copy -= previous.size
+                status = "conflict" if item["reason"] else "unchanged" if item.get("unchanged") else "ready"
+                task.scanned += 1
+                if status == "conflict": task.conflicts += 1
+                elif status == "unchanged": task.unchanged += 1
+                else:
+                    task.ready += 1
+                    task.bytes_to_copy += item["size"]
+                session.add(PathPlanEntry(task_id=task.id, node_id=item["id"], kind=item["kind"],
+                    source_json=_json(item["source"]), target_json=_json(item["target"]), target_hash=target_hash,
+                    path_fingerprint=item["fingerprint"], source_physical_id=item["physical_id"],
+                    size=item["size"], status=status, reason=item["reason"]))
+                # autoflush is disabled; subsequent duplicate checks must see this entry.
+                await session.flush()
+            if items:
+                task.cursor = items[-1]["id"]
+            if len(items) < PAGE_SIZE:
+                task.status = "completed"
+            else:
+                task.status = "pending"
+            task.lease_token = None
+            task.lease_expires_at = None

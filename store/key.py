@@ -67,6 +67,8 @@ def format_object_key(template: str, *, directory: str, filename: str, blob_id: 
                 if field is not None:
                     if field not in values or specification or conversion:
                         raise ValueError("Unknown or invalid template variable")
+                    if "dir" not in fields:
+                        raise ValueError("File name variables must follow the directory variable")
                     fields.add(field)
                     fragments.append(values[field])
         except ValueError as exc:
@@ -82,6 +84,24 @@ def format_object_key(template: str, *, directory: str, filename: str, blob_id: 
         raise ValueError("Object key exceeds the storage limit")
     if result == LEGACY_MANAGED_PREFIX or result.startswith(f"{LEGACY_MANAGED_PREFIX}/"):
         raise ValueError("Object key uses a reserved prefix")
+    return result
+
+
+def format_directory_key(template: str, directory: str) -> str:
+    """Render the physical prefix corresponding to a non-root virtual directory."""
+
+    format_object_key(template, directory="sample", filename="sample.txt", blob_id="0" * 32)
+    if not directory or any(not part or part in {".", ".."} or "\\" in part or "\x00" in part
+                            for part in directory.split("/")):
+        raise ValueError("Invalid directory path")
+    prefix: list[str] = []
+    for segment in template.split("/"):
+        if segment == "{dir}":
+            break
+        prefix.append("".join(literal for literal, _, _, _ in Formatter().parse(segment)))
+    result = "/".join([*prefix, *directory.split("/")])
+    if len(result.encode("utf-8")) > 1024 or result == LEGACY_MANAGED_PREFIX or result.startswith(f"{LEGACY_MANAGED_PREFIX}/"):
+        raise ValueError("Invalid directory marker key")
     return result
 
 

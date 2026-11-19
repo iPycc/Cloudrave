@@ -54,3 +54,37 @@ class MountSyncConflictRead(CloudraveSchema):
 class MountSyncConflictPage(CloudraveSchema):
     items: list[MountSyncConflictRead]
     next_after_id: int | None = None
+
+
+class PathPlanRequest(CloudraveSchema):
+    template: str = Field(min_length=1, max_length=1024)
+
+
+class PathPlanRead(CloudraveSchema):
+    id: str
+    mount_id: int
+    owner_id: int
+    template: str
+    status: Literal["pending", "running", "paused", "completed", "failed", "canceled"]
+    scanned: int
+    ready: int
+    unchanged: int
+    conflicts: int
+    bytes_to_copy: int
+    error: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    name: str | None = None
+
+
+class PathPlanConflictRead(CloudraveSchema):
+    id: int
+    node_id: int
+    source: str | None
+    target: str | None
+    reason: str
+
+
+class PathPlanConflictPage(CloudraveSchema):
+    items: list[PathPlanConflictRead]
+    next_after_id: int | None = None

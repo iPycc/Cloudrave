@@ -271,6 +271,14 @@ class AliyunOssAdapter(StorageAdapterBase):
             forbid_overwrite=True, **self._encryption_args(policy),
         ))
 
+    def head_directory_marker(self, policy: Any, mount: Any, directory: str) -> int:
+        key = self._validate_physical_key(self._key(policy, mount, directory).rstrip("/") + "/")
+        result = self._client_for(policy).head_object(oss.HeadObjectRequest(bucket=self._bucket(policy), key=key))
+        size = getattr(result, "content_length", None)
+        if size is None:
+            raise RuntimeError("OSS directory marker size is unavailable")
+        return int(size)
+
     def delete_directory_marker(self, policy: Any, mount: Any, directory: str) -> None:
         key = self._validate_physical_key(self._key(policy, mount, directory).rstrip("/") + "/")
         self._client_for(policy).delete_object(oss.DeleteObjectRequest(

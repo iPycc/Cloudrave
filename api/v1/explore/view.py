@@ -11,7 +11,7 @@ from fastapi.responses import Response
 from sqlalchemy import select
 
 from web.mid.auth import get_current_user
-from models.tables import BucketMount, MountSyncConflict, MountSyncTask, User
+from models.tables import BucketMount, MountSyncConflict, MountSyncTask, PathPlanEntry, PathPlanTask, User
 from schemas.preview import (
     OfficeCardPreviewRead,
     ArchiveEntryPageRead,
@@ -23,7 +23,8 @@ from schemas.preview import (
     TextContentUpdateRead,
 )
 from schemas.node import NodeRead
-from schemas.task import ArchiveExtractRequest, BackgroundTaskRead, MountSyncConflictPage, MountSyncConflictRead, MountSyncTaskRead
+from schemas.task import (ArchiveExtractRequest, BackgroundTaskRead, MountSyncConflictPage, MountSyncConflictRead,
+                          MountSyncTaskRead, PathPlanRead, PathPlanConflictPage, PathPlanConflictRead)
 from services.explorer.extract import list_tasks, start_extract
 from services.explorer.preview import (
     DERIVED_CACHE_CONTROL,
@@ -128,6 +129,37 @@ async def list_sync_tasks(
                 "missing": int(state.get("missing", 0)),
             }))
         return tasks
+
+
+@router.get("/path-plans", response_model=list[PathPlanRead])
+async def list_path_plans(request: Request, current_user: User = Depends(get_current_user)) -> list[PathPlanRead]:
+    async with request.app.state.dep.session_scope() as session:
+        rows = await session.execute(select(PathPlanTask, BucketMount).join(
+            BucketMount, BucketMount.id == PathPlanTask.mount_id
+        ).where(PathPlanTask.owner_id == current_user.id, BucketMount.owner_id == current_user.id)
+         .order_by(PathPlanTask.updated_at.desc()).limit(100))
+        return [PathPlanRead.model_validate(task).model_copy(update={"name": mount.name}) for task, mount in rows]
+
+
+@router.get("/path-plans/{task_id}/conflicts", response_model=PathPlanConflictPage)
+async def list_path_plan_conflicts(
+    task_id: str, request: Request, after_id: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=200), current_user: User = Depends(get_current_user),
+) -> PathPlanConflictPage:
+    async with request.app.state.dep.session_scope() as session:
+        task = await session.scalar(select(PathPlanTask).join(BucketMount, BucketMount.id == PathPlanTask.mount_id).where(
+            PathPlanTask.id == task_id, PathPlanTask.owner_id == current_user.id, BucketMount.owner_id == current_user.id,
+        ))
+        if task is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        rows = list(await session.scalars(select(PathPlanEntry).where(
+            PathPlanEntry.task_id == task.id, PathPlanEntry.status == "conflict", PathPlanEntry.id > after_id,
+        ).order_by(PathPlanEntry.id).limit(limit + 1)))
+        selected = rows[:limit]
+        return PathPlanConflictPage(items=[PathPlanConflictRead(
+            id=row.id, node_id=row.node_id, source=json.loads(row.source_json) if row.source_json else None,
+            target=json.loads(row.target_json) if row.target_json else None, reason=row.reason or "unknown",
+        ) for row in selected], next_after_id=selected[-1].id if len(rows) > limit else None)
 
 
 @router.get("/sync-tasks/{task_id}/conflicts", response_model=MountSyncConflictPage)

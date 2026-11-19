@@ -19,6 +19,7 @@ from db.mig.v7 import upgrade as upgrade_v7
 from db.mig.v8 import upgrade as upgrade_v8
 from db.mig.v9 import upgrade as upgrade_v9
 from db.mig.v10 import upgrade as upgrade_v10
+from db.mig.v11 import upgrade as upgrade_v11
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +40,7 @@ MIGRATIONS = (
     Migration(8, "direct-operator-drive-uploads", upgrade_v8),
     Migration(9, "mount-sync-conflicts", upgrade_v9),
     Migration(10, "mount-sync-worker-gate", upgrade_v10),
+    Migration(11, "storage-path-precheck", upgrade_v11),
 )
 
 

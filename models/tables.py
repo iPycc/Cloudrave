@@ -254,6 +254,50 @@ class MountSyncConflict(Base):
     )
 
 
+class PathPlanTask(Base, TimestampMixin):
+    __tablename__ = "path_plan_tasks"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    mount_id: Mapped[int] = mapped_column(ForeignKey("bucket_mounts.id", ondelete="CASCADE"), index=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    template: Mapped[str] = mapped_column(Text)
+    mapping: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    cursor: Mapped[int] = mapped_column(Integer, default=0)
+    max_node_id: Mapped[int] = mapped_column(Integer, default=0)
+    scanned: Mapped[int] = mapped_column(Integer, default=0)
+    ready: Mapped[int] = mapped_column(Integer, default=0)
+    unchanged: Mapped[int] = mapped_column(Integer, default=0)
+    conflicts: Mapped[int] = mapped_column(Integer, default=0)
+    bytes_to_copy: Mapped[int] = mapped_column(BigInteger, default=0)
+    lease_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class PathPlanEntry(Base):
+    __tablename__ = "path_plan_entries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("path_plan_tasks.id", ondelete="CASCADE"))
+    node_id: Mapped[int] = mapped_column(Integer)
+    kind: Mapped[str] = mapped_column(String(16))
+    source_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    target_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    target_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    path_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_physical_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    size: Mapped[int] = mapped_column(BigInteger, default=0)
+    status: Mapped[str] = mapped_column(String(16))
+    reason: Mapped[str | None] = mapped_column(String(40), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("task_id", "node_id", name="uq_path_plan_node"),
+        Index("ix_path_plan_target", "task_id", "target_hash"),
+        Index("ix_path_plan_page", "task_id", "id"),
+    )
+
+
 class Node(Base, TimestampMixin):
     __tablename__ = "nodes"
 
