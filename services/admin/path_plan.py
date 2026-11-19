@@ -20,7 +20,7 @@ from services.admin.sync import MountSyncService
 from services.admin.task_claim import LEASE_DURATION, claim_task
 from store.call import call_adapter
 from store.copy_guard import source_identity
-from store.errors import is_not_found
+from store.errors import is_not_found, storage_error_code
 from store.key import format_directory_key, format_object_key
 
 LOGGER = logging.getLogger("cloudrave.path_plan")
@@ -115,13 +115,7 @@ async def _snapshot(session, node, task):
 
 
 async def _exists(adapter, policy, mount, key, *, folder=False):
-    try:
-        value = await call_adapter(adapter, "head_directory_marker" if folder else "head_object", policy, mount, key)
-        return True, value
-    except Exception as exc:
-        if is_not_found(exc):
-            return False, None
-        raise
+    return await call_adapter(adapter, "object_key_exists", policy, mount, key, directory_marker=folder)
 
 
 class PathPlanWorker:
@@ -187,14 +181,21 @@ class PathPlanWorker:
             await self._scan_page(task_id, token)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            LOGGER.exception("Path precheck failed for task %s", task_id)
+        except Exception as exc:
+            code = storage_error_code(exc)
+            LOGGER.warning("Path precheck failed for task %s (provider code %s)", task_id, code or "unknown")
+            if code in {"AccessDenied", "Forbidden", "Unauthorized", "InvalidAccessKeyId", "SignatureDoesNotMatch"}:
+                message = "预检查需要读取对象、软链接、ACL、标签和存储桶版本状态，请检查权限或重新授权"
+            elif isinstance(exc, ValueError) and "versioning" in str(exc).lower():
+                message = "无法确认存储桶未开启版本控制；安全复制要求版本控制处于未开启状态"
+            else:
+                message = "预检查未完成，请检查存储连接、权限和配置后重试"
             async with session_scope(self.dep.session_factory) as session:
                 await session.execute(update(PathPlanTask).where(
                     PathPlanTask.id == task_id, PathPlanTask.status == "running", PathPlanTask.lease_token == token,
                     PathPlanTask.lease_expires_at > datetime.now(UTC),
                 ).values(status="failed", lease_token=None, lease_expires_at=None,
-                         error="预检查未完成，请检查存储连接、权限和配置后重试"))
+                         error=message))
 
     async def _scan_page(self, task_id, token):
         items = []
@@ -249,21 +250,30 @@ class PathPlanWorker:
                 item["reason"] = "invalid_path"
                 continue
             if item["kind"] == "file":
-                exists, source = await _exists(adapter, policy, mount, item["source"])
+                try:
+                    source = await call_adapter(adapter, "inspect_copy_source", policy, mount, item["source"])
+                except Exception as exc:
+                    if is_not_found(exc):
+                        item["reason"] = "source_changed"
+                        continue
+                    if isinstance(exc, ValueError):
+                        item["reason"] = "source_unsupported"
+                        continue
+                    raise
                 expected_etag = str(item.get("etag") or "").strip('"')
-                actual_etag = str(source.etag or "").strip('"') if exists else ""
-                if not exists or source.size is None or int(source.size) != item["size"] or (expected_etag and expected_etag != actual_etag):
+                actual_etag = str(source.etag or "").strip('"')
+                if source.size is None or int(source.size) != item["size"] or (expected_etag and expected_etag != actual_etag):
                     item["reason"] = "source_changed"
                     continue
                 try:
-                    item["source_identity"] = source_identity(source.size, source.etag, source.last_modified)
+                    item["source_identity"] = source_identity(source.size, source.etag, source.modified)
                 except (ValueError, TypeError, OverflowError):
                     item["reason"] = "source_identity_unavailable"
                     continue
                 if source_key == physical_target:
                     item["unchanged"] = True
                     continue
-            exists, _ = await _exists(adapter, policy, mount, item["target"], folder=item["kind"] == "folder")
+            exists = await _exists(adapter, policy, mount, item["target"], folder=item["kind"] == "folder")
             if exists:
                 item["reason"] = "target_exists"
 

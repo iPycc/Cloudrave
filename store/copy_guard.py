@@ -4,6 +4,21 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
 
+from store.errors import is_not_found, storage_error_code
+
+
+def exact_key_exists(get_symlink) -> bool:
+    """Check the key itself, including links whose targets do not exist."""
+    try:
+        get_symlink()
+    except Exception as exc:
+        if storage_error_code(exc) == "NotSymlink":
+            return True
+        if is_not_found(exc):
+            return False
+        raise
+    return True
+
 
 def source_identity(size: Any, etag: Any, modified: Any) -> dict[str, str | int]:
     value = str(etag or "").strip()

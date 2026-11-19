@@ -18,7 +18,7 @@ from store.key import logical_key, mount_prefix, physical_key, physical_list_pre
 from store.oss.stream import OssStream
 from store.oss.download import download_settings
 from store.oss.copy import CopySnapshot, read_copy_snapshot
-from store.copy_guard import require_source_identity
+from store.copy_guard import exact_key_exists, require_source_identity
 from store.identity import physical_hash
 from store.errors import storage_error_code
 from store.port import StorageAdapterBase
@@ -272,14 +272,6 @@ class AliyunOssAdapter(StorageAdapterBase):
             forbid_overwrite=True, **self._encryption_args(policy),
         ))
 
-    def head_directory_marker(self, policy: Any, mount: Any, directory: str) -> int:
-        key = self._validate_physical_key(self._key(policy, mount, directory).rstrip("/") + "/")
-        result = self._client_for(policy).head_object(oss.HeadObjectRequest(bucket=self._bucket(policy), key=key))
-        size = getattr(result, "content_length", None)
-        if size is None:
-            raise RuntimeError("OSS directory marker size is unavailable")
-        return int(size)
-
     def delete_directory_marker(self, policy: Any, mount: Any, directory: str) -> None:
         key = self._validate_physical_key(self._key(policy, mount, directory).rstrip("/") + "/")
         self._client_for(policy).delete_object(oss.DeleteObjectRequest(
@@ -312,13 +304,9 @@ class AliyunOssAdapter(StorageAdapterBase):
             self._require_unversioned(policy)
             if self._key(policy, mount, source_key) == self._key(policy, mount, destination_key):
                 raise ValueError("OSS protected copy requires a different destination")
-            client = self._client_for(policy)
-            bucket = self._bucket(policy)
-            source = read_copy_snapshot(client, oss, bucket, self._key(policy, mount, source_key))
+            source = self.inspect_copy_source(policy, mount, source_key)
             require_source_identity(source, expected_source_identity)
             if source.size > 1024 * 1024 * 1024:
-                if source.content_md5:
-                    raise ValueError("OSS multipart copy cannot preserve the source Content-MD5")
                 return self._copy_multipart_without_overwrite(policy, mount, source_key, source, destination_key)
         else:
             source = None
@@ -336,6 +324,22 @@ class AliyunOssAdapter(StorageAdapterBase):
         if source is not None:
             self._verify_protected_copy(policy, mount, source_key, destination_key, source)
         return self.head_object(policy, mount, destination_key)
+
+    def inspect_copy_source(self, policy: Any, mount: Any, source_key: str) -> CopySnapshot:
+        source = read_copy_snapshot(self._client_for(policy), oss, self._bucket(policy), self._key(policy, mount, source_key))
+        if source.size > 1024 * 1024 * 1024:
+            if source.content_md5:
+                raise ValueError("OSS multipart copy cannot preserve the source Content-MD5")
+            if max(16 * 1024 * 1024, ceil(source.size / self.capabilities.max_parts)) > self.capabilities.max_part_size:
+                raise ValueError("OSS source is too large for multipart copy")
+        return source
+
+    def object_key_exists(self, policy: Any, mount: Any, object_key: str, *, directory_marker: bool = False) -> bool:
+        key = self._key(policy, mount, object_key)
+        if directory_marker:
+            key = self._validate_physical_key(key.rstrip("/") + "/")
+        return exact_key_exists(lambda: self._client_for(policy).get_symlink(
+            oss.GetSymlinkRequest(bucket=self._bucket(policy), key=key)))
 
     def _copy_multipart_without_overwrite(
         self, policy: Any, mount: Any, source_key: str, source: CopySnapshot, destination_key: str,

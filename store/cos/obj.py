@@ -10,9 +10,9 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from store.types import MultipartPart, StorageObject, StorageObjectPage
-from store.cos.parse import header, object_from_head, page_from_response
+from store.cos.parse import object_from_head, page_from_response
 from store.cos.copy import CopySnapshot, read_copy_snapshot
-from store.copy_guard import require_source_identity
+from store.copy_guard import exact_key_exists, require_source_identity
 from store.cos.sec import assert_encryption, encryption_args, metadata_headers
 from store.cos.stream import AsyncCosStream, CosStream
 
@@ -305,14 +305,6 @@ class CosObjectMixin:
             Metadata={"x-cos-forbid-overwrite": "true"}, **encryption_args(policy),
         )
 
-    def head_directory_marker(self, policy: Any, mount: Any, directory: str) -> int:
-        key = self._validate_physical_key(self._key(policy, mount, directory).rstrip("/") + "/")
-        response = self._client_for(policy).head_object(Bucket=self._bucket(policy), Key=key)
-        size = header(response, "content-length")
-        if size is None:
-            raise RuntimeError("COS directory marker size is unavailable")
-        return int(size)
-
     def delete_directory_marker(self, policy: Any, mount: Any, directory: str) -> None:
         key = self._validate_physical_key(self._key(policy, mount, directory).rstrip("/") + "/")
         self._client_for(policy).delete_object(Bucket=self._bucket(policy), Key=key)
@@ -406,7 +398,7 @@ class CosObjectMixin:
         source_path = self._key(policy, mount, source_key)
         if source_path == target:
             raise ValueError("COS protected copy requires a different destination")
-        source = read_copy_snapshot(client, bucket, source_path)
+        source = self.inspect_copy_source(policy, mount, source_key)
         require_source_identity(source, expected_source_identity)
         copy_source = {"Bucket": bucket, "Key": source_path, "Region": self._region(policy)}
         if source.size <= 5 * 1024 * 1024 * 1024:
@@ -425,8 +417,6 @@ class CosObjectMixin:
             self._finish_protected_copy(client, bucket, source_path, target, source)
             return self.head_object(policy, mount, destination_key)
 
-        if source.content_md5:
-            raise ValueError("COS multipart copy cannot preserve the source Content-MD5")
         part_size = max(16 * 1024 * 1024, ceil(source.size / self.capabilities.max_parts))
         if part_size > self.capabilities.max_part_size:
             raise ValueError("COS source is too large for multipart copy")
@@ -458,6 +448,22 @@ class CosObjectMixin:
             with suppress(Exception):
                 self.abort_multipart_upload(policy, mount, upload)
             raise
+
+    def inspect_copy_source(self, policy: Any, mount: Any, source_key: str) -> CopySnapshot:
+        source = read_copy_snapshot(self._client_for(policy), self._bucket(policy), self._key(policy, mount, source_key))
+        if source.size > 5 * 1024 * 1024 * 1024:
+            if source.content_md5:
+                raise ValueError("COS multipart copy cannot preserve the source Content-MD5")
+            if max(16 * 1024 * 1024, ceil(source.size / self.capabilities.max_parts)) > self.capabilities.max_part_size:
+                raise ValueError("COS source is too large for multipart copy")
+        return source
+
+    def object_key_exists(self, policy: Any, mount: Any, object_key: str, *, directory_marker: bool = False) -> bool:
+        key = self._key(policy, mount, object_key)
+        if directory_marker:
+            key = self._validate_physical_key(key.rstrip("/") + "/")
+        return exact_key_exists(lambda: self._client_for(policy).get_symlink(
+            Bucket=self._bucket(policy), SymlinkName=key))
 
     @staticmethod
     def _finish_protected_copy(client: Any, bucket: str, source_path: str, target: str, source: CopySnapshot) -> None:
