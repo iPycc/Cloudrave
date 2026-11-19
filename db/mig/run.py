@@ -21,6 +21,7 @@ from db.mig.v9 import upgrade as upgrade_v9
 from db.mig.v10 import upgrade as upgrade_v10
 from db.mig.v11 import upgrade as upgrade_v11
 from db.mig.v12 import upgrade as upgrade_v12
+from db.mig.v13 import upgrade as upgrade_v13
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +44,7 @@ MIGRATIONS = (
     Migration(10, "mount-sync-worker-gate", upgrade_v10),
     Migration(11, "storage-path-precheck", upgrade_v11),
     Migration(12, "storage-path-source-identity", upgrade_v12),
+    Migration(13, "blob-lifecycle-revision", upgrade_v13),
 )
 
 

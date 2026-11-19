@@ -14,6 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.enums import NodeStatus, NodeType
+from models.blob import BlobRef
 from models.tables import BucketMount, MountSyncConflict, MountSyncTask, Node, StoragePolicy, User
 from repositories.audit_logs import AuditLogRepository
 from repositories.blobs import BlobUnavailable
@@ -27,9 +28,9 @@ from services.admin.scan import BucketItem, BucketPage, BucketScanner
 
 @dataclass
 class _PageCache:
-    policy: StoragePolicy | None = None
     root: Node | None = None
     folders: dict[tuple[int, str], Node | None] = field(default_factory=dict)
+    revivals: dict[str, tuple[int, bool]] = field(default_factory=dict)
 
 
 class MountSyncService:
@@ -78,11 +79,43 @@ class MountSyncService:
                 cursor=expected.get("cursor"),
                 page_size=payload.page_size,
             )
+            revivals = await self._probe_revivals(policy, mount, page)
         except Exception as exc:
+            await self.session.rollback()
             await self._record_error(mount_id, expected, exc, lease=lease)
             raise self._sync_error(exc) from exc
 
-        return await self._apply_page(request, actor, mount_id, expected, policy, page, lease=lease)
+        return await self._apply_page(request, actor, mount_id, expected, policy, page, lease=lease, revivals=revivals)
+
+    @staticmethod
+    def _physical_id(mount: BucketMount, item: BucketItem) -> str:
+        return item.physical_id or hashlib.sha256(f"{mount.policy_id}\0{item.physical_key}".encode()).hexdigest()
+
+    @staticmethod
+    def _path_parts(item: BucketItem) -> list[str] | None:
+        if item.key.startswith("/") or "\\" in item.key or "\x00" in item.key:
+            return None
+        key = item.key[:-1] if item.is_directory and item.key.endswith("/") else item.key
+        parts = key.split("/")
+        return None if any(not part or part in {".", ".."} or len(part) > 255 for part in parts) else parts
+
+    async def _probe_revivals(self, policy: StoragePolicy, mount: BucketMount, page: BucketPage) -> dict[str, tuple[int, bool]]:
+        """Check deleted identities without holding the mount or blob write locks."""
+        keys = {self._physical_id(mount, item): item.key for item in page.items
+                if not item.is_directory and self._path_parts(item) is not None}
+        states: list[tuple[str, int]] = []
+        identities = list(keys)
+        for offset in range(0, len(identities), 400):
+            rows = await self.session.execute(select(BlobRef.physical_id, BlobRef.revision).where(
+                BlobRef.physical_id.in_(identities[offset:offset + 400]), BlobRef.state == "deleted",
+            ))
+            states.extend(rows.tuples())
+        # Release the read transaction and its connection before provider I/O.
+        await self.session.commit()
+        results = {}
+        for identity, revision in states:
+            results[identity] = (revision, await self.scanner.exists(policy, mount, keys[identity]))
+        return results
 
     async def _claim_page(
         self,
@@ -139,6 +172,7 @@ class MountSyncService:
         page: BucketPage,
         *,
         lease: tuple[str, str] | None = None,
+        revivals: dict[str, tuple[int, bool]] | None = None,
     ) -> MountSyncRead:
         page_error: Exception | None = None
         result: MountSyncRead
@@ -178,7 +212,7 @@ class MountSyncService:
                 result = self._read(mount, failed)
             else:
                 next_state = dict(current)
-                cache = _PageCache(policy=policy)
+                cache = _PageCache(revivals=revivals or {})
                 try:
                     async with self.session.begin_nested():
                         conflicts: dict[str, tuple[str, str]] = {}
@@ -273,14 +307,10 @@ class MountSyncService:
         generation: str,
         cache: _PageCache,
     ) -> tuple[str, str | None]:
-        if item.key.startswith("/") or "\\" in item.key or "\x00" in item.key:
+        parts = self._path_parts(item)
+        if parts is None:
             return "conflicts", "invalid_path"
         key = item.key[:-1] if item.is_directory and item.key.endswith("/") else item.key
-        if not key:
-            return "conflicts", "invalid_path"
-        parts = key.split("/")
-        if any(not part or part in {".", ".."} or len(part) > 255 for part in parts):
-            return "conflicts", "invalid_path"
 
         if item.is_directory:
             if cache.root is None:
@@ -301,9 +331,7 @@ class MountSyncService:
                 parent_id = folder.id
             return ("created" if created else "unchanged"), None
 
-        physical_id = item.physical_id or hashlib.sha256(
-            f"{mount.policy_id}\0{item.physical_key}".encode()
-        ).hexdigest()
+        physical_id = self._physical_id(mount, item)
         references = await self.objects.list_physical_in_mount(mount.id, mount.policy_id, physical_id, key)
         for record in references:
             if (record.extra or {}).get("origin") == "bucket_import":
@@ -313,7 +341,11 @@ class MountSyncService:
         try:
             await self.objects.blobs.ensure(physical_id)
         except BlobUnavailable:
-            if cache.policy is None or not await self.scanner.exists(cache.policy, mount, key):
+            # The blob lock is held here. Accept only the exact deleted state
+            # checked outside the transaction; a concurrent GC invalidates it.
+            probe = cache.revivals.get(physical_id)
+            blob = await self.objects.blobs.lock(physical_id)
+            if probe is None or not probe[1] or blob.state != "deleted" or blob.revision != probe[0]:
                 return "conflicts", "source_unavailable"
             await self.objects.blobs.ensure(physical_id, revive=True)
 
