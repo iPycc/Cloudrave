@@ -84,8 +84,11 @@ class CosUploadMixin:
         total_size: int | None = None,
         mime_type: str | None = None,
         metadata: dict[str, str] | None = None,
+        no_overwrite: bool = False,
         _copy_snapshot: CopySnapshot | None = None,
     ) -> MultipartUploadState:
+        if no_overwrite:
+            self._require_unversioned(policy)
         if _copy_snapshot is None:
             kwargs: dict[str, Any] = encryption_args(policy)
             if mime_type:

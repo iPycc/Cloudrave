@@ -35,14 +35,14 @@ from services.explorer.up_check import (
     validate_part_number,
 )
 from services.explorer.access import MountAccessPolicy
+from services.explorer.path_write import new_file_path, object_path_template
 from services.explorer.write_policy import ensure_capacity
 from services.explorer.up_abort import cleanup_upload
 from services.explorer.up_path import UploadPath
-from services.explorer.up_plan import make_plan, sign_part, sign_put
+from services.explorer.up_plan import PATH_TOKEN_METADATA, make_plan, sign_part, sign_put
 from store.manager import StorageManager
 from store.call import call_adapter
-from store.errors import is_not_found
-from store.key import managed_key
+from store.errors import is_not_found, storage_error_code
 from store.types import MultipartPart
 
 
@@ -84,7 +84,7 @@ class CreateUploadSessionService:
 
         await ensure_capacity(mount, payload.size, nodes=self.nodes, uploads=self.uploads)
 
-        if payload.checksum:
+        if payload.checksum and object_path_template(policy, mount) is None:
             existing_object = await self.objects.get_by_checksum(
                 payload.checksum,
                 policy_id=policy.id,
@@ -156,11 +156,12 @@ class CreateUploadSessionService:
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Custom object_key is not accepted for managed uploads",
             )
-        object_key = managed_key(
-            actor.id,
-            file_name,
-            style=str((mount.extra or {}).get("object_key_style", "readable")),
-        )
+        file_path = await new_file_path(self.nodes, self.objects, adapter, policy, mount, parent.id, file_name)
+        if file_path.blob_id and (
+            file_path.key in await self.uploads.active_paths(mount.id, {file_path.key})
+            or await self._head_path(adapter, policy, mount, file_path.key) is not None
+        ):
+            raise HTTPException(status_code=409, detail="存储桶中的目标路径已被占用")
         session_record, plan = await make_plan(
             uploads=self.uploads,
             storage_manager=self.storage_manager,
@@ -168,14 +169,15 @@ class CreateUploadSessionService:
             mount=mount,
             parent=parent,
             file_name=file_name,
-            object_key=object_key,
+            object_key=file_path.key,
             payload=payload,
+            path_token=file_path.blob_id,
         )
         await self.audits.create(
             actor_id=actor.id,
             action="upload.create",
             target=f"upload:{session_record.id}",
-            detail=object_key,
+            detail=file_path.key,
             ip=request.client.host if request.client else None,
             user_agent=request.headers.get("user-agent"),
             request_id=getattr(request.state, "request_id", None),
@@ -184,14 +186,19 @@ class CreateUploadSessionService:
 
     async def get(self, actor: User, session_id: str) -> UploadSessionRead:
         record = await self._require_upload_access(actor, session_id)
-        if record.mode == UploadMode.MULTIPART and record.state in (
+        if (record.mode == UploadMode.MULTIPART or record.path_token) and record.state in (
             UploadState.CREATED,
             UploadState.UPLOADING,
             UploadState.FAILED,
         ):
             mount, policy = await self._require_mount_access(actor, record.mount_id)
             adapter = self.storage_manager.get_adapter(policy)
-            if adapter.capabilities.supports_part_listing:
+            stored = await self._head_path(adapter, policy, mount, record.path) if record.path_token else None
+            if stored is not None:
+                self._check_path_object(record, stored)
+                if record.mode == UploadMode.SINGLE:
+                    await self.uploads.sync_parts(record.id, [(1, stored.etag or "part-1", record.size)])
+            elif record.mode == UploadMode.MULTIPART and adapter.capabilities.supports_part_listing:
                 storage_parts = await call_adapter(
                     adapter,
                     "list_parts",
@@ -233,6 +240,7 @@ class CreateUploadSessionService:
                 record.path,
                 record.content_type,
                 getattr(record, "checksum", None),
+                path_token=record.path_token,
             )
         if record.mode != UploadMode.MULTIPART:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Upload session cannot issue part URLs")
@@ -359,6 +367,12 @@ class CreateUploadSessionService:
             mount, policy = await self._require_mount_write(actor, record.mount_id)
             adapter = self.storage_manager.get_adapter(policy)
             declared_checksum = getattr(record, "checksum", None)
+            physical_id = None
+            if record.path_token:
+                physical_id = await call_adapter(adapter, "physical_id", policy, mount, record.path)
+                await self.objects.blobs.lock(physical_id)
+                if await self.objects.has_physical_reference(physical_id) or await self.objects.has_migration_reservation(physical_id):
+                    raise HTTPException(status_code=409, detail="存储桶中的目标路径已被占用")
 
             for part in payload.parts:
                 expected_size = self._expected_part_size(record, part.part_number)
@@ -375,19 +389,8 @@ class CreateUploadSessionService:
                 )
 
             stored_object = None
-            if record.state == UploadState.FAILED or record.mode == UploadMode.SINGLE:
-                try:
-                    stored_object = await call_adapter(
-                        adapter,
-                        "head_object",
-                        policy,
-                        mount,
-                        record.path,
-                    )
-                except Exception as exc:
-                    if not is_not_found(exc):
-                        raise
-                    stored_object = None
+            if record.path_token or record.state == UploadState.FAILED or record.mode == UploadMode.SINGLE:
+                stored_object = await self._head_path(adapter, policy, mount, record.path)
                 if stored_object is not None and stored_object.size != record.size:
                     raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Uploaded object size does not match session")
 
@@ -427,18 +430,27 @@ class CreateUploadSessionService:
                         mime_type=record.content_type,
                     )
                 else:
-                    stored_object = await call_adapter(
-                        adapter,
-                        "complete_multipart_upload",
-                        policy,
-                        mount,
-                        upload_state,
-                        [MultipartPart(part_number=part.part_number, etag=part.etag or "", size=part.size) for part in parts],
-                        mime_type=record.content_type,
-                    )
+                    guarded = {"no_overwrite": True} if record.path_token else {}
+                    try:
+                        stored_object = await call_adapter(
+                            adapter,
+                            "complete_multipart_upload",
+                            policy,
+                            mount,
+                            upload_state,
+                            [MultipartPart(part_number=part.part_number, etag=part.etag or "", size=part.size) for part in parts],
+                            mime_type=record.content_type,
+                            **guarded,
+                        )
+                    except Exception as exc:
+                        if record.path_token and storage_error_code(exc) in {"FileAlreadyExists", "PreconditionFailed"}:
+                            raise HTTPException(status_code=409, detail="存储桶中的目标路径已被占用") from exc
+                        raise
             elif stored_object is None:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Uploaded object was not found")
 
+            if record.path_token:
+                self._check_path_object(record, stored_object)
             try:
                 await call_adapter(
                     adapter,
@@ -475,7 +487,7 @@ class CreateUploadSessionService:
                 node_id=file_node.id,
                 policy_id=policy.id,
                 blob_path=record.path,
-                physical_id=await call_adapter(adapter, "physical_id", policy, mount, record.path),
+                physical_id=physical_id or await call_adapter(adapter, "physical_id", policy, mount, record.path),
                 revive_physical=True,
                 checksum=checksum,
                 content_type=record.content_type,
@@ -483,6 +495,7 @@ class CreateUploadSessionService:
                     "etag": getattr(stored_object, "etag", None),
                     "version_id": getattr(stored_object, "version_id", None),
                     "origin": "managed_upload",
+                    **({"path_blob_id": record.path_token} if record.path_token else {}),
                 },
             )
             await self.uploads.bind_node(record.id, file_node.id)
@@ -531,6 +544,7 @@ class CreateUploadSessionService:
             mount,
             self._build_upload_state(record, policy, mount),
             record.mode,
+            protected=record.path_token is not None,
         )
         await self.uploads.set_state(record.id, UploadState.ABORTED)
         await self.audits.create(
@@ -543,6 +557,22 @@ class CreateUploadSessionService:
             request_id=getattr(request.state, "request_id", None),
         )
         return await self._to_read(record)
+
+    @staticmethod
+    async def _head_path(adapter, policy, mount, key):
+        try:
+            return await call_adapter(adapter, "head_object", policy, mount, key)
+        except Exception as exc:
+            if not is_not_found(exc):
+                raise
+            return None
+
+    @staticmethod
+    def _check_path_object(record, stored) -> None:
+        if stored.metadata.get(PATH_TOKEN_METADATA) != record.path_token:
+            raise HTTPException(status_code=409, detail="存储桶中的目标路径已被占用")
+        if stored.size != record.size:
+            raise HTTPException(status_code=409, detail="存储对象大小与上传会话不匹配")
 
     async def _require_mount_access(self, actor: User, mount_id: int) -> tuple[BucketMount, StoragePolicy]:
         return await self.mount_access.read(actor, mount_id, lock=True)

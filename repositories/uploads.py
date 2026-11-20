@@ -11,6 +11,9 @@ from models.enums import UploadMode, UploadState
 from models.tables import UploadPartRecord, UploadSessionRecord
 
 
+TERMINAL_STATES = (UploadState.COMPLETED, UploadState.ABORTED, UploadState.EXPIRED)
+
+
 class UploadRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
@@ -28,6 +31,7 @@ class UploadRepository:
         content_type: str | None,
         size: int,
         part_size: int,
+        path_token: str | None = None,
         checksum: str | None = None,
         provider_checksum: str | None = None,
         state: UploadState = UploadState.CREATED,
@@ -37,6 +41,7 @@ class UploadRepository:
             mount_id=mount_id,
             node_id=node_id,
             path=path,
+            path_token=path_token,
             mode=mode,
             state=state,
             upload_id=upload_id,
@@ -54,13 +59,22 @@ class UploadRepository:
     async def get_session(self, upload_session_id: str) -> UploadSessionRecord | None:
         return await self.session.get(UploadSessionRecord, upload_session_id)
 
+    async def active_paths(self, mount_id: int, keys: set[str]) -> set[str]:
+        if not keys:
+            return set()
+        statement = select(UploadSessionRecord.path).where(
+            UploadSessionRecord.mount_id == mount_id,
+            UploadSessionRecord.path.in_(keys),
+            UploadSessionRecord.state.not_in(TERMINAL_STATES),
+        )
+        return set(await self.session.scalars(statement))
+
     async def list_active_for_mount(self, mount_id: int) -> list[UploadSessionRecord]:
-        terminal = (UploadState.COMPLETED, UploadState.ABORTED, UploadState.EXPIRED)
         result = await self.session.scalars(
             select(UploadSessionRecord)
             .where(
                 UploadSessionRecord.mount_id == mount_id,
-                UploadSessionRecord.state.not_in(terminal),
+                UploadSessionRecord.state.not_in(TERMINAL_STATES),
             )
             .order_by(UploadSessionRecord.created_at.asc())
         )

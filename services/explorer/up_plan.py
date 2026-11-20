@@ -15,6 +15,7 @@ from store.errors import storage_error_code
 
 
 PRESIGN_WINDOW = 3
+PATH_TOKEN_METADATA = "cloudrave-upload-token"
 LOGGER = logging.getLogger("cloudrave.upload")
 
 
@@ -54,16 +55,24 @@ async def sign_part(adapter, policy, mount, upload, part_number: int, *, relay_u
     )
 
 
-async def sign_put(adapter, policy, mount, object_key: str, mime_type: str | None, checksum: str | None) -> UploadPartPlan:
-    presigned = await call_adapter(
-        adapter,
-        "presign_put",
-        policy,
-        mount,
-        object_key,
-        mime_type=mime_type,
-        metadata={"sha256": checksum} if checksum else None,
-    )
+async def sign_put(
+    adapter, policy, mount, object_key: str, mime_type: str | None, checksum: str | None,
+    *, path_token: str | None = None,
+) -> UploadPartPlan:
+    metadata = {"sha256": checksum} if checksum else {}
+    guarded = {}
+    if path_token:
+        metadata[PATH_TOKEN_METADATA] = path_token
+        guarded["no_overwrite"] = True
+    try:
+        presigned = await call_adapter(
+            adapter, "presign_put", policy, mount, object_key,
+            mime_type=mime_type, metadata=metadata or None, **guarded,
+        )
+    except ValueError as exc:
+        if path_token:
+            raise HTTPException(status_code=409, detail="存储桶不支持防覆盖上传，请检查版本控制配置") from exc
+        raise
     return UploadPartPlan(
         part_number=1,
         method=presigned.method,
@@ -73,7 +82,7 @@ async def sign_put(adapter, policy, mount, object_key: str, mime_type: str | Non
     )
 
 
-async def make_plan(*, uploads, storage_manager, policy, mount, parent, file_name, object_key, payload):
+async def make_plan(*, uploads, storage_manager, policy, mount, parent, file_name, object_key, payload, path_token=None):
     adapter = storage_manager.get_adapter(policy)
     capability = adapter.capabilities
     size = apply_threshold(
@@ -93,12 +102,13 @@ async def make_plan(*, uploads, storage_manager, policy, mount, parent, file_nam
 
     if capability.supports_single_put and mode == UploadMode.SINGLE:
         single_size = payload.size or 1
-        put = await sign_put(adapter, policy, mount, object_key, payload.content_type, payload.checksum)
+        put = await sign_put(adapter, policy, mount, object_key, payload.content_type, payload.checksum, path_token=path_token)
         record = await uploads.create_session(
             owner_id=mount.owner_id,
             mount_id=mount.id,
             node_id=parent.id if parent else None,
             path=object_key,
+            path_token=path_token,
             mode=mode,
             upload_id=None,
             file_name=file_name,
@@ -120,6 +130,16 @@ async def make_plan(*, uploads, storage_manager, policy, mount, parent, file_nam
             required_response_headers=[],
         )
 
+    metadata = {
+        "sha256": payload.checksum or "",
+        "provider_checksum": payload.provider_checksum or "",
+        "file_name": file_name,
+        "part_size": str(size),
+    }
+    guarded = {}
+    if path_token:
+        metadata[PATH_TOKEN_METADATA] = path_token
+        guarded["no_overwrite"] = True
     try:
         upload = await call_adapter(
             adapter,
@@ -129,14 +149,12 @@ async def make_plan(*, uploads, storage_manager, policy, mount, parent, file_nam
             object_key,
             total_size=payload.size,
             mime_type=payload.content_type,
-            metadata={
-                "sha256": payload.checksum or "",
-                "provider_checksum": payload.provider_checksum or "",
-                "file_name": file_name,
-                "part_size": str(size),
-            },
+            metadata=metadata,
+            **guarded,
         )
     except Exception as exc:
+        if path_token and isinstance(exc, ValueError):
+            raise HTTPException(status_code=409, detail="存储桶不支持防覆盖上传，请检查版本控制配置") from exc
         if adapter.provider_type == "aliyun_oss" and storage_error_code(exc) == "SignatureDoesNotMatch":
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
@@ -149,6 +167,7 @@ async def make_plan(*, uploads, storage_manager, policy, mount, parent, file_nam
             mount_id=mount.id,
             node_id=parent.id if parent else None,
             path=object_key,
+            path_token=path_token,
             mode=UploadMode.MULTIPART,
             upload_id=upload.upload_id,
             file_name=file_name,

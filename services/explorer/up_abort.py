@@ -7,7 +7,17 @@ from store.call import call_adapter
 from store.errors import is_not_found
 
 
-async def cleanup_upload(adapter, policy, mount, upload, mode: UploadMode) -> None:
+async def cleanup_upload(adapter, policy, mount, upload, mode: UploadMode, *, protected: bool = False) -> None:
+    if protected:
+        # A named key can already belong to a different writer. Abort only the provider upload ID.
+        if mode == UploadMode.MULTIPART:
+            try:
+                await call_adapter(adapter, "abort_multipart_upload", policy, mount, upload)
+            except Exception as exc:
+                if not is_not_found(exc):
+                    raise
+        return
+
     if mode == UploadMode.SINGLE:
         await call_adapter(adapter, "delete_object", policy, mount, upload.object_key, hard_delete=True)
         return

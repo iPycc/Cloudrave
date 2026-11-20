@@ -460,6 +460,7 @@ class UploadSessionRecord(Base, TimestampMixin):
     mount_id: Mapped[int] = mapped_column(ForeignKey("bucket_mounts.id", ondelete="CASCADE"), index=True)
     node_id: Mapped[int | None] = mapped_column(ForeignKey("nodes.id", ondelete="SET NULL"), nullable=True)
     path: Mapped[str] = mapped_column(String(1024))
+    path_token: Mapped[str | None] = mapped_column(String(32), nullable=True)
     mode: Mapped[UploadMode] = mapped_column(Enum(UploadMode, native_enum=False))
     state: Mapped[UploadState] = mapped_column(Enum(UploadState, native_enum=False), default=UploadState.CREATED)
     upload_id: Mapped[str | None] = mapped_column(Text, nullable=True)
