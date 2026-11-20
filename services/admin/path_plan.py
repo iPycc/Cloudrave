@@ -19,6 +19,7 @@ from models.tables import BucketMount, Node, ObjectRecord, PathMigrationJob, Pat
 from repositories.audit_logs import AuditLogRepository
 from repositories.nodes import NodeRepository
 from repositories.objects import ObjectRepository
+from schemas.task import PathTemplatePreview
 from services.admin.sync import MountSyncService
 from services.admin.task_claim import LEASE_DURATION, claim_task
 from store.call import call_adapter
@@ -122,12 +123,9 @@ async def apply_queued_operation(session, task, node, target_key) -> Node | None
     return node
 
 
-async def start_path_plan(dep, session, mount_id: int, owner_id: int, template: str):
-    try:
-        format_object_key(template, directory="sample", filename="sample.txt", blob_id="0" * 32)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"路径模板无效：{exc}") from exc
-    mount = await dep.get_mount_repository(session).get_by_id_for_update(mount_id)
+async def _path_plan_mount(dep, session, mount_id, owner_id, *, lock: bool):
+    mounts = dep.get_mount_repository(session)
+    mount = await (mounts.get_by_id_for_update(mount_id) if lock else mounts.get_by_id(mount_id))
     if mount is None or mount.owner_id != owner_id:
         raise HTTPException(status_code=404, detail="Bucket mount not found")
     policy = await dep.get_policy_repository(session).get_by_id(mount.policy_id)
@@ -137,6 +135,32 @@ async def start_path_plan(dep, session, mount_id: int, owner_id: int, template: 
         raise HTTPException(status_code=400, detail="当前仅支持 COS 和 OSS 路径预检查")
     if (mount.extra or {}).get("legacy_prefixed_keys"):
         raise HTTPException(status_code=409, detail="旧版前缀映射暂不支持路径预检查")
+    return mount, policy
+
+
+def _path_examples(adapter, policy, mount, template: str) -> PathTemplatePreview:
+    blob_id = "0123456789abcdef" * 2
+    try:
+        root = format_object_key(template, directory="", filename="说明.txt", blob_id=blob_id)
+        nested = format_object_key(template, directory="项目", filename="合同.pdf", blob_id=blob_id)
+        directory = format_directory_key(template, "项目")
+        return PathTemplatePreview(
+            root_key=adapter._key(policy, mount, root),
+            nested_key=adapter._key(policy, mount, nested),
+            directory_key=adapter._validate_physical_key(adapter._key(policy, mount, directory) + "/"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"路径模板无效：{exc}") from exc
+
+
+async def preview_path_template(dep, session, mount_id: int, owner_id: int, template: str) -> PathTemplatePreview:
+    mount, policy = await _path_plan_mount(dep, session, mount_id, owner_id, lock=False)
+    return _path_examples(dep.storage_manager.get_adapter(policy), policy, mount, template)
+
+
+async def start_path_plan(dep, session, mount_id: int, owner_id: int, template: str):
+    mount, policy = await _path_plan_mount(dep, session, mount_id, owner_id, lock=True)
+    _path_examples(dep.storage_manager.get_adapter(policy), policy, mount, template)
     active = await session.scalar(select(PathPlanTask).where(
         PathPlanTask.mount_id == mount.id, PathPlanTask.status.in_(("pending", "running", "paused", "failed")),
         PathPlanTask.rename_to.is_(None), PathPlanTask.move_to.is_(None), PathPlanTask.copy_to.is_(None),

@@ -9,7 +9,7 @@ from models.tables import User
 from models.tables import MountSyncTask
 from schemas.mount import BucketMountRead, MountUsageRead
 from schemas.sync import MountSyncRead, MountSyncRequest
-from schemas.task import MountSyncTaskRead, PathMigrationRead, PathPlanRead, PathPlanRequest
+from schemas.task import MountSyncTaskRead, PathMigrationRead, PathPlanRead, PathPlanRequest, PathTemplatePreview
 from schemas.user_mount import (
     OssDomainRequest,
     UserMountCreate,
@@ -21,7 +21,7 @@ from schemas.user_mount import (
 from services.admin.scan import BucketScanner
 from services.admin.sync import MountSyncService
 from services.admin.sync_task import start_sync_task, stop_sync_task
-from services.admin.path_plan import control_path_plan, start_path_plan
+from services.admin.path_plan import control_path_plan, preview_path_template, start_path_plan
 from services.admin.path_migration import control_migration, start_migration
 from services.user.mount import UserMountService
 from web.mid.auth import get_current_user
@@ -223,6 +223,17 @@ async def start_mount_sync_task(
         mount = await _service(request, session).require_owned_mount(current_user, mount_id)
         task = await start_sync_task(dep, session, mount, current_user.id)
         return MountSyncTaskRead.model_validate(task)
+
+
+@router.post("/{mount_id}/path-plan/preview", response_model=PathTemplatePreview)
+async def preview_mount_path_template(
+    mount_id: int, payload: PathPlanRequest, request: Request,
+    current_user: User = Depends(get_current_user),
+) -> PathTemplatePreview:
+    require_mount_manager(current_user)
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        return await preview_path_template(dep, session, mount_id, current_user.id, payload.template)
 
 
 @router.post("/{mount_id}/path-plan", response_model=PathPlanRead, status_code=202)

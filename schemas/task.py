@@ -60,6 +60,12 @@ class PathPlanRequest(CloudraveSchema):
     template: str = Field(min_length=1, max_length=1024)
 
 
+class PathTemplatePreview(CloudraveSchema):
+    root_key: str
+    nested_key: str
+    directory_key: str
+
+
 class PathMigrationRead(CloudraveSchema):
     id: str
     status: Literal["pending", "running", "paused", "completed", "failed", "canceled"]
