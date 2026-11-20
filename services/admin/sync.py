@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.enums import NodeStatus, NodeType
 from models.blob import BlobRef
-from models.tables import BucketMount, MountSyncConflict, MountSyncTask, Node, StoragePolicy, User
+from models.tables import BucketMount, MountSyncConflict, MountSyncTask, Node, ObjectRecord, StoragePolicy, User
 from repositories.audit_logs import AuditLogRepository
 from repositories.blobs import BlobUnavailable
 from repositories.gc import GcRepository
@@ -47,6 +47,11 @@ def _matches_retained_deletion(item: BucketItem, candidates: list[dict]) -> bool
             continue
         if item.is_directory:
             if candidate.get("directory_marker"):
+                return True
+            continue
+        version_id = candidate.get("version_id")
+        if version_id and item.version_id:
+            if version_id == item.version_id:
                 return True
             continue
         etag = candidate.get("etag")
@@ -429,13 +434,11 @@ class MountSyncService:
         file_name = parts[-1]
         node = await self.nodes.get_child_any(mount.id, parent_id, file_name)
         if references and all(node is None or record.node_id != node.id for record in references):
+            indexed = await self.nodes.list_by_ids([ref.node_id for ref in references])
+            indexed_nodes = {node.id: node for node in indexed}
             for record in references:
-                extra = dict(record.extra or {})
-                if (extra.get("etag") != item.etag or extra.get("last_modified") != item.last_modified
-                        or not (item.etag or item.last_modified)):
-                    record.checksum = None
-                extra["sync_generation"] = generation
-                record.extra = extra
+                if indexed_node := indexed_nodes.get(record.node_id):
+                    await self._refresh_imported_file(indexed_node, record, mount, item, generation, physical_id)
             return "conflicts", "indexed_elsewhere"
         if node is None:
             node = await self.nodes.create_file(
@@ -467,12 +470,20 @@ class MountSyncService:
             # at this name. Never replace its identity during a rescan.
             return "conflicts", "name_conflict"
 
+        changed = await self._refresh_imported_file(node, record, mount, item, generation, physical_id)
+        return ("updated" if changed else "unchanged"), None
+
+    async def _refresh_imported_file(
+        self, node: Node, record: ObjectRecord, mount: BucketMount, item: BucketItem, generation: str, physical_id: str,
+    ) -> bool:
+        key = item.key
         old_extra = dict(record.extra or {})
         content_changed = (
             node.size != item.size
             or node.blob_path != key
             or old_extra.get("etag") != item.etag
             or old_extra.get("last_modified") != item.last_modified
+            or old_extra.get("version_id") != item.version_id
         )
         changed = content_changed or bool(old_extra.get("external_missing"))
         in_recycle_bin = node.deleted_at is not None and (
@@ -487,7 +498,7 @@ class MountSyncService:
         # An imported object's checksum describes its previous contents. If the
         # provider cannot supply a version signal, it cannot be safely reused.
         checksum = record.checksum
-        if changed or not (item.etag or item.last_modified):
+        if changed or not (item.version_id or item.etag or item.last_modified):
             checksum = None
         await self.objects.create_or_update(
             node_id=node.id,
@@ -498,7 +509,7 @@ class MountSyncService:
             content_type=record.content_type,
             extra=self._object_extra(item, generation),
         )
-        return ("updated" if changed else "unchanged"), None
+        return changed
 
     async def _finalize_page(
         self, request: Request, actor: User, mount_id: int, expected: dict,
@@ -613,6 +624,7 @@ class MountSyncService:
             "origin": "bucket_import",
             "physical_key": item.physical_key,
             "etag": item.etag,
+            "version_id": item.version_id,
             "last_modified": item.last_modified,
             "storage_class": item.storage_class,
             "sync_generation": generation,

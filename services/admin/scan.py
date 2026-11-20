@@ -21,6 +21,7 @@ class BucketItem:
     storage_class: str | None
     physical_id: str = ""
     is_directory: bool = False
+    version_id: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -72,6 +73,7 @@ class BucketScanner:
                 identity = await call_adapter(adapter, "listed_physical_id", policy, mount, raw)
             else:
                 identity = await call_adapter(adapter, "physical_id", policy, mount, raw.object_key)
+            version_id = _optional_text(raw.version_id)
             items.append(
                 BucketItem(
                     key=raw.object_key,
@@ -82,6 +84,7 @@ class BucketScanner:
                     last_modified=_optional_text(raw.metadata.get("last_modified")),
                     storage_class=_optional_text(raw.metadata.get("storage_class")),
                     is_directory=is_directory,
+                    version_id=None if version_id == "null" else version_id,
                 )
             )
         if page.is_truncated and (not page.next_marker or page.next_marker == cursor):
