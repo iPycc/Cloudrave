@@ -102,6 +102,8 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
     async def manifest(self, request: Request, actor: User, node_id: int) -> PreviewManifestRead:
         node, mount, policy = await self.resolver.resolve(actor, node_id)
         manifest = await self._build_manifest(request, node, mount, policy)
+        if manifest.kind == "image":
+            await self._add_image_assets(request, node, mount, policy, manifest)
         if Path(node.name).suffix.lower() in {".zip", ".7z"} and manifest.status == "ready":
             manifest.capabilities.append("extract")
         if manifest.kind == "pdf" and manifest.status == "ready":
@@ -184,32 +186,6 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
 
         if kind == "image":
             capabilities.extend(["zoom", "pan", "rotate", "actual-size", "edit"])
-            try:
-                image_metadata = await self._cached_json(
-                    node,
-                    "image-metadata",
-                    lambda: self._probe_image(node, mount, policy),
-                )
-                metadata.update(image_metadata)
-                for variant, width in IMAGE_VARIANTS.items():
-                    assets[variant] = PreviewAssetRead(
-                        url=relative_preview_url(
-                            request.url_for("preview_image_asset", node_id=node.id, variant=variant).include_query_params(v=version)
-                        ),
-                        mime_type="image/webp",
-                        width=min(width, int(image_metadata["width"])),
-                    )
-                if max(int(image_metadata["width"]), int(image_metadata["height"])) > 4096:
-                    assets["dzi"] = PreviewAssetRead(
-                        url=relative_preview_url(request.url_for("preview_dzi", node_id=node.id).include_query_params(v=version)),
-                        mime_type="application/xml",
-                    )
-                    metadata["tiled"] = True
-            except (OSError, UnidentifiedImageError, Image.DecompressionBombError) as exc:
-                metadata["probe_error"] = "Image metadata unavailable"
-                error = str(exc)
-                if metadata["extension"] == "svg":
-                    error = None
         elif kind in {"video", "audio"}:
             capabilities.extend(["play", "seek"])
             media_dir = self._media_dir(node, version)
@@ -345,6 +321,40 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
             preparation_available=preparation_available,
             error=error,
         )
+
+    async def _add_image_assets(
+        self,
+        request: Request,
+        node: Node,
+        mount: BucketMount,
+        policy: StoragePolicy,
+        manifest: PreviewManifestRead,
+    ) -> None:
+        try:
+            image_metadata = await self._cached_json(
+                node, "image-metadata", lambda: self._probe_image(node, mount, policy),
+            )
+        except (OSError, UnidentifiedImageError, Image.DecompressionBombError) as exc:
+            manifest.metadata["probe_error"] = "Image metadata unavailable"
+            if manifest.metadata["extension"] != "svg":
+                manifest.error = str(exc)
+            return
+
+        manifest.metadata.update(image_metadata)
+        for variant, width in IMAGE_VARIANTS.items():
+            url = request.url_for("preview_image_asset", node_id=node.id, variant=variant)
+            manifest.assets[variant] = PreviewAssetRead(
+                url=relative_preview_url(url.include_query_params(v=manifest.version)),
+                mime_type="image/webp",
+                width=min(width, int(image_metadata["width"])),
+            )
+        if max(int(image_metadata["width"]), int(image_metadata["height"])) > 4096:
+            url = request.url_for("preview_dzi", node_id=node.id)
+            manifest.assets["dzi"] = PreviewAssetRead(
+                url=relative_preview_url(url.include_query_params(v=manifest.version)),
+                mime_type="application/xml",
+            )
+            manifest.metadata["tiled"] = True
 
     async def get_pdf_annotations(self, actor: User, node_id: int) -> PdfAnnotationDocument:
         node, _mount, _policy = await self.resolver.resolve(actor, node_id)
