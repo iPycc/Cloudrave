@@ -40,13 +40,12 @@ def _digest(value):
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _relocates_mirror_items(task, mount) -> bool:
+    return mount.mode == "mirror" and (task.rename_to is not None or task.move_to is not None)
+
+
 def _can_relocate_imports(task, mount) -> bool:
-    extra = mount.extra or {}
-    return (
-        (task.rename_to is not None or task.move_to is not None)
-        and mount.mode == "mirror"
-        and extra.get("import_writeback") is True
-    )
+    return _relocates_mirror_items(task, mount) and (mount.extra or {}).get("import_writeback") is True
 
 
 def plan_mapping(task, policy, mount):
@@ -396,6 +395,9 @@ class PathPlanWorker:
                     else:
                         item["target"] = format_directory_key(task.template, "/".join(components))
                         item["source"] = node.blob_path
+                        if node.blob_path is None and _relocates_mirror_items(task, mount):
+                            chain = await _path_chain(session, node, task)
+                            item["marker_candidate"] = "/".join(part[2] for part in reversed(chain[:-1]))
                 except ValueError as exc:
                     item["reason"] = str(exc) if str(exc) in {"source_missing", "external_readonly", "invalid_tree"} else "invalid_path"
                 items.append(item)
@@ -410,6 +412,12 @@ class PathPlanWorker:
             if item["reason"]:
                 continue
             try:
+                candidate = item.get("marker_candidate")
+                if candidate and await _exists(adapter, policy, mount, candidate, folder=True):
+                    if not can_relocate:
+                        item["reason"] = "external_readonly"
+                        continue
+                    item["source"] = candidate
                 physical_target = adapter._validate_physical_key(adapter._key(policy, mount, item["target"]) + ("/" if item["kind"] == "folder" else ""))
                 item["target_hash"] = _digest(physical_target)
                 source_key = adapter._key(policy, mount, item["source"]) if item["kind"] == "file" else None
