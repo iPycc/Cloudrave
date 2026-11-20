@@ -82,12 +82,27 @@ class ObjectGc:
             excluding_node_ids=node_ids,
         )
         legacy_refs = await self.objects.referenced_keys(records, excluding_node_ids=node_ids)
-        protected_ids = {
-            identities[record.id]
-            for record in records
-            if record.id in identities and (record.extra or {}).get("origin") == "bucket_import"
-            and (mounts[nodes[record.node_id].mount_id].extra or {}).get("import_delete_source") is not True
-        }
+        protected_ids = set()
+        for record in records:
+            identity = identities.get(record.id)
+            extra = record.extra or {}
+            if not identity or extra.get("origin") != "bucket_import":
+                continue
+            node = nodes[record.node_id]
+            mount = mounts[node.mount_id]
+            if (mount.extra or {}).get("import_delete_source") is True:
+                continue
+            protected_ids.add(identity)
+            source = _cleanup_identity(extra, node.size)
+            if source["version_id"] or source["etag"]:
+                await self.tasks.create(
+                    policy_id=record.policy_id,
+                    mount_id=mount.id,
+                    blob_path=record.blob_path,
+                    physical_id=identity,
+                    source_identity=source,
+                    retain_source=True,
+                )
         migrated = await self.objects.migrated_targets(set(identities.values()))
         candidates: dict[str, tuple[int, int, str, dict | None]] = {}
         for record in records:
@@ -181,7 +196,7 @@ class ObjectGc:
                         await self.tasks.skipped(task)
                         continue
                     if source.get("external") and (mount.extra or {}).get("import_delete_source") is not True:
-                        await self.tasks.skipped(task)
+                        await self.tasks.skipped(task, retain_source=True)
                         continue
                     if not mount.is_enabled or mount.read_only or policy.status != "active":
                         raise RuntimeError("Storage is no longer writable")

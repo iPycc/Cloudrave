@@ -15,9 +15,12 @@ class GcRepository:
         self.session = session
 
     async def create(
-        self, *, policy_id: int, mount_id: int, blob_path: str, physical_id: str, source_identity: dict | None = None,
+        self, *, policy_id: int, mount_id: int, blob_path: str, physical_id: str,
+        source_identity: dict | None = None, retain_source: bool = False,
     ) -> GcTask:
-        retained = source_identity is not None and not (source_identity.get("version_id") or source_identity.get("managed_blob"))
+        retained = retain_source or (
+            source_identity is not None and not (source_identity.get("version_id") or source_identity.get("managed_blob"))
+        )
         task = GcTask(
             policy_id=policy_id,
             mount_id=mount_id,
@@ -74,8 +77,8 @@ class GcRepository:
         task.next_attempt_at = None
         await self.session.flush()
 
-    async def skipped(self, task: GcTask) -> None:
-        task.state = "skipped"
+    async def skipped(self, task: GcTask, *, retain_source: bool = False) -> None:
+        task.state = "retained" if retain_source else "skipped"
         task.error = None
         task.attempts += 1
         task.next_attempt_at = None
