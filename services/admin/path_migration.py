@@ -1,4 +1,4 @@
-"""Copy historical objects and switch their Cloudrave index in a short transaction."""
+"""Copy storage objects and switch their Cloudrave index in a short transaction."""
 
 from __future__ import annotations
 
@@ -18,8 +18,7 @@ from models.tables import BucketMount, Node, PathMigrationJob, PathMigrationReco
 from repositories.blobs import BlobRepository
 from repositories.nodes import NodeRepository
 from repositories.objects import ObjectRepository
-from services.admin.path_plan import PathPlanWorker, _snapshot
-from services.admin.sync import MountSyncService
+from services.admin.path_plan import PathPlanWorker, _snapshot, apply_queued_rename, plan_mapping
 from store.call import call_adapter
 from store.copy_guard import source_identity
 from store.errors import is_not_found, storage_error_code
@@ -44,7 +43,7 @@ async def start_migration(dep, session, mount_id: int, plan_id: str, owner_id: i
     policy = await dep.get_policy_repository(session).get_by_id(mount.policy_id)
     if (not mount.is_enabled or mount.read_only or policy is None or policy.status != "active" or
         policy.provider not in {"aliyun_oss", "tencent_cos"} or
-        plan.mapping != MountSyncService.mapping_signature(policy, mount)):
+        plan.mapping != plan_mapping(plan, policy, mount)):
         raise HTTPException(status_code=409, detail="存储配置已更改或不可写，请重新检查")
     if plan.status != "completed" or plan.ready <= 0:
         raise HTTPException(status_code=409, detail="请先完成预检查，且至少有一项可迁移")
@@ -158,7 +157,7 @@ async def reserve_file_copy(dep, job_id: str, entry_id: int, lease_token: str) -
             locked_mount.read_only or current_policy is None or current_policy.status != "active" or
             plan is None or plan.mount_id != job.mount_id or plan.owner_id != job.owner_id or
             plan.status != "completed" or plan.mapping != expected_mapping or
-            MountSyncService.mapping_signature(current_policy, locked_mount) != expected_mapping or
+            plan_mapping(plan, current_policy, locked_mount) != expected_mapping or
             entry is None or entry.task_id != plan.id or entry.id <= job.cursor or
             entry.status != "ready" or entry.source_identity_json != expected_identity_json or
             entry.path_fingerprint != expected_fingerprint or
@@ -226,7 +225,7 @@ async def copy_reserved_file(dep, job_id: str, record_id: int, lease_token: str)
             mount is None or mount.owner_id != job.owner_id or not mount.is_enabled or mount.read_only or
             actor is None or actor.status != UserStatus.ACTIVE or actor.role == UserRole.GUEST or
             policy is None or policy.status != "active" or
-            MountSyncService.mapping_signature(policy, mount) != plan.mapping):
+            plan_mapping(plan, policy, mount) != plan.mapping):
             raise ValueError("Migration state changed before copying")
         node = await session.get(Node, entry.node_id)
         await _require_snapshot(session, node, plan, entry)
@@ -318,7 +317,7 @@ async def apply_copy(dep, job_id: str, record_id: int, lease_token: str) -> None
         mount = await session.get(BucketMount, job.mount_id)
         policy = await dep.get_policy_repository(session).get_by_id(mount.policy_id)
         if not mount.is_enabled or mount.read_only or policy.status != "active" or (
-            MountSyncService.mapping_signature(policy, mount) != plan.mapping
+            plan_mapping(plan, policy, mount) != plan.mapping
         ):
             raise ValueError("Storage mapping changed before switching the index")
         target_key = json.loads(entry.target_json)
@@ -346,7 +345,7 @@ async def apply_copy(dep, job_id: str, record_id: int, lease_token: str) -> None
         if (actor is None or actor.status != UserStatus.ACTIVE or actor.role == UserRole.GUEST or
             mount is None or mount.owner_id != job.owner_id or not mount.is_enabled or mount.read_only or
             current_policy is None or current_policy.status != "active" or
-            MountSyncService.mapping_signature(current_policy, mount) != plan.mapping):
+            plan_mapping(plan, current_policy, mount) != plan.mapping):
             raise ValueError("Storage mapping changed before switching the index")
         record = await session.get(PathMigrationRecord, record_id)
         if record.status != "copied":
@@ -370,6 +369,12 @@ async def apply_copy(dep, job_id: str, record_id: int, lease_token: str) -> None
                 if await objects.has_physical_reference(record.target_physical_id):
                     record.status = "uncertain"
                     record.error = "目标已被其他文件登记，源文件已保留"
+                    job.conflicts += 1
+                    job.cursor = entry.id
+                    return
+                if plan.rename_to is not None and not await apply_queued_rename(session, plan, node):
+                    record.status = "uncertain"
+                    record.error = "已有同名文件或文件夹，源文件已保留"
                     job.conflicts += 1
                     job.cursor = entry.id
                     return

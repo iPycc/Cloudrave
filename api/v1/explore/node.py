@@ -26,6 +26,7 @@ from schemas.node import (
     NodeSearchResult,
     NodeSort,
 )
+from schemas.task import PathChangeQueued
 from services.user.storage import UserStorageProvisionService
 from api.v1.explore.dep import node_service
 
@@ -184,17 +185,21 @@ async def create_file(
         return await service.create_file(request, current_user, payload)
 
 
-@router.patch("/node/{node_id}", response_model=NodeRead)
+@router.patch("/node/{node_id}", response_model=NodeRead | PathChangeQueued, responses={202: {"model": PathChangeQueued}})
 async def rename_node(
     node_id: int,
     request: Request,
+    response: Response,
     payload: NodeRenameRequest = Body(...),
     current_user: User = Depends(get_current_user),
-) -> NodeRead:
+) -> NodeRead | PathChangeQueued:
     dep = request.app.state.dep
     async with dep.session_scope() as session:
         service = node_service(dep, session)
-        return await service.rename_node(request, current_user, node_id, payload)
+        result = await service.rename_node(request, current_user, node_id, payload)
+        if isinstance(result, PathChangeQueued):
+            response.status_code = 202
+        return result
 
 
 @router.delete("/node", response_model=dict[str, object])

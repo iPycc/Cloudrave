@@ -22,7 +22,7 @@ class NewFilePath:
 
 
 def object_path_template(policy, mount) -> str | None:
-    extra = mount.extra or {}
+    extra = getattr(mount, "extra", None) or {}
     template = extra.get("object_key_template")
     if template is None:
         return None

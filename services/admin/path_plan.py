@@ -15,7 +15,9 @@ from sqlalchemy import func, select, update
 
 from db.base import session_scope
 from models.enums import NodeStatus, NodeType, UserRole, UserStatus
-from models.tables import BucketMount, Node, ObjectRecord, PathPlanEntry, PathPlanTask, User
+from models.tables import BucketMount, Node, ObjectRecord, PathMigrationJob, PathPlanEntry, PathPlanTask, User
+from repositories.audit_logs import AuditLogRepository
+from repositories.nodes import NodeRepository
 from repositories.objects import ObjectRepository
 from services.admin.sync import MountSyncService
 from services.admin.task_claim import LEASE_DURATION, claim_task
@@ -36,6 +38,46 @@ def _digest(value):
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def plan_mapping(task, policy, mount):
+    current = MountSyncService.mapping_signature(policy, mount)
+    if task.rename_to is not None:
+        return _digest(_json([current, (mount.extra or {}).get("object_key_template"), mount.read_only]))
+    return current
+
+
+async def queue_path_rename(session, mount, policy, node, name, template) -> PathPlanTask:
+    job_status = ("pending", "running", "paused", "failed")
+    active = await session.scalar(select(PathPlanTask.id).outerjoin(
+        PathMigrationJob, PathMigrationJob.plan_id == PathPlanTask.id,
+    ).where(
+        PathPlanTask.mount_id == mount.id, PathPlanTask.rename_to.is_not(None),
+        PathPlanTask.max_node_id == node.id,
+        (PathPlanTask.status.in_(job_status) | PathMigrationJob.status.in_(job_status)),
+    ).limit(1))
+    if active is not None:
+        raise HTTPException(status_code=409, detail="此文件已有未完成的改名任务")
+    task = PathPlanTask(
+        mount_id=mount.id, owner_id=mount.owner_id, template=template, rename_to=name,
+        cursor=node.id - 1, max_node_id=node.id,
+    )
+    task.mapping = plan_mapping(task, policy, mount)
+    session.add(task)
+    await session.flush()
+    return task
+
+
+async def apply_queued_rename(session, task, node) -> bool:
+    sibling = await NodeRepository(session).get_child_any(task.mount_id, node.parent_id, task.rename_to)
+    if sibling is not None and sibling.id != node.id:
+        return False
+    node.name = task.rename_to
+    await AuditLogRepository(session).create(
+        actor_id=task.owner_id, action="node.rename", target=f"node:{node.id}", detail=node.name,
+        ip=None, user_agent=None, request_id=None,
+    )
+    return True
+
+
 async def start_path_plan(dep, session, mount_id: int, owner_id: int, template: str):
     try:
         format_object_key(template, directory="sample", filename="sample.txt", blob_id="0" * 32)
@@ -53,6 +95,7 @@ async def start_path_plan(dep, session, mount_id: int, owner_id: int, template: 
         raise HTTPException(status_code=409, detail="旧版前缀映射暂不支持路径预检查")
     active = await session.scalar(select(PathPlanTask).where(
         PathPlanTask.mount_id == mount.id, PathPlanTask.status.in_(("pending", "running", "paused", "failed")),
+        PathPlanTask.rename_to.is_(None),
     ).order_by(PathPlanTask.created_at.desc()).limit(1))
     if active:
         if active.template == template and active.status in {"pending", "running"}:
@@ -77,7 +120,7 @@ async def control_path_plan(dep, session, mount_id, task_id, owner_id, action):
         raise HTTPException(status_code=404, detail="Task not found")
     if action == "resume" and task.status in {"paused", "failed"}:
         policy = await dep.get_policy_repository(session).get_by_id(mount.policy_id)
-        if not mount.is_enabled or policy is None or policy.status != "active" or task.mapping != MountSyncService.mapping_signature(policy, mount):
+        if not mount.is_enabled or policy is None or policy.status != "active" or task.mapping != plan_mapping(task, policy, mount):
             raise HTTPException(status_code=409, detail="存储配置已更改，请取消后重新检查")
         task.status = "pending"
         task.error = None
@@ -213,12 +256,14 @@ class PathPlanWorker:
             policy = await self.dep.get_policy_repository(session).get_by_id(mount.policy_id) if mount else None
             if (actor is None or actor.status != UserStatus.ACTIVE or actor.role == UserRole.GUEST or
                 mount is None or mount.owner_id != task.owner_id or not mount.is_enabled or policy is None or
-                policy.status != "active" or task.mapping != MountSyncService.mapping_signature(policy, mount)):
+                policy.status != "active" or task.mapping != plan_mapping(task, policy, mount)):
                 raise RuntimeError("Storage or account changed")
             rows = list(await session.scalars(select(Node).where(
                 Node.mount_id == task.mount_id, Node.id > task.cursor, Node.id <= task.max_node_id,
                 Node.parent_id.is_not(None), Node.status == NodeStatus.ACTIVE, Node.deleted_at.is_(None),
             ).order_by(Node.id).limit(PAGE_SIZE)))
+            if task.rename_to is not None and not rows:
+                raise ValueError("Rename source no longer exists")
             for node in rows:
                 item = {"id": node.id, "kind": node.type.value, "size": node.size, "source": None,
                         "target": None, "fingerprint": None, "physical_id": None, "reason": None}
@@ -233,7 +278,7 @@ class PathPlanWorker:
                         item["etag"] = extra.get("etag")
                         blob_id = extra.get("path_blob_id") or uuid5(NAMESPACE_URL, f"cloudrave:{mount.id}:{node.id}").hex
                         item["target"] = format_object_key(task.template, directory="/".join(components[:-1]),
-                            filename=components[-1], blob_id=blob_id)
+                            filename=task.rename_to or components[-1], blob_id=blob_id)
                         if extra.get("origin") == "bucket_import":
                             raise ValueError("external_readonly")
                     else:
@@ -298,10 +343,13 @@ class PathPlanWorker:
                 return
             current_policy = await self.dep.get_policy_repository(session).get_by_id(locked_mount.policy_id) if locked_mount else None
             if (locked_mount is None or locked_mount.owner_id != task.owner_id or not locked_mount.is_enabled or
-                current_policy is None or current_policy.status != "active" or task.mapping != MountSyncService.mapping_signature(current_policy, locked_mount)):
+                current_policy is None or current_policy.status != "active" or task.mapping != plan_mapping(task, current_policy, locked_mount)):
                 raise RuntimeError("Storage configuration changed")
             for item in items:
-                node = await session.get(Node, item["id"])
+                node = (
+                    await NodeRepository(session).get_by_id_for_update(item["id"])
+                    if task.rename_to is not None else await session.get(Node, item["id"])
+                )
                 if item["fingerprint"] is not None:
                     try:
                         if node is None or (await _snapshot(session, node, task))[2] != item["fingerprint"]:
@@ -324,6 +372,9 @@ class PathPlanWorker:
                                 task.ready -= 1
                                 task.conflicts += 1
                                 task.bytes_to_copy -= previous.size
+                if task.rename_to is not None and item.get("unchanged") and item["reason"] is None:
+                    if not await apply_queued_rename(session, task, node):
+                        item["reason"] = "name_conflict"
                 status = "conflict" if item["reason"] else "unchanged" if item.get("unchanged") else "ready"
                 task.scanned += 1
                 if status == "conflict": task.conflicts += 1
@@ -342,6 +393,8 @@ class PathPlanWorker:
                 task.cursor = items[-1]["id"]
             if len(items) < PAGE_SIZE:
                 task.status = "completed"
+                if task.rename_to is not None and task.ready:
+                    session.add(PathMigrationJob(plan_id=task.id, mount_id=task.mount_id, owner_id=task.owner_id))
             else:
                 task.status = "pending"
             task.lease_token = None

@@ -261,6 +261,7 @@ class PathPlanTask(Base, TimestampMixin):
     mount_id: Mapped[int] = mapped_column(ForeignKey("bucket_mounts.id", ondelete="CASCADE"), index=True)
     owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     template: Mapped[str] = mapped_column(Text)
+    rename_to: Mapped[str | None] = mapped_column(String(255), nullable=True)
     mapping: Mapped[str] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     cursor: Mapped[int] = mapped_column(Integer, default=0)

@@ -36,9 +36,11 @@ from schemas.node import (
     NodeRenameRequest,
     NodeSearchResult,
 )
+from schemas.task import PathChangeQueued
+from services.admin.path_plan import queue_path_rename
 from services.explorer.archive import ArchiveDownloadService
 from services.explorer.access import MountAccessPolicy
-from services.explorer.path_write import new_file_path, put_new_file, put_new_folder
+from services.explorer.path_write import new_file_path, object_path_template, put_new_file, put_new_folder
 from services.explorer.write_policy import StorageWritePolicy
 from services.explorer.gc import ObjectGc
 from services.user.response import build_avatar_url
@@ -440,9 +442,27 @@ class FileExplorerService:
         )
         return NodeRead.model_validate(node)
 
-    async def rename_node(self, request: Request, actor: User, node_id: int, payload: NodeRenameRequest) -> NodeRead:
+    async def rename_node(
+        self, request: Request, actor: User, node_id: int, payload: NodeRenameRequest,
+    ) -> NodeRead | PathChangeQueued:
         node = await self._require_node_access(actor, node_id)
-        await self._require_mount_write(actor, node.mount_id)
+        mount, policy = await self._require_mount_write(actor, node.mount_id)
+        if object_path_template(policy, mount) is not None:
+            mount, policy = await self.mount_access.write(actor, node.mount_id, lock=True)
+            template = object_path_template(policy, mount)
+            if template is not None:
+                node = await self.nodes.get_by_id_for_update(node_id)
+                if node is None or node.deleted_at is not None:
+                    raise HTTPException(status_code=404, detail="File node not found")
+                if node.type != NodeType.FILE:
+                    raise HTTPException(status_code=409, detail="此存储的目录改名尚未开放")
+                if node.name == payload.name:
+                    return NodeRead.model_validate(node)
+                sibling = await self.nodes.get_child_any(mount.id, node.parent_id, payload.name)
+                if sibling is not None and sibling.id != node.id:
+                    raise HTTPException(status_code=409, detail="目标位置已存在同名文件或文件夹")
+                task = await queue_path_rename(self.session, mount, policy, node, payload.name, template)
+                return PathChangeQueued(task_id=task.id)
         updated = await self.nodes.rename(node, payload.name)
         await self.audits.create(
             actor_id=actor.id,
