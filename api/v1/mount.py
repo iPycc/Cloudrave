@@ -298,11 +298,11 @@ async def control_mount_sync_task(
     dep = request.app.state.dep
     async with dep.session_scope() as session:
         mount = await _service(request, session).require_owned_mount(current_user, mount_id)
-        task = await session.get(MountSyncTask, task_id)
-        if task is None or task.mount_id != mount.id or task.owner_id != current_user.id:
-            raise HTTPException(status_code=404, detail="Synchronization task not found")
         if action == "resume":
-            task = await start_sync_task(dep, session, mount, current_user.id)
+            task = await start_sync_task(dep, session, mount, current_user.id, resume_task_id=task_id)
         else:
+            task = await session.get(MountSyncTask, task_id)
+            if task is None or task.mount_id != mount.id or task.owner_id != current_user.id:
+                raise HTTPException(status_code=404, detail="Synchronization task not found")
             task = await stop_sync_task(dep, session, task, current_user.id, cancel=action == "cancel")
         return MountSyncTaskRead.model_validate(task)

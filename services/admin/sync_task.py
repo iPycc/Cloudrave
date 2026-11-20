@@ -58,7 +58,9 @@ def sync_service(dep, session) -> MountSyncService:
     )
 
 
-async def start_sync_task(dep, session, mount: BucketMount, owner_id: int) -> MountSyncTask:
+async def start_sync_task(
+    dep, session, mount: BucketMount, owner_id: int, *, resume_task_id: str | None = None,
+) -> MountSyncTask:
     mounts = dep.get_mount_repository(session)
     mount = await mounts.get_by_id_for_update(mount.id)
     if mount is None or mount.owner_id != owner_id:
@@ -73,9 +75,17 @@ async def start_sync_task(dep, session, mount: BucketMount, owner_id: int) -> Mo
         select(MountSyncTask).where(MountSyncTask.mount_id == mount.id)
         .with_for_update().execution_options(populate_existing=True)
     )
+    state = MountSyncService._state(mount)
+    if resume_task_id is not None:
+        if task is None or task.id != resume_task_id or task.owner_id != owner_id:
+            raise HTTPException(status_code=404, detail="Synchronization task not found")
+        if (
+            task.status not in {"pending", "running", "paused", "failed"}
+            or state.get("generation") != task.generation
+        ):
+            raise HTTPException(status_code=409, detail="此导入任务无法继续，请重新发起导入")
     if task is not None and task.status in {"pending", "running"}:
         return task
-    state = MountSyncService._state(mount)
     resuming = task is not None and task.status in {"paused", "failed"} and state.get("generation") == task.generation
     if resuming:
         if state.get("mapping") and state["mapping"] != MountSyncService.mapping_signature(policy, mount):
