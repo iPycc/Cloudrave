@@ -9,6 +9,7 @@ from fastapi.responses import Response
 
 from web.mid.auth import get_current_user
 from web.mid.rate import share_password_rate_limit
+from models.enums import NodeType
 from models.tables import Node, ShareRecord, User
 from schemas.common import MessageResponse
 from schemas.preview import PreviewManifestRead
@@ -30,6 +31,7 @@ from services.explorer.preview import (
 from services.explorer.proxy import remote_response
 from services.explorer.share import ShareService, require_share_preview
 from services.explorer.source import content_disposition, download_probe_response
+from services.explorer.view.base import preview_version
 from services.user.response import build_avatar_url
 
 
@@ -104,6 +106,7 @@ def _shared_node_read(node: Node) -> SharedNodeRead:
         name=node.name,
         type=node.type.value,
         size=node.size,
+        preview_version=preview_version(node) if node.type == NodeType.FILE else None,
     )
 
 
