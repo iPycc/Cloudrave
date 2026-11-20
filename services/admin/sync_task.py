@@ -158,6 +158,12 @@ class MountSyncWorker:
                         heartbeat = asyncio.create_task(self._renew_lease(*claimed), name="mount-sync-lease")
                         try:
                             await self._run_page(*claimed)
+                        except asyncio.CancelledError:
+                            try:
+                                await self._finish_page(*claimed, status="pending")
+                            except Exception:
+                                LOGGER.exception("Could not release synchronization task lease at shutdown")
+                            raise
                         finally:
                             heartbeat.cancel()
                             with suppress(asyncio.CancelledError):
@@ -255,9 +261,13 @@ class MountSyncWorker:
                 return
             error = "同步未完成，请检查存储连接或重新授权后重试"
             complete = False
+        page_status = "failed" if error else "completed" if complete else "pending"
+        await self._finish_page(task_id, token, status=page_status, error=error)
+
+    async def _finish_page(self, task_id: str, token: str, *, status: str, error: str | None = None) -> None:
         async with session_scope(self.dep.session_factory) as session:
             values = {
-                "status": "failed" if error else "completed" if complete else "pending",
+                "status": status,
                 "error": error, "lease_token": None, "lease_expires_at": None,
                 "updated_at": datetime.now(UTC),
             }
