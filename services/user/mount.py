@@ -22,6 +22,7 @@ from repositories.uploads import UploadRepository
 from schemas.mount import BucketMountCreate, BucketMountRead, BucketMountUpdate, mount_read
 from schemas.policy import StoragePolicyCreate, StoragePolicyRead, StoragePolicyUpdate
 from schemas.user_mount import (
+    UploadCorsRead,
     UserBucketMountCreate,
     UserMountCreate,
     UserMountDeletePreview,
@@ -31,6 +32,7 @@ from schemas.user_mount import (
 )
 from services.explorer.upload_cleanup import UploadCleanup
 from services.explorer.path_write import validate_import_permissions, validate_mount_path
+from services.user.upload_cors import check_direct_upload_cors
 from store.call import call_adapter
 from store.manager import StorageManager
 from drives.ids import provider_id
@@ -277,6 +279,18 @@ class UserMountService:
         await self.session.flush()
         await self._audit(request, actor, "mount.cors", mount, str(result.get("status", "configured")))
         return result
+
+    async def check_upload_cors(self, actor: User, mount_id: int, origin: str) -> UploadCorsRead:
+        mount = await self._owned_mount(actor, mount_id)
+        policy = await self._policy(mount.policy_id)
+        if provider_id(policy.provider) not in {"tencent_cos", "aliyun_oss"}:
+            raise HTTPException(status_code=422, detail="当前存储不使用 COS／OSS 直传")
+        if mount.read_only:
+            return UploadCorsRead(status="read_only")
+        if not mount.is_enabled or policy.status != "active":
+            return UploadCorsRead(status="unavailable")
+        result = await check_direct_upload_cors(self.storage_manager.get_adapter(policy), policy, mount, origin)
+        return UploadCorsRead(status=result)
 
     async def require_owned_mount(self, actor: User, mount_id: int) -> BucketMount:
         return await self._owned_mount(actor, mount_id)
