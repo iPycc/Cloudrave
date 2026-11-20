@@ -187,6 +187,7 @@ class CreateUploadSessionService:
 
     async def get(self, actor: User, session_id: str) -> UploadSessionRead:
         record = await self._require_upload_access(actor, session_id)
+        ready_to_complete = False
         if (record.mode == UploadMode.MULTIPART or record.path_token) and record.state in (
             UploadState.CREATED,
             UploadState.UPLOADING,
@@ -197,6 +198,7 @@ class CreateUploadSessionService:
             stored = await self._head_path(adapter, policy, mount, record.path) if record.path_token else None
             if stored is not None:
                 self._check_path_object(record, stored)
+                ready_to_complete = True
                 if record.mode == UploadMode.SINGLE:
                     await self.uploads.sync_parts(record.id, [(1, stored.etag or "part-1", record.size)])
             elif record.mode == UploadMode.MULTIPART and adapter.capabilities.supports_part_listing:
@@ -205,7 +207,16 @@ class CreateUploadSessionService:
                         adapter, "list_parts", policy, mount, self._build_upload_state(record, policy, mount),
                     )
                 except Exception as exc:
-                    await self._recover_missing_oss_upload(adapter, policy, mount, record, exc)
+                    stored = await self._recover_missing_oss_upload(adapter, policy, mount, record, exc)
+                    if stored is None:
+                        await self.uploads.transition_state(
+                            record.id,
+                            expected=(UploadState.CREATED, UploadState.UPLOADING, UploadState.FAILED),
+                            target=UploadState.EXPIRED,
+                        )
+                        await self.session.refresh(record)
+                        return await self._to_read(record)
+                    ready_to_complete = True
                 else:
                     reconciled: list[tuple[int, str | None, int]] = []
                     for part in storage_parts:
@@ -217,7 +228,7 @@ class CreateUploadSessionService:
                             reconciled.append((part.part_number, part.etag, part.size))
                     await self.uploads.sync_parts(record.id, reconciled)
             await self.uploads.touch(record.id)
-        return await self._to_read(record)
+        return await self._to_read(record, ready_to_complete=ready_to_complete)
 
     async def part_url(
         self,
@@ -390,7 +401,7 @@ class CreateUploadSessionService:
                 )
 
             stored_object = None
-            if record.state == UploadState.FAILED and self._is_oss_blob_multipart(adapter, record):
+            if self._is_oss_blob_multipart(adapter, record) and (record.state == UploadState.FAILED or not payload.parts):
                 stored_object = await self._completed_oss_object(adapter, policy, mount, record)
             elif record.path_token or record.state == UploadState.FAILED or record.mode == UploadMode.SINGLE:
                 stored_object = await self._head_path(adapter, policy, mount, record.path)
@@ -449,6 +460,8 @@ class CreateUploadSessionService:
                         if record.path_token and storage_error_code(exc) in {"FileAlreadyExists", "PreconditionFailed"}:
                             raise HTTPException(status_code=409, detail="存储桶中的目标路径已被占用") from exc
                         stored_object = await self._recover_missing_oss_upload(adapter, policy, mount, record, exc)
+                        if stored_object is None:
+                            raise HTTPException(status_code=410, detail="OSS 分片会话已失效，请重新上传文件") from exc
             elif stored_object is None:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Uploaded object was not found")
 
@@ -584,10 +597,7 @@ class CreateUploadSessionService:
     async def _recover_missing_oss_upload(self, adapter, policy, mount, record, exc: Exception):
         if not self._is_oss_blob_multipart(adapter, record) or storage_error_code(exc) != "NoSuchUpload":
             raise exc
-        stored = await self._completed_oss_object(adapter, policy, mount, record)
-        if stored is None:
-            raise HTTPException(status_code=409, detail="OSS 分片会话已失效，请重新上传文件") from exc
-        return stored
+        return await self._completed_oss_object(adapter, policy, mount, record)
 
     async def _completed_oss_object(self, adapter, policy, mount, record):
         stored = await self._head_path(adapter, policy, mount, record.path)
@@ -650,7 +660,7 @@ class CreateUploadSessionService:
     def _build_upload_state(self, record, policy, mount):
         return build_upload_state(record, policy, mount, self.storage_manager)
 
-    async def _to_read(self, record) -> UploadSessionRead:
+    async def _to_read(self, record, *, ready_to_complete: bool = False) -> UploadSessionRead:
         parts = await self.uploads.list_parts(record.id)
         mount = await self.mounts.get_by_id(record.mount_id)
         if mount is None:
@@ -678,6 +688,7 @@ class CreateUploadSessionService:
             transport=capability.upload_transport,
             required_response_headers=["ETag"] if capability.requires_part_etag else [],
             part_checksum_algorithm=capability.part_checksum_algorithm,
+            ready_to_complete=ready_to_complete,
             parts=[UploadPartRead.model_validate(part) for part in parts],
         )
 
