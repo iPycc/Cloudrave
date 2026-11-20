@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from hashlib import sha256
+
+from drives.ids import provider_id
+from models.enums import NodeType
 from models.gc import GcTask
 from repositories.gc import GcRepository
 from repositories.mounts import BucketMountRepository
@@ -9,7 +13,23 @@ from repositories.nodes import NodeRepository
 from repositories.objects import ObjectRepository
 from repositories.policies import StoragePolicyRepository
 from store.call import call_adapter
+from store.errors import is_not_found
+from store.key import physical_key
 from store.manager import StorageManager
+
+
+PATH_PROVIDERS = {"tencent_cos", "aliyun_oss"}
+
+
+def _cleanup_identity(extra, size):
+    version = str(extra.get("version_id") or "").strip()
+    return {
+        "size": size,
+        "etag": str(extra.get("etag") or "").strip('"') or None,
+        "modified": str(extra["last_modified"]) if extra.get("last_modified") else None,
+        "version_id": version if version and version.lower() != "null" else None,
+        "external": extra.get("origin") == "bucket_import",
+    }
 
 
 class ObjectGc:
@@ -34,12 +54,10 @@ class ObjectGc:
 
     async def stage(self, node_ids: list[int]) -> list[int]:
         records = await self.objects.get_by_node_ids(node_ids)
-        if not records:
-            return []
         nodes = {node.id: node for node in await self.nodes.list_by_ids(node_ids)}
-        mount_ids = {nodes[record.node_id].mount_id for record in records if record.node_id in nodes}
+        mount_ids = {node.mount_id for node in nodes.values()}
         mounts = {mount.id: mount for mount in await self.mounts.list_by_ids(list(mount_ids))}
-        policy_ids = {record.policy_id for record in records}
+        policy_ids = {record.policy_id for record in records} | {mount.policy_id for mount in mounts.values()}
         policies = {policy.id: policy for policy in await self.policies.list_by_ids(list(policy_ids))}
 
         identities: dict[int, str] = {}
@@ -70,7 +88,8 @@ class ObjectGc:
             if record.id in identities and (record.extra or {}).get("origin") == "bucket_import"
             and (mounts[nodes[record.node_id].mount_id].extra or {}).get("import_delete_source") is not True
         }
-        candidates: dict[str, tuple[int, int, str]] = {}
+        migrated = await self.objects.migrated_targets(set(identities.values()))
+        candidates: dict[str, tuple[int, int, str, dict | None]] = {}
         for record in records:
             identity = identities.get(record.id)
             node = nodes.get(record.node_id)
@@ -79,18 +98,39 @@ class ObjectGc:
             legacy_key = (record.policy_id, node.mount_id, record.blob_path)
             if legacy_key in legacy_refs:
                 continue
-            if node.mount_id in mounts and record.policy_id in policies:
-                candidates.setdefault(identity, (record.policy_id, node.mount_id, record.blob_path))
+            mount = mounts[node.mount_id]
+            policy = policies[record.policy_id]
+            extra = record.extra or {}
+            guarded = provider_id(policy.provider) in PATH_PROVIDERS and (
+                (mount.extra or {}).get("object_key_template") is not None or extra.get("path_blob_id") or identity in migrated
+            )
+            source = _cleanup_identity(extra, node.size) if guarded else None
+            if identity not in candidates or (source is not None and candidates[identity][3] is None):
+                candidates[identity] = (policy.id, mount.id, record.blob_path, source)
 
         task_ids: list[int] = []
-        for identity, (policy_id, mount_id, blob_path) in candidates.items():
+        for identity, (policy_id, mount_id, blob_path, source) in candidates.items():
             task = await self.tasks.create(
                 policy_id=policy_id,
                 mount_id=mount_id,
                 blob_path=blob_path,
                 physical_id=identity,
+                source_identity=source,
             )
-            task_ids.append(task.id)
+            if source is None:
+                task_ids.append(task.id)
+        for node in nodes.values():
+            if node.type != NodeType.FOLDER or not node.blob_path:
+                continue
+            mount = mounts.get(node.mount_id)
+            policy = policies.get(mount.policy_id) if mount else None
+            if policy is not None and provider_id(policy.provider) in PATH_PROVIDERS:
+                marker = physical_key(policy, mount, node.blob_path) + "/"
+                await self.tasks.create(
+                    policy_id=policy.id, mount_id=mount.id, blob_path=node.blob_path + "/",
+                    physical_id=sha256(marker.encode("utf-8")).hexdigest(),
+                    source_identity={"directory_marker": True, "size": 0},
+                )
         return task_ids
 
     async def run(self, task_ids: list[int]) -> int:
@@ -104,8 +144,9 @@ class ObjectGc:
         for task in sorted(tasks, key=lambda item: (item.physical_id, item.id)):
             if task.state != "processing":
                 continue
+            source = task.source_identity
             blob = await self.objects.blobs.lock(task.physical_id)
-            if blob.state == "deleted":
+            if blob.state == "deleted" and source is None:
                 await self.tasks.done(task)
                 completed += 1
                 continue
@@ -128,6 +169,22 @@ class ObjectGc:
                 current_id = await call_adapter(adapter, "physical_id", policy, mount, task.blob_path)
                 if current_id != task.physical_id:
                     raise RuntimeError("Storage mapping changed after cleanup was staged")
+                if source is not None:
+                    if source.get("external") and (mount.extra or {}).get("import_delete_source") is not True:
+                        await self.tasks.skipped(task)
+                        continue
+                    if not mount.is_enabled or mount.read_only or policy.status != "active":
+                        raise RuntimeError("Storage is no longer writable")
+                    try:
+                        await call_adapter(adapter, "delete_object_version", policy, mount, task.blob_path, source["version_id"])
+                    except Exception as exc:
+                        if not is_not_found(exc):
+                            raise
+                    # Other versions at the same key may still be live.
+                    await self.objects.blobs.active(blob)
+                    await self.tasks.done(task)
+                    completed += 1
+                    continue
                 await self.objects.blobs.deleting(blob)
                 await call_adapter(
                     adapter,

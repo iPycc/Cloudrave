@@ -18,12 +18,14 @@ from models.blob import BlobRef
 from models.tables import BucketMount, MountSyncConflict, MountSyncTask, Node, StoragePolicy, User
 from repositories.audit_logs import AuditLogRepository
 from repositories.blobs import BlobUnavailable
+from repositories.gc import GcRepository
 from repositories.mounts import BucketMountRepository
 from repositories.nodes import NodeRepository
 from repositories.objects import ObjectRepository
 from repositories.policies import StoragePolicyRepository
 from schemas.sync import MountSyncRead, MountSyncRequest
 from services.admin.scan import BucketItem, BucketPage, BucketScanner
+from store.copy_guard import source_identity
 
 
 @dataclass
@@ -32,6 +34,32 @@ class _PageCache:
     folders: dict[tuple[int, str], Node | None] = field(default_factory=dict)
     revivals: dict[str, tuple[int, bool]] = field(default_factory=dict)
     managed_markers: set[str] = field(default_factory=set)
+    retained_deletions: dict[str, list[dict]] = field(default_factory=dict)
+
+
+def _marker_identity(item: BucketItem) -> str:
+    return hashlib.sha256((item.physical_key.rstrip("/") + "/").encode("utf-8")).hexdigest()
+
+
+def _matches_retained_deletion(item: BucketItem, candidates: list[dict]) -> bool:
+    for candidate in candidates:
+        if candidate["size"] != item.size:
+            continue
+        if item.is_directory:
+            if candidate.get("directory_marker"):
+                return True
+            continue
+        etag = candidate.get("etag")
+        if not etag or etag != item.etag:
+            continue
+        if modified := candidate.get("modified"):
+            try:
+                if source_identity(item.size, etag, modified) != source_identity(item.size, item.etag, item.last_modified):
+                    continue
+            except (ValueError, TypeError, OverflowError):
+                continue
+        return True
+    return False
 
 
 class MountSyncService:
@@ -219,6 +247,10 @@ class MountSyncService:
                         cache.managed_markers = await self.nodes.directory_marker_keys(
                             mount.id, {item.key.removesuffix("/") for item in page.items if item.is_directory},
                         )
+                        cache.retained_deletions = await GcRepository(self.session).retained_sources(mount.id, {
+                            _marker_identity(item) if item.is_directory else self._physical_id(mount, item)
+                            for item in page.items
+                        })
                         conflicts: dict[str, tuple[str, str]] = {}
                         for item in page.items:
                             next_state["scanned"] += 1
@@ -317,8 +349,10 @@ class MountSyncService:
         key = item.key[:-1] if item.is_directory and item.key.endswith("/") else item.key
 
         if item.is_directory:
-            marker_hash = hashlib.sha256((item.physical_key.rstrip("/") + "/").encode("utf-8")).hexdigest()
-            if key in cache.managed_markers or await self.objects.has_migration_marker(mount.id, marker_hash):
+            marker_hash = _marker_identity(item)
+            if (key in cache.managed_markers
+                or _matches_retained_deletion(item, cache.retained_deletions.get(marker_hash, []))
+                or await self.objects.has_migration_marker(mount.id, marker_hash)):
                 return "skipped", None
             if cache.root is None:
                 cache.root = await self.nodes.ensure_mount_root(
@@ -344,6 +378,8 @@ class MountSyncService:
             if (record.extra or {}).get("origin") == "bucket_import":
                 record.extra = {**record.extra, "sync_generation": generation}
         if any((record.extra or {}).get("origin") != "bucket_import" for record in references):
+            return "skipped", None
+        if not references and _matches_retained_deletion(item, cache.retained_deletions.get(physical_id, [])):
             return "skipped", None
         try:
             await self.objects.blobs.ensure(physical_id)

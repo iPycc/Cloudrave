@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import ForeignKey, Integer, String, Text
+from sqlalchemy import ForeignKey, Integer, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from db.base import Base
@@ -23,6 +23,7 @@ class GcTask(Base):
     mount_id: Mapped[int] = mapped_column(ForeignKey("bucket_mounts.id", ondelete="CASCADE"), index=True)
     blob_path: Mapped[str] = mapped_column(String(1024))
     physical_id: Mapped[str] = mapped_column(String(64), index=True)
+    source_identity: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
     state: Mapped[str] = mapped_column(String(16), default="pending", index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)

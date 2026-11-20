@@ -409,6 +409,11 @@ class AliyunOssAdapter(StorageAdapterBase):
                         ))
         return True
 
+    def delete_object_version(self, policy: Any, mount: Any, object_key: str, version_id: str) -> None:
+        self._client_for(policy).delete_object(oss.DeleteObjectRequest(
+            bucket=self._bucket(policy), key=self._key(policy, mount, object_key), version_id=version_id,
+        ))
+
     def mount_has_objects(self, policy: Any, mount: Any) -> bool:
         return bool(self.list_objects(policy, mount, max_keys=1).objects)
 

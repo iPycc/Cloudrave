@@ -365,6 +365,11 @@ class CosObjectMixin:
     async def adelete_object(self, policy: Any, mount: Any, object_key: str, *, hard_delete: bool = False) -> bool:
         return await asyncio.to_thread(self.delete_object, policy, mount, object_key, hard_delete=hard_delete)
 
+    def delete_object_version(self, policy: Any, mount: Any, object_key: str, version_id: str) -> None:
+        self._client_for(policy).delete_object(
+            Bucket=self._bucket(policy), Key=self._key(policy, mount, object_key), VersionId=version_id,
+        )
+
     def copy_object(
         self, policy: Any, mount: Any, source_key: str, destination_key: str, *,
         no_overwrite: bool = False,

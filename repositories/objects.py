@@ -189,6 +189,14 @@ class ObjectRepository:
         ).limit(1).with_for_update()
         return await self.session.scalar(statement) is not None
 
+    async def migrated_targets(self, identities: set[str]) -> set[str]:
+        if not identities:
+            return set()
+        return set(await self.session.scalars(select(PathMigrationRecord.target_physical_id).where(
+            PathMigrationRecord.target_physical_id.in_(identities),
+            PathMigrationRecord.status.in_(("applied", "duplicated")),
+        ).distinct()))
+
     async def retained_migration_source(self, physical_id: str, mount_id: int | None = None) -> PathPlanEntry | None:
         query = select(PathPlanEntry).join(PathMigrationRecord, PathMigrationRecord.plan_entry_id == PathPlanEntry.id).where(
             PathMigrationRecord.source_physical_id == physical_id, PathMigrationRecord.status == "applied",

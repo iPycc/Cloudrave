@@ -476,8 +476,11 @@ class FileExplorerService:
 
     async def delete_nodes(self, request: Request, actor: User, payload: NodeDeleteRequest) -> dict[str, list[int] | list[NodeRead]]:
         nodes = [await self._require_node_access(actor, node_id) for node_id in payload.node_ids]
-        for mount_id in {node.mount_id for node in nodes}:
-            await self._require_mount_write(actor, mount_id)
+        for mount_id in sorted({node.mount_id for node in nodes}):
+            if payload.hard_delete:
+                await self.mount_access.write(actor, mount_id, lock=True)
+            else:
+                await self._require_mount_write(actor, mount_id)
         if payload.hard_delete:
             all_ids = await self.nodes.collect_descendant_ids(payload.node_ids)
             gc = ObjectGc(
@@ -513,8 +516,9 @@ class FileExplorerService:
                 },
             )
             await self.session.commit()
-            await gc.run(task_ids)
-            await self.session.commit()
+            if task_ids:
+                await gc.run(task_ids)
+                await self.session.commit()
             return {"deleted_node_ids": all_ids}
 
         deleted = await self.nodes.soft_delete(payload.node_ids)

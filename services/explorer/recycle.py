@@ -102,13 +102,16 @@ class RecycleBinService:
     async def permanently_delete_nodes(self, request: Request, actor: User, payload: NodeDeleteRequest) -> dict[str, list[int]]:
         if not payload.hard_delete:
             payload = NodeDeleteRequest(node_ids=payload.node_ids, hard_delete=True)
+        mount_ids = set()
         for node_id in payload.node_ids:
             node = await self.nodes.get_by_id(node_id)
             if node is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
             if node.owner_id != actor.id:
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Node access denied")
-            await self._require_write(actor, node.mount_id)
+            mount_ids.add(node.mount_id)
+        for mount_id in sorted(mount_ids):
+            await self.mount_access.write(actor, mount_id, lock=True)
         deleted_ids = await self.nodes.collect_descendant_ids(payload.node_ids)
         gc = ObjectGc(
             mounts=self.mounts,
@@ -130,9 +133,7 @@ class RecycleBinService:
             request_id=getattr(request.state, "request_id", None),
         )
         await self.session.commit()
-        await gc.run(task_ids)
-        await self.session.commit()
+        if task_ids:
+            await gc.run(task_ids)
+            await self.session.commit()
         return {"deleted_node_ids": deleted_ids}
-
-    async def _require_write(self, actor: User, mount_id: int) -> None:
-        await self.mount_access.write(actor, mount_id)
