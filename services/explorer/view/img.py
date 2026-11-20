@@ -5,12 +5,15 @@ from __future__ import annotations
 import asyncio
 import math
 import tempfile
+from contextlib import closing
+from io import BytesIO
 from pathlib import Path
 
 from fastapi import HTTPException, status
 from PIL import ExifTags, Image, ImageOps
 from pillow_heif import register_heif_opener
 
+from drives.ids import ALIYUN_OSS, TENCENT_COS
 from models.tables import BucketMount, Node, StoragePolicy, User
 from services.explorer.view.base import (
     IMAGE_VARIANTS,
@@ -22,6 +25,9 @@ from services.explorer.view.base import (
 
 
 register_heif_opener()
+
+_IMAGE_HEADER_BYTES = 128 * 1024
+_IMAGE_HEADER_FORMATS = {".jpg": "JPEG", ".jpeg": "JPEG", ".png": "PNG"}
 
 _EXIF_FIELDS = {
     "Make": "camera_make",
@@ -55,6 +61,26 @@ def _safe_exif(image: Image.Image) -> dict[str, object]:
         else:
             values[output_name] = str(value)
     return values
+
+
+def _image_metadata(image: Image.Image, *, header_only: bool = False) -> dict[str, object]:
+    width, height = image.size
+    exif = {}
+    # Pillow loads PNG pixels when asked for EXIF that was absent from its header.
+    if not header_only or image.format != "PNG" or "exif" in image.info:
+        if image.getexif().get(ExifTags.Base.Orientation) in (5, 6, 7, 8):
+            width, height = height, width
+        exif = _safe_exif(image)
+    metadata: dict[str, object] = {
+        "width": width,
+        "height": height,
+        "format": image.format or "",
+        "mode": image.mode,
+        "frames": int(getattr(image, "n_frames", 1)),
+    }
+    if exif:
+        metadata["exif"] = exif
+    return metadata
 
 
 class ImageMixin:
@@ -108,20 +134,25 @@ class ImageMixin:
                         await asyncio.to_thread(self._generate_dzi_tile, node, mount, policy, target, level, column, row)
         return target
     def _probe_image(self, node: Node, mount: BucketMount, policy: StoragePolicy) -> dict[str, object]:
+        image_format = _IMAGE_HEADER_FORMATS.get(Path(node.name).suffix.lower())
+        if image_format and node.size > _IMAGE_HEADER_BYTES:
+            adapter = self.storage_manager.get_adapter(policy)
+            if adapter.provider_type in {ALIYUN_OSS, TENCENT_COS}:
+                with closing(adapter.open_object(
+                    policy, mount, node.blob_path, byte_range=(0, _IMAGE_HEADER_BYTES - 1),
+                )) as stream:
+                    header = stream.read(_IMAGE_HEADER_BYTES)
+                try:
+                    with Image.open(BytesIO(header), formats=[image_format]) as image:
+                        return _image_metadata(image, header_only=True)
+                except (OSError, SyntaxError, ValueError):
+                    # ICC and other metadata chunks can put the image header beyond the first range.
+                    pass
+
         with self._open_seekable(node, mount, policy) as stream:
             with Image.open(stream) as image:
-                oriented = ImageOps.exif_transpose(image)
-                metadata: dict[str, object] = {
-                    "width": oriented.width,
-                    "height": oriented.height,
-                    "format": image.format or "",
-                    "mode": image.mode,
-                    "frames": int(getattr(image, "n_frames", 1)),
-                }
-                exif = _safe_exif(image)
-                if exif:
-                    metadata["exif"] = exif
-                return metadata
+                image.load()
+                return _image_metadata(image)
 
     def _generate_image_variant(
         self,
