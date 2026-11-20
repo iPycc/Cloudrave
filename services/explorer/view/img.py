@@ -90,6 +90,8 @@ class ImageMixin:
         node, mount, policy = await self.resolver.resolve(actor, node_id)
         if preview_kind(node.name) != "image":
             raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="File is not an image")
+        if Path(node.name).suffix.lower() == ".svg":
+            raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="SVG image variants are not supported")
         version = preview_version(node)
         target = self.cache_root / "images" / str(node.id) / version / f"{variant}.webp"
         if not target.exists():
