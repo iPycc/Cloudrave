@@ -228,11 +228,12 @@ async def test_google_oauth(
     require_admin(current_user)
     dep = request.app.state.dep
     async with dep.session_scope() as session:
+        settings = await _settings_service(request, session)
         try:
-            credentials = await (await _settings_service(request, session)).get_credentials(allow_disabled=True)
+            credentials = await settings.get_credentials(allow_disabled=True)
         except GoogleOAuthProtocolError:
             return _test_redirect("not_configured")
-    signed = _encode_link_flow(current_user.uid, dep.config.auth.jwt_secret + ":google-oauth-test")
+    signed = _encode_link_flow(current_user.uid, settings.configuration_fingerprint(credentials))
     return _authorization_redirect(request, dep.config, credentials, flow="test:" + signed[5:])
 
 
@@ -248,10 +249,6 @@ async def finish_google_oauth(
     is_link_flow = flow.startswith("link:")
     is_test_flow = flow.startswith("test:")
     link_user_uid = _decode_link_flow(flow, dep.config.auth.jwt_secret) if is_link_flow else None
-    test_user_uid = (
-        _decode_link_flow("link:" + flow[5:], dep.config.auth.jwt_secret + ":google-oauth-test")
-        if is_test_flow else None
-    )
     error_redirect = _test_redirect if is_test_flow else _link_redirect if is_link_flow else _login_redirect
     expected_state = request.cookies.get(GOOGLE_STATE_COOKIE, "")
     verifier = request.cookies.get(GOOGLE_VERIFIER_COOKIE, "")
@@ -261,12 +258,15 @@ async def finish_google_oauth(
         return _clear_flow_cookies(error_redirect("invalid_state"), request, dep.config)
     if is_link_flow and link_user_uid is None:
         return _clear_flow_cookies(_link_redirect("invalid_state"), request, dep.config)
-    if is_test_flow and test_user_uid is None:
-        return _clear_flow_cookies(_test_redirect("invalid_state"), request, dep.config)
-
     async with dep.session_scope() as session:
         try:
-            credentials = await (await _settings_service(request, session)).get_credentials(allow_disabled=is_test_flow)
+            settings = await _settings_service(request, session)
+            credentials = await settings.get_credentials(allow_disabled=is_test_flow)
+            if is_test_flow:
+                test_user_uid = _decode_link_flow("link:" + flow[5:], settings.configuration_fingerprint(credentials))
+                if test_user_uid is None:
+                    return _clear_flow_cookies(_test_redirect("test_expired"), request, dep.config)
+                await session.commit()
             profile = await GoogleOAuthClient().exchange_code(
                 credentials,
                 code=code,
@@ -290,6 +290,8 @@ async def finish_google_oauth(
             user = await dep.get_user_repository(session).get_by_uid(test_user_uid)
             if user is None or user.status != UserStatus.ACTIVE or user.role != UserRole.ADMIN:
                 return _clear_flow_cookies(_test_redirect("account_not_found"), request, dep.config)
+            if not await (await _settings_service(request, session)).mark_verified(credentials):
+                return _clear_flow_cookies(_test_redirect("test_expired"), request, dep.config)
             return _clear_flow_cookies(_test_redirect("success"), request, dep.config)
 
         avatar_url = await _cache_google_avatar(dep, profile)

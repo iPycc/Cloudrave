@@ -51,6 +51,7 @@ class GoogleOAuthAdminSettings(AuthSchema):
     client_id: str = ""
     client_secret_configured: bool = False
     callback_url: str = ""
+    configuration_verified: bool = False
 
 
 class GoogleOAuthSettingsUpdate(AuthSchema):

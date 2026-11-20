@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
+import json
 from dataclasses import dataclass
 from urllib.parse import urlencode
 
@@ -130,14 +132,22 @@ class GoogleOAuthSettingsService:
         self.site_url = site_url.strip().rstrip("/")
         material = f"cloudrave:google-oauth:{config.auth.jwt_secret}".encode("utf-8")
         self._fernet = Fernet(base64.urlsafe_b64encode(hashlib.sha256(material).digest()))
+        self._verification_key = material + b":verification"
 
     async def get_admin(self) -> GoogleOAuthAdminSettings:
         raw = await self.repository.get()
+        client_id = str(raw.get("client_id") or "")
+        secret = self._decrypt_secret(raw)
+        credentials = GoogleOAuthCredentials(client_id, secret, self.callback_url)
         return GoogleOAuthAdminSettings(
             enabled=self._is_ready(raw),
-            client_id=str(raw.get("client_id") or ""),
-            client_secret_configured=bool(self._decrypt_secret(raw)),
+            client_id=client_id,
+            client_secret_configured=bool(secret),
             callback_url=self.callback_url,
+            configuration_verified=bool(
+                client_id and secret and is_secure_context_url(self.site_url)
+                and self.configuration_fingerprint(credentials) == await self.repository.get_verified_config()
+            ),
         )
 
     async def get_public(self) -> GoogleOAuthPublicSettings:
@@ -147,32 +157,60 @@ class GoogleOAuthSettingsService:
     async def update(self, payload: GoogleOAuthSettingsUpdate) -> GoogleOAuthAdminSettings:
         current = await self.repository.get()
         client_id = payload.client_id.strip()
+        old_secret = self._decrypt_secret(current)
+        secret = (payload.client_secret or "").strip() or old_secret
         encrypted_secret = str(current.get("client_secret") or "")
-        if payload.client_secret is not None and payload.client_secret.strip():
-            encrypted_secret = self._fernet.encrypt(
-                payload.client_secret.strip().encode("utf-8")
-            ).decode("utf-8")
+        if secret != old_secret:
+            encrypted_secret = self._fernet.encrypt(secret.encode("utf-8")).decode("utf-8")
 
+        enabled_config = ""
         if payload.enabled:
             if not self.site_url or not is_secure_context_url(self.site_url):
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail="启用 Google OAuth 前请先在站点设置中保存 HTTPS 网站地址",
                 )
-            if not client_id or not encrypted_secret or not self._decrypt_value(encrypted_secret):
+            if not client_id or not secret:
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail="启用 Google OAuth 需要填写 Client ID 和 Client Secret",
                 )
+            fingerprint = self.configuration_fingerprint(GoogleOAuthCredentials(client_id, secret, self.callback_url))
+            previous = current.get("enabled_config")
+            staying_enabled = bool(
+                current.get("enabled") and current.get("client_id") == client_id and old_secret == secret
+                and (not previous or previous == fingerprint)
+            )
+            if await self.repository.get_verified_config() == fingerprint:
+                enabled_config = fingerprint
+            elif staying_enabled:
+                enabled_config = str(previous or "")
+            else:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="请先保存配置并通过 Google 登录测试")
 
         await self.repository.update(
             {
                 "enabled": payload.enabled,
                 "client_id": client_id,
                 "client_secret": encrypted_secret,
+                "enabled_config": enabled_config,
             }
         )
         return await self.get_admin()
+
+    def configuration_fingerprint(self, credentials: GoogleOAuthCredentials) -> str:
+        payload = json.dumps((credentials.client_id, credentials.client_secret, credentials.callback_url)).encode("utf-8")
+        return hmac.digest(self._verification_key, payload, "sha256").hex()
+
+    async def mark_verified(self, credentials: GoogleOAuthCredentials) -> bool:
+        try:
+            current = await self.get_credentials(allow_disabled=True)
+        except GoogleOAuthProtocolError:
+            return False
+        if credentials != current:
+            return False
+        await self.repository.set_verified_config(self.configuration_fingerprint(credentials))
+        return True
 
     async def get_credentials(self, *, allow_disabled: bool = False) -> GoogleOAuthCredentials:
         raw = await self.repository.get()
@@ -192,13 +230,17 @@ class GoogleOAuthSettingsService:
         return f"{self.site_url}/api/v1/oauth/google/callback"
 
     def _is_ready(self, raw: dict[str, object], *, allow_disabled: bool = False) -> bool:
-        return bool(
-            (allow_disabled or raw.get("enabled"))
-            and str(raw.get("client_id") or "").strip()
-            and self._decrypt_secret(raw)
-            and self.callback_url
-            and is_secure_context_url(self.site_url)
-        )
+        client_id = str(raw.get("client_id") or "").strip()
+        secret = self._decrypt_secret(raw)
+        if not (client_id and secret and self.callback_url and is_secure_context_url(self.site_url)):
+            return False
+        if allow_disabled:
+            return True
+        enabled_config = raw.get("enabled_config")
+        return bool(raw.get("enabled") and (
+            not enabled_config
+            or enabled_config == self.configuration_fingerprint(GoogleOAuthCredentials(client_id, secret, self.callback_url))
+        ))
 
     def _decrypt_secret(self, raw: dict[str, object]) -> str:
         return self._decrypt_value(str(raw.get("client_secret") or ""))

@@ -147,7 +147,7 @@ use_color = true
 
 1. 在 [Google Auth Platform](https://console.cloud.google.com/auth/overview) 选择项目，配置应用的同意屏幕和受众。如果测试状态限制了授权账号，在 **Audience** 中添加测试用户。
 2. 到 **Clients** 创建 **Web application**，将 Cloudrave 显示的完整回调地址填入 **Authorized redirect URIs**。
-3. 回到 Cloudrave，填入 **Client ID** 和 **Client Secret**，保存并开启。
+3. 回到 Cloudrave，填入 **Client ID** 和 **Client Secret**，点击「保存配置」，再点击「测试登录」。测试通过后点击「开启 Google OAuth」。更换凭据或回调地址后需重新测试。
 
 #### QQ
 
