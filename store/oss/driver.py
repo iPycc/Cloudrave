@@ -12,7 +12,7 @@ from math import ceil
 from pathlib import Path
 from threading import Lock
 from typing import Any, BinaryIO
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 from store.key import logical_key, mount_prefix, physical_key, physical_list_prefix, validate_physical_key
 from store.oss.stream import OssStream
@@ -474,6 +474,10 @@ class AliyunOssAdapter(StorageAdapterBase):
         # OSS signs these as x-oss-meta-* headers and does not allow underscores in their names.
         oss_metadata = (dict(_copy_snapshot.metadata) if _copy_snapshot is not None else
                         {key.replace("_", "-"): value for key, value in (metadata or {}).items() if value})
+        file_name = oss_metadata.get("file-name")
+        if _copy_snapshot is None and file_name and not file_name.isascii():
+            # The SDK sends custom metadata as HTTP headers, which cannot carry raw Unicode.
+            oss_metadata["cloudrave-file-name-utf8"] = quote(oss_metadata.pop("file-name"), safe="")
         copy_args = {} if _copy_snapshot is None else {
             "cache_control": _copy_snapshot.cache_control,
             "content_disposition": _copy_snapshot.content_disposition,
@@ -491,7 +495,7 @@ class AliyunOssAdapter(StorageAdapterBase):
             **copy_args,
             **(_copy_snapshot.encryption_args() if _copy_snapshot is not None else self._encryption_args(policy)),
         ))
-        upload_id = str(getattr(result, "upload_id", ""))
+        upload_id = str(getattr(result, "upload_id", None) or "")
         if not upload_id:
             raise RuntimeError("Aliyun OSS did not return an upload ID")
         ttl = self._ttl(policy)
@@ -686,6 +690,8 @@ class AliyunOssAdapter(StorageAdapterBase):
 
     def _object_from_result(self, policy: Any, mount: Any, object_key: str, result: Any) -> StorageObject:
         metadata = {str(key): str(value) for key, value in (getattr(result, "metadata", None) or {}).items()}
+        if file_name := metadata.get("cloudrave-file-name-utf8"):
+            metadata["file-name"] = unquote(file_name)
         if getattr(result, "server_side_encryption", None):
             metadata["server_side_encryption"] = str(result.server_side_encryption)
         if getattr(result, "server_side_encryption_key_id", None):
