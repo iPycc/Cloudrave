@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import defaultdict
 from datetime import UTC, datetime
 import json
 import logging
@@ -19,7 +20,9 @@ from repositories.blobs import BlobRepository
 from repositories.nodes import NodeRepository
 from repositories.objects import ObjectRepository
 from repositories.uploads import UploadRepository
-from services.admin.path_plan import PathPlanWorker, _snapshot, apply_queued_file_operation, copy_blob_id, plan_mapping
+from services.admin.path_plan import (
+    PathPlanWorker, _snapshot, active_tree_nodes, apply_queued_operation, copy_blob_id, plan_mapping,
+)
 from services.explorer.write_policy import ensure_capacity
 from store.call import call_adapter
 from store.copy_guard import source_identity
@@ -49,6 +52,8 @@ async def start_migration(dep, session, mount_id: int, plan_id: str, owner_id: i
         raise HTTPException(status_code=409, detail="存储配置已更改或不可写，请重新检查")
     if plan.status != "completed" or plan.ready <= 0:
         raise HTTPException(status_code=409, detail="请先完成预检查，且至少有一项可迁移")
+    if plan.root_node_id is not None and plan.conflicts:
+        raise HTTPException(status_code=409, detail="目录操作存在冲突")
     missing_identity = await session.scalar(select(PathPlanEntry.id).where(
         PathPlanEntry.task_id == plan.id, PathPlanEntry.status == "ready", PathPlanEntry.kind == NodeType.FILE.value,
         or_(PathPlanEntry.source_identity_json.is_(None), PathPlanEntry.path_fingerprint.is_(None)),
@@ -135,7 +140,7 @@ async def reserve_file_copy(dep, job_id: str, entry_id: int, lease_token: str) -
 
     # Provider identity calculation is outside the transaction. The mapping is
     # rechecked under the mount lock before either identity is reserved.
-    source_id = await call_adapter(adapter, "physical_id", policy, mount, source_key) if is_file else None
+    source_id = await call_adapter(adapter, "physical_id", policy, mount, source_key) if is_file else expected_source_id
     target_id = await call_adapter(adapter, "physical_id", policy, mount, target_key) if is_file else None
     if is_file and (not isinstance(source_id, str) or not isinstance(target_id, str) or
         not re.fullmatch(r"[0-9a-f]{64}", source_id) or not re.fullmatch(r"[0-9a-f]{64}", target_id) or
@@ -231,7 +236,7 @@ async def copy_reserved_file(dep, job_id: str, record_id: int, lease_token: str)
             raise ValueError("Migration state changed before copying")
         node = await session.get(Node, entry.node_id)
         await _require_snapshot(session, node, plan, entry)
-        if plan.copy_to is not None and not await _copy_has_capacity(session, mount, entry.size):
+        if plan.copy_to is not None and not await _copy_has_capacity(session, mount, plan.bytes_to_copy):
             raise MigrationConflict("存储配额不足，未复制文件")
         source_key = json.loads(entry.source_json or "null")
         target_key = json.loads(entry.target_json or "null")
@@ -329,27 +334,45 @@ async def _apply_file_copy_result(session, mount, plan, node, obj, record, targe
     is_copy = plan.copy_to is not None
     if is_copy and not await _copy_has_capacity(session, mount, node.size):
         return "存储配额不足，源文件已保留"
-    if plan.is_file_operation:
-        node = await apply_queued_file_operation(session, plan, node, target_key)
+    if plan.is_path_operation:
+        node = await apply_queued_operation(session, plan, node, target_key)
         if node is None:
             return "目标位置已变化或有同名条目，源文件已保留"
 
-    extra = {"origin": "managed_copy", "path_blob_id": copy_blob_id(plan.id)} if is_copy else dict(obj.extra or {})
-    extra.update(etag=stored.etag, version_id=stored.version_id)
-    extra.pop("last_modified", None)
-    if getattr(stored, "last_modified", None):
-        extra["last_modified"] = str(stored.last_modified)
     if is_copy:
-        await objects.create_or_update(
-            node_id=node.id, policy_id=mount.policy_id, blob_path=target_key, physical_id=record.target_physical_id,
-            revive_physical=True, checksum=obj.checksum, content_type=obj.content_type, extra=extra,
-        )
+        await _register_copy(objects, mount, plan, node, obj, record, target_key, stored)
     else:
         await objects.blobs.ensure(record.target_physical_id, revive=True)
         node.blob_path = obj.blob_path = target_key
         obj.physical_id = record.target_physical_id
-        obj.extra = extra
+        obj.extra = _stored_metadata(dict(obj.extra or {}), stored)
     return None
+
+
+async def _register_copy(objects, mount, plan, node, source, receipt, key, stored):
+    extra = _stored_metadata({"origin": "managed_copy", "path_blob_id": copy_blob_id(plan, source.node_id)}, stored)
+    await objects.create_or_update(
+        node_id=node.id, policy_id=mount.policy_id, blob_path=key, physical_id=receipt.target_physical_id,
+        revive_physical=True, checksum=source.checksum, content_type=source.content_type, extra=extra,
+    )
+
+
+def _stored_metadata(extra, stored):
+    extra.update(etag=stored.etag, version_id=stored.version_id)
+    extra.pop("last_modified", None)
+    if getattr(stored, "last_modified", None):
+        extra["last_modified"] = str(stored.last_modified)
+    return extra
+
+
+async def _require_current_policy(dep, session, mount, job, plan):
+    policy = await dep.get_policy_repository(session).get_by_id(mount.policy_id) if mount else None
+    actor = await session.get(User, job.owner_id)
+    if (actor is None or actor.status != UserStatus.ACTIVE or actor.role == UserRole.GUEST or
+        mount is None or mount.owner_id != job.owner_id or not mount.is_enabled or mount.read_only or
+        policy is None or policy.status != "active" or plan_mapping(plan, policy, mount) != plan.mapping):
+        raise ValueError("Storage mapping changed before switching the index")
+    return policy
 
 
 async def apply_copy(dep, job_id: str, record_id: int, lease_token: str) -> None:
@@ -384,13 +407,7 @@ async def apply_copy(dep, job_id: str, record_id: int, lease_token: str) -> None
         job = await session.scalar(_owned_job(job_id, lease_token).with_for_update())
         if job is None:
             return
-        current_policy = await dep.get_policy_repository(session).get_by_id(mount.policy_id) if mount else None
-        actor = await session.get(User, job.owner_id)
-        if (actor is None or actor.status != UserStatus.ACTIVE or actor.role == UserRole.GUEST or
-            mount is None or mount.owner_id != job.owner_id or not mount.is_enabled or mount.read_only or
-            current_policy is None or current_policy.status != "active" or
-            plan_mapping(plan, current_policy, mount) != plan.mapping):
-            raise ValueError("Storage mapping changed before switching the index")
+        await _require_current_policy(dep, session, mount, job, plan)
         record = await session.get(PathMigrationRecord, record_id)
         if record.status != "copied":
             return
@@ -423,6 +440,143 @@ def _owned_job(job_id: str, token: str):
     )
 
 
+def _tree_results(plan_id, job_id):
+    return select(PathPlanEntry, PathMigrationRecord).outerjoin(PathMigrationRecord, (
+        (PathMigrationRecord.plan_entry_id == PathPlanEntry.id) & (PathMigrationRecord.job_id == job_id)
+    )).where(PathPlanEntry.task_id == plan_id).order_by(PathPlanEntry.id)
+
+
+async def _verified_tree_targets(adapter, policy, mount, entries):
+    verified = {}
+    for entry, receipt in entries:
+        if entry.status == "conflict":
+            raise MigrationConflict("目录操作存在冲突，原目录已保留")
+        key = json.loads(entry.target_json)
+        if entry.status == "ready" and (receipt is None or receipt.status != "copied"):
+            raise MigrationConflict("目标目录中仍有对象未复制")
+        try:
+            if entry.kind == NodeType.FOLDER.value:
+                if not await call_adapter(adapter, "object_key_exists", policy, mount, key, directory_marker=True):
+                    raise MigrationConflict("目标目录标记已变化，原目录已保留")
+                continue
+            stored = await call_adapter(adapter, "head_object", policy, mount, key)
+        except Exception as exc:
+            if is_not_found(exc):
+                raise MigrationConflict("目标对象已不存在，原目录已保留") from exc
+            raise
+        if receipt is not None:
+            matches = stored.etag == receipt.target_etag and stored.version_id == receipt.target_version_id
+        else:
+            expected = json.loads(entry.source_identity_json)
+            matches = str(stored.etag or "").strip('"') == expected["etag"]
+        if not matches or stored.size != entry.size:
+            raise MigrationConflict("目标对象已变化，原目录已保留")
+        verified[entry.node_id] = stored
+    return verified
+
+
+async def _clone_tree_nodes(session, plan, originals, root_copy, keys):
+    nodes = NodeRepository(session)
+    children = defaultdict(list)
+    for node in originals.values():
+        if node.id != plan.root_node_id:
+            children[node.parent_id].append(node)
+    copies = {plan.root_node_id: root_copy}
+    pending = [plan.root_node_id]
+    while pending:
+        parent_id = pending.pop()
+        for child in children[parent_id]:
+            target = dict(owner_id=plan.owner_id, mount_id=plan.mount_id, parent_id=copies[parent_id].id, name=child.name)
+            if child.type == NodeType.FOLDER:
+                copies[child.id] = await nodes.create_folder(**target)
+                pending.append(child.id)
+            else:
+                copies[child.id] = await nodes.create_file(**target, blob_path=keys[child.id], size=child.size)
+    return copies
+
+
+async def finalize_tree(dep, job_id, token):
+    """Verify the whole destination, then publish the new tree in one transaction."""
+    async with session_scope(dep.session_factory) as session:
+        job = await session.scalar(_owned_job(job_id, token))
+        if job is None:
+            return
+        plan = await session.get(PathPlanTask, job.plan_id)
+        mount = await session.get(BucketMount, job.mount_id)
+        policy = await _require_current_policy(dep, session, mount, job, plan)
+        entries = (await session.execute(_tree_results(plan.id, job.id))).all()
+    adapter = dep.storage_manager.get_adapter(policy)
+    verified = await _verified_tree_targets(adapter, policy, mount, entries)
+
+    async with session_scope(dep.session_factory) as session:
+        mount = await dep.get_mount_repository(session).get_by_id_for_update(mount.id)
+        job = await session.scalar(_owned_job(job_id, token).with_for_update())
+        if job is None:
+            return
+        plan = await session.get(PathPlanTask, job.plan_id)
+        await _require_current_policy(dep, session, mount, job, plan)
+        entries = (await session.execute(_tree_results(plan.id, job.id))).all()
+        nodes = {node.id: node for node in await session.scalars(select(Node).where(
+            Node.id.in_(active_tree_nodes(plan)),
+        ).order_by(Node.id).with_for_update())}
+        if not nodes or nodes.keys() != {entry.node_id for entry, _ in entries}:
+            raise MigrationConflict("目录内容已变化，原目录已保留")
+
+        objects = ObjectRepository(session)
+        identities = set()
+        source_objects = {}
+        for entry, receipt in entries:
+            node = nodes[entry.node_id]
+            try:
+                _, obj, fingerprint = await _snapshot(session, node, plan)
+            except ValueError as exc:
+                raise MigrationConflict("文件或目录位置已变化，原目录已保留") from exc
+            if fingerprint != entry.path_fingerprint:
+                raise MigrationConflict("目录或文件已变化，原目录已保留")
+            if node.type == NodeType.FILE:
+                if obj is None or obj.blob_path != node.blob_path:
+                    raise MigrationConflict("文件存储路径已变化，原目录已保留")
+                source_objects[node.id] = obj
+            if receipt is not None and receipt.target_physical_id:
+                identities.update((receipt.source_physical_id, receipt.target_physical_id))
+        for identity in sorted(identities):
+            await objects.blobs.lock(identity)
+        for _, receipt in entries:
+            if receipt is not None and receipt.target_physical_id:
+                if await objects.has_physical_reference(receipt.target_physical_id):
+                    raise MigrationConflict("目标对象已被其他文件登记，原目录已保留")
+        is_copy = plan.copy_to is not None
+        if is_copy and not await _copy_has_capacity(session, mount, plan.bytes_to_copy):
+            raise MigrationConflict("存储配额不足，原目录已保留")
+        root = nodes[plan.root_node_id]
+        keys = {entry.node_id: json.loads(entry.target_json) for entry, _ in entries}
+        root_result = await apply_queued_operation(session, plan, root, keys[root.id])
+        if root_result is None:
+            raise MigrationConflict("目标位置已变化或有同名条目，原目录已保留")
+        destinations = await _clone_tree_nodes(session, plan, nodes, root_result, keys) if is_copy else nodes
+
+        for entry, receipt in entries:
+            node = destinations[entry.node_id]
+            key = keys[entry.node_id]
+            if node.type == NodeType.FOLDER:
+                node.blob_path = key
+            elif receipt is not None:
+                obj = source_objects[entry.node_id]
+                stored = verified[entry.node_id]
+                if is_copy:
+                    await _register_copy(objects, mount, plan, node, obj, receipt, key, stored)
+                else:
+                    await objects.blobs.ensure(receipt.target_physical_id, revive=True)
+                    node.blob_path = obj.blob_path = key
+                    obj.physical_id = receipt.target_physical_id
+                    obj.extra = _stored_metadata(dict(obj.extra or {}), stored)
+            if receipt is not None:
+                receipt.status = "duplicated" if is_copy else "applied"
+        job.migrated = len(entries)
+        job.status = "completed"
+        job.lease_token = job.lease_expires_at = None
+
+
 class PathMigrationWorker(PathPlanWorker):
     model = PathMigrationJob
     worker_name = "path-migration"
@@ -439,11 +593,24 @@ class PathMigrationWorker(PathPlanWorker):
     async def _migrate_next(self, job_id, token):
         async with session_scope(self.dep.session_factory) as session:
             job = await session.scalar(_owned_job(job_id, token))
+            plan = await session.get(PathPlanTask, job.plan_id) if job else None
+            is_tree = plan is not None and plan.root_node_id is not None
             entry_id = await session.scalar(select(PathPlanEntry.id).where(
                 PathPlanEntry.task_id == job.plan_id, PathPlanEntry.id > job.cursor, PathPlanEntry.status == "ready",
-            ).order_by(PathPlanEntry.id).limit(1)) if job is not None else None
+            ).order_by(PathPlanEntry.id).limit(1)) if job is not None and not (is_tree and job.conflicts) else None
         if entry_id is None:
-            await self._release(job_id, token, "completed")
+            if is_tree and not job.conflicts:
+                try:
+                    await finalize_tree(self.dep, job_id, token)
+                except MigrationConflict as exc:
+                    async with session_scope(self.dep.session_factory) as session:
+                        current = await session.scalar(_owned_job(job_id, token).with_for_update())
+                        if current is not None:
+                            current.conflicts += 1
+                    await self._release(job_id, token, "completed", str(exc))
+            else:
+                error = "目录操作有冲突，原目录已保留" if is_tree else None
+                await self._release(job_id, token, "completed", error)
             return
         try:
             record = await reserve_file_copy(self.dep, job_id, entry_id, token)
@@ -460,7 +627,14 @@ class PathMigrationWorker(PathPlanWorker):
             await self._release(job_id, token, "pending")
             return
         if state == "copied":
-            await apply_copy(self.dep, job_id, record.id, token)
+            if is_tree:
+                async with session_scope(self.dep.session_factory) as session:
+                    current = await session.scalar(_owned_job(job_id, token).with_for_update())
+                    if current is not None:
+                        current.prepared += 1
+                        current.cursor = entry_id
+            else:
+                await apply_copy(self.dep, job_id, record.id, token)
         elif state in {"uncertain", "conflict"}:
             await self._skip(job_id, token, entry_id)
         await self._release(job_id, token, "pending")

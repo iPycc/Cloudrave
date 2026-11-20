@@ -265,6 +265,7 @@ class PathPlanTask(Base, TimestampMixin):
     move_to: Mapped[int | None] = mapped_column(Integer, nullable=True)
     copy_to: Mapped[int | None] = mapped_column(Integer, nullable=True)
     copy_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    root_node_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     mapping: Mapped[str] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     cursor: Mapped[int] = mapped_column(Integer, default=0)
@@ -284,7 +285,7 @@ class PathPlanTask(Base, TimestampMixin):
         return self.copy_to if self.copy_to is not None else self.move_to
 
     @property
-    def is_file_operation(self) -> bool:
+    def is_path_operation(self) -> bool:
         return self.rename_to is not None or self.target_parent_id is not None
 
 
@@ -324,6 +325,7 @@ class PathMigrationJob(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     cursor: Mapped[int] = mapped_column(Integer, default=0)
     migrated: Mapped[int] = mapped_column(Integer, default=0)
+    prepared: Mapped[int] = mapped_column(Integer, default=0)
     conflicts: Mapped[int] = mapped_column(Integer, default=0)
     lease_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

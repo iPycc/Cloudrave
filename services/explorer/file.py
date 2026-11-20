@@ -38,7 +38,7 @@ from schemas.node import (
     NodeSearchResult,
 )
 from schemas.task import PathBatchQueued, PathChangeQueued
-from services.admin.path_plan import queue_file_path_change
+from services.admin.path_plan import queue_path_operation
 from services.explorer.archive import ArchiveDownloadService
 from services.explorer.access import MountAccessPolicy
 from services.explorer.path_write import new_file_path, object_path_template, put_new_file, put_new_folder
@@ -455,14 +455,12 @@ class FileExplorerService:
                 node = await self.nodes.get_by_id_for_update(node_id)
                 if node is None or node.deleted_at is not None:
                     raise HTTPException(status_code=404, detail="File node not found")
-                if node.type != NodeType.FILE:
-                    raise HTTPException(status_code=409, detail="此存储的目录改名尚未开放")
                 if node.name == payload.name:
                     return NodeRead.model_validate(node)
                 sibling = await self.nodes.get_child_any(mount.id, node.parent_id, payload.name)
                 if sibling is not None and sibling.id != node.id:
                     raise HTTPException(status_code=409, detail="目标位置已存在同名文件或文件夹")
-                task = await queue_file_path_change(self.session, mount, policy, node, template, rename_to=payload.name)
+                task = await queue_path_operation(self.session, mount, policy, node, template, rename_to=payload.name)
                 return PathChangeQueued(task_id=task.id)
         updated = await self.nodes.rename(node, payload.name)
         await self.audits.create(
@@ -574,15 +572,13 @@ class FileExplorerService:
             for node_id in dict.fromkeys(payload.node_ids):
                 node = await self.nodes.get_by_id_for_update(node_id)
                 if node is None or node.deleted_at is not None or node.status != NodeStatus.ACTIVE:
-                    raise HTTPException(status_code=404, detail="找不到要移动的文件")
-                if node.type != NodeType.FILE:
-                    raise HTTPException(status_code=409, detail="此存储的目录移动尚未开放")
+                    raise HTTPException(status_code=404, detail="找不到要移动的条目")
                 if node.parent_id == target_parent_id:
                     continue
                 if node.name in names or await self.nodes.get_child_any(mount_id, target_parent_id, node.name) is not None:
                     raise HTTPException(status_code=409, detail=f"目标位置已有同名条目：{node.name}")
                 names.add(node.name)
-                task = await queue_file_path_change(self.session, mount, policy, node, template, move_to=target_parent_id)
+                task = await queue_path_operation(self.session, mount, policy, node, template, move_to=target_parent_id)
                 task_ids.append(task.id)
             return PathBatchQueued(task_ids=task_ids) if task_ids else []
 
@@ -638,24 +634,22 @@ class FileExplorerService:
         if template is not None:
             if target.deleted_at is not None or target.status != NodeStatus.ACTIVE:
                 raise HTTPException(status_code=404, detail="找不到目标文件夹")
-            files = []
+            sources = []
             for node_id in dict.fromkeys(payload.node_ids):
                 node = await self.nodes.get_by_id_for_update(node_id)
                 if node is None or node.deleted_at is not None or node.status != NodeStatus.ACTIVE:
-                    raise HTTPException(status_code=404, detail="找不到要复制的文件")
-                if node.type != NodeType.FILE:
-                    raise HTTPException(status_code=409, detail="此存储的目录复制尚未开放")
-                files.append(node)
-            await ensure_capacity(mount, sum(node.size for node in files), nodes=self.nodes, uploads=UploadRepository(self.session))
+                    raise HTTPException(status_code=404, detail="找不到要复制的条目")
+                sources.append(node)
+            await ensure_capacity(mount, sum(node.size for node in sources), nodes=self.nodes, uploads=UploadRepository(self.session))
             children = await self.nodes.list_children(mount_id, target_parent_id, include_deleted=True)
             names = {child.name for child in children}
             task_ids = []
-            for node in files:
+            for node in sources:
                 name = _unique_name(node.name, names)
                 if len(name) > 255:
                     raise HTTPException(status_code=422, detail="副本文件名过长，请缩短原文件名后重试")
                 names.add(name)
-                task = await queue_file_path_change(
+                task = await queue_path_operation(
                     self.session, mount, policy, node, template, copy_to=target_parent_id, copy_name=name,
                 )
                 task_ids.append(task.id)

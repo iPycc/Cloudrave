@@ -137,7 +137,8 @@ async def list_path_plans(request: Request, current_user: User = Depends(get_cur
         rows = await session.execute(select(PathPlanTask, BucketMount, PathMigrationJob, Node.name).join(
             BucketMount, BucketMount.id == PathPlanTask.mount_id
         ).outerjoin(PathMigrationJob, PathMigrationJob.plan_id == PathPlanTask.id).outerjoin(Node, and_(
-            PathPlanTask.move_to.is_not(None), Node.id == PathPlanTask.max_node_id, Node.mount_id == PathPlanTask.mount_id,
+            PathPlanTask.move_to.is_not(None), Node.id == func.coalesce(PathPlanTask.root_node_id, PathPlanTask.max_node_id),
+            Node.mount_id == PathPlanTask.mount_id,
         ))
          .where(PathPlanTask.owner_id == current_user.id, BucketMount.owner_id == current_user.id)
          .order_by(func.coalesce(PathMigrationJob.updated_at, PathPlanTask.updated_at).desc()).limit(100))

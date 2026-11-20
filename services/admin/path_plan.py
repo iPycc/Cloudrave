@@ -11,7 +11,7 @@ import logging
 from uuid import NAMESPACE_URL, uuid5
 
 from fastapi import HTTPException
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 
 from db.base import session_scope
 from models.enums import NodeStatus, NodeType, UserRole, UserStatus
@@ -40,16 +40,19 @@ def _digest(value):
 
 def plan_mapping(task, policy, mount):
     current = MountSyncService.mapping_signature(policy, mount)
-    if task.is_file_operation:
+    if task.is_path_operation:
         return _digest(_json([current, (mount.extra or {}).get("object_key_template"), mount.read_only]))
     return current
 
 
-def copy_blob_id(task_id: str) -> str:
-    return uuid5(NAMESPACE_URL, f"cloudrave:copy:{task_id}").hex
+def copy_blob_id(task, node_id: int) -> str:
+    seed = f"cloudrave:copy:{task.id}"
+    if task.root_node_id is not None:
+        seed += f":{node_id}"
+    return uuid5(NAMESPACE_URL, seed).hex
 
 
-async def queue_file_path_change(
+async def queue_path_operation(
     session, mount, policy, node, template, *, rename_to=None, move_to=None, copy_to=None, copy_name=None,
 ) -> PathPlanTask:
     job_status = ("pending", "running", "paused", "failed")
@@ -58,22 +61,36 @@ async def queue_file_path_change(
     ).where(
         PathPlanTask.mount_id == mount.id,
         or_(PathPlanTask.rename_to.is_not(None), PathPlanTask.move_to.is_not(None), PathPlanTask.copy_to.is_not(None)),
-        PathPlanTask.max_node_id == node.id,
+        (func.coalesce(PathPlanTask.root_node_id, PathPlanTask.max_node_id) == node.id),
         (PathPlanTask.status.in_(job_status) | PathMigrationJob.status.in_(job_status)),
     ).limit(1))
     if active is not None:
-        raise HTTPException(status_code=409, detail="此文件已有未完成的路径任务")
+        raise HTTPException(status_code=409, detail="此条目已有未完成的路径任务")
     task = PathPlanTask(
         mount_id=mount.id, owner_id=mount.owner_id, template=template, rename_to=rename_to, move_to=move_to,
         copy_to=copy_to, copy_name=copy_name, cursor=node.id - 1, max_node_id=node.id,
     )
+    if node.type == NodeType.FOLDER:
+        if node.parent_id is None:
+            raise HTTPException(status_code=409, detail="不能改动存储根目录")
+        if task.target_parent_id is not None:
+            target = await session.get(Node, task.target_parent_id)
+            try:
+                destination = await _path_chain(session, target, task)
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail="目标文件夹路径已变化") from exc
+            if any(part[0] == node.id for part in destination):
+                raise HTTPException(status_code=409, detail="目标目录不能位于源文件夹内")
+        task.root_node_id = node.id
+        task.cursor = 0
+        task.max_node_id = await session.scalar(select(func.max(Node.id)).where(Node.mount_id == mount.id))
     task.mapping = plan_mapping(task, policy, mount)
     session.add(task)
     await session.flush()
     return task
 
 
-async def apply_queued_file_operation(session, task, node, target_key) -> Node | None:
+async def apply_queued_operation(session, task, node, target_key) -> Node | None:
     nodes = NodeRepository(session)
     new_name = task.copy_name or task.rename_to or node.name
     parent_id = node.parent_id
@@ -86,10 +103,11 @@ async def apply_queued_file_operation(session, task, node, target_key) -> Node |
     if sibling is not None and (task.copy_to is not None or sibling.id != node.id):
         return None
     if task.copy_to is not None:
-        node = await nodes.create_file(
-            owner_id=task.owner_id, mount_id=task.mount_id, parent_id=parent_id, name=new_name,
-            blob_path=target_key, size=node.size,
-        )
+        target = dict(owner_id=task.owner_id, mount_id=task.mount_id, parent_id=parent_id, name=new_name)
+        if node.type == NodeType.FOLDER:
+            node = await nodes.create_folder(**target)
+        else:
+            node = await nodes.create_file(**target, blob_path=target_key, size=node.size)
         action = "node.copy"
     else:
         node.name = new_name
@@ -177,6 +195,14 @@ async def _path_chain(session, current, task):
     return chain
 
 
+def active_tree_nodes(task):
+    visible = and_(Node.mount_id == task.mount_id, Node.owner_id == task.owner_id,
+                   Node.status == NodeStatus.ACTIVE, Node.deleted_at.is_(None))
+    tree = select(Node.id).where(Node.id == task.root_node_id, visible).cte(recursive=True)
+    tree = tree.union(select(Node.id).where(Node.parent_id == tree.c.id, visible))
+    return select(tree.c.id)
+
+
 async def _snapshot(session, node, task):
     """Build the target path and snapshot the source and destination ancestry."""
     chain = await _path_chain(session, node, task)
@@ -186,6 +212,7 @@ async def _snapshot(session, node, task):
     record = await session.scalar(select(ObjectRecord).where(ObjectRecord.node_id == node.id)) if node.type == NodeType.FILE else None
     record_state = None if record is None else [record.id, record.policy_id, record.blob_path, record.physical_id, record.extra, str(record.updated_at)]
     snapshot = [chain, node.size, record_state]
+    destination_chain = None
     if task.target_parent_id is not None:
         target = await session.get(Node, task.target_parent_id)
         if target is None or target.type != NodeType.FOLDER:
@@ -193,6 +220,15 @@ async def _snapshot(session, node, task):
         destination_chain = await _path_chain(session, target, task)
         components = [part[2] for part in reversed(destination_chain[:-1])] + [node.name]
         snapshot.append(destination_chain)
+    if task.root_node_id is not None:
+        root_index = next((index for index, part in enumerate(chain) if part[0] == task.root_node_id), None)
+        if root_index is None or root_index == len(chain) - 1:
+            raise ValueError("invalid_tree")
+        if destination_chain is not None and any(part[0] == task.root_node_id for part in destination_chain):
+            raise ValueError("invalid_tree")
+        prefix = destination_chain[:-1] if destination_chain is not None else chain[root_index + 1:-1]
+        name = task.copy_name or task.rename_to or chain[root_index][2]
+        components = [part[2] for part in reversed(prefix)] + [name] + [part[2] for part in reversed(chain[:root_index])]
     return components, record, _digest(_json(snapshot))
 
 
@@ -296,11 +332,14 @@ class PathPlanWorker:
                 mount is None or mount.owner_id != task.owner_id or not mount.is_enabled or policy is None or
                 policy.status != "active" or task.mapping != plan_mapping(task, policy, mount)):
                 raise RuntimeError("Storage or account changed")
-            rows = list(await session.scalars(select(Node).where(
+            query = select(Node).where(
                 Node.mount_id == task.mount_id, Node.id > task.cursor, Node.id <= task.max_node_id,
                 Node.parent_id.is_not(None), Node.status == NodeStatus.ACTIVE, Node.deleted_at.is_(None),
-            ).order_by(Node.id).limit(PAGE_SIZE)))
-            if task.is_file_operation and not rows:
+            )
+            if task.root_node_id is not None:
+                query = query.where(Node.id.in_(active_tree_nodes(task)))
+            rows = list(await session.scalars(query.order_by(Node.id).limit(PAGE_SIZE)))
+            if task.is_path_operation and not rows and task.scanned == 0:
                 raise ValueError("Path-change source no longer exists")
             for node in rows:
                 item = {"id": node.id, "kind": node.type.value, "size": node.size, "source": None,
@@ -316,9 +355,12 @@ class PathPlanWorker:
                         item["etag"] = extra.get("etag")
                         blob_id = extra.get("path_blob_id") or uuid5(NAMESPACE_URL, f"cloudrave:{mount.id}:{node.id}").hex
                         if task.copy_to is not None:
-                            blob_id = copy_blob_id(task.id)
+                            blob_id = copy_blob_id(task, node.id)
+                        filename = components[-1]
+                        if task.root_node_id is None:
+                            filename = task.copy_name or task.rename_to or filename
                         item["target"] = format_object_key(task.template, directory="/".join(components[:-1]),
-                            filename=task.copy_name or task.rename_to or components[-1], blob_id=blob_id)
+                            filename=filename, blob_id=blob_id)
                         if task.copy_to is None and extra.get("origin") == "bucket_import":
                             raise ValueError("external_readonly")
                     else:
@@ -339,6 +381,8 @@ class PathPlanWorker:
                 physical_target = adapter._validate_physical_key(adapter._key(policy, mount, item["target"]) + ("/" if item["kind"] == "folder" else ""))
                 item["target_hash"] = _digest(physical_target)
                 source_key = adapter._key(policy, mount, item["source"]) if item["kind"] == "file" else None
+                if task.root_node_id is not None and item["kind"] == "folder" and item["source"]:
+                    item["physical_id"] = _digest(adapter._key(policy, mount, item["source"]) + "/")
             except ValueError:
                 item["reason"] = "invalid_path"
                 continue
@@ -371,7 +415,7 @@ class PathPlanWorker:
                     continue
             exists = await _exists(adapter, policy, mount, item["target"], folder=item["kind"] == "folder")
             if exists:
-                if item["kind"] == "folder" and item["source"] == item["target"]:
+                if task.copy_to is None and item["kind"] == "folder" and item["source"] == item["target"]:
                     item["unchanged"] = True
                 else:
                     item["reason"] = "target_exists"
@@ -391,7 +435,7 @@ class PathPlanWorker:
             for item in items:
                 node = (
                     await NodeRepository(session).get_by_id_for_update(item["id"])
-                    if task.is_file_operation else await session.get(Node, item["id"])
+                    if task.is_path_operation else await session.get(Node, item["id"])
                 )
                 if item["fingerprint"] is not None:
                     try:
@@ -400,7 +444,7 @@ class PathPlanWorker:
                     except ValueError:
                         item["reason"] = "changed_during_scan"
                 target_hash = item.get("target_hash")
-                if target_hash and item["kind"] == "folder" and item["reason"] == "target_exists":
+                if task.copy_to is None and target_hash and item["kind"] == "folder" and item["reason"] == "target_exists":
                     if await ObjectRepository(session).has_migration_marker(mount.id, target_hash, node_id=item["id"]):
                         item["reason"] = None
                         item["unchanged"] = True
@@ -415,8 +459,8 @@ class PathPlanWorker:
                                 task.ready -= 1
                                 task.conflicts += 1
                                 task.bytes_to_copy -= previous.size
-                if task.is_file_operation and item.get("unchanged") and item["reason"] is None:
-                    if not await apply_queued_file_operation(session, task, node, item["target"]):
+                if task.is_path_operation and task.root_node_id is None and item.get("unchanged") and item["reason"] is None:
+                    if not await apply_queued_operation(session, task, node, item["target"]):
                         item["reason"] = "name_conflict"
                 status = "conflict" if item["reason"] else "unchanged" if item.get("unchanged") else "ready"
                 task.scanned += 1
@@ -436,7 +480,8 @@ class PathPlanWorker:
                 task.cursor = items[-1]["id"]
             if len(items) < PAGE_SIZE:
                 task.status = "completed"
-                if task.is_file_operation and task.ready:
+                can_start = (task.conflicts == 0 and task.scanned > 0) if task.root_node_id is not None else task.ready > 0
+                if task.is_path_operation and can_start:
                     session.add(PathMigrationJob(plan_id=task.id, mount_id=task.mount_id, owner_id=task.owner_id))
             else:
                 task.status = "pending"

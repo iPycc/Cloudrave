@@ -64,6 +64,7 @@ class PathMigrationRead(CloudraveSchema):
     id: str
     status: Literal["pending", "running", "paused", "completed", "failed", "canceled"]
     migrated: int
+    prepared: int = 0
     conflicts: int
     error: str | None = None
 
@@ -77,6 +78,7 @@ class PathPlanRead(CloudraveSchema):
     move_to: int | None = None
     copy_to: int | None = None
     copy_name: str | None = None
+    root_node_id: int | None = None
     source_name: str | None = None
     status: Literal["pending", "running", "paused", "completed", "failed", "canceled"]
     scanned: int

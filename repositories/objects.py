@@ -192,6 +192,7 @@ class ObjectRepository:
     async def retained_migration_source(self, physical_id: str, mount_id: int | None = None) -> PathPlanEntry | None:
         query = select(PathPlanEntry).join(PathMigrationRecord, PathMigrationRecord.plan_entry_id == PathPlanEntry.id).where(
             PathMigrationRecord.source_physical_id == physical_id, PathMigrationRecord.status == "applied",
+            PathPlanEntry.kind == "file",
         )
         if mount_id is not None:
             query = query.join(PathMigrationJob, PathMigrationJob.id == PathMigrationRecord.job_id).where(
@@ -203,11 +204,17 @@ class ObjectRepository:
         query = select(PathMigrationRecord.id).join(
             PathPlanEntry, PathPlanEntry.id == PathMigrationRecord.plan_entry_id,
         ).join(PathMigrationJob, PathMigrationJob.id == PathMigrationRecord.job_id).where(
-            PathMigrationJob.mount_id == mount_id, PathPlanEntry.target_hash == target_hash,
-            PathPlanEntry.kind == "folder", PathMigrationRecord.status.in_(("copying", "copied", "uncertain", "applied")),
+            PathMigrationJob.mount_id == mount_id, PathPlanEntry.kind == "folder",
         )
         if node_id is not None:
-            query = query.where(PathPlanEntry.node_id == node_id, PathMigrationRecord.status == "applied")
+            query = query.where(PathPlanEntry.node_id == node_id, PathPlanEntry.target_hash == target_hash,
+                                PathMigrationRecord.status == "applied")
+        else:
+            query = query.where(or_(
+                (PathPlanEntry.target_hash == target_hash)
+                & PathMigrationRecord.status.in_(("copying", "copied", "uncertain", "applied", "duplicated")),
+                (PathMigrationRecord.source_physical_id == target_hash) & (PathMigrationRecord.status == "applied"),
+            ))
         return await self.session.scalar(query.limit(1)) is not None
 
     async def list_missing_physical_page(
