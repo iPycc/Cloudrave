@@ -17,13 +17,14 @@ class GcRepository:
     async def create(
         self, *, policy_id: int, mount_id: int, blob_path: str, physical_id: str, source_identity: dict | None = None,
     ) -> GcTask:
+        retained = source_identity is not None and not (source_identity.get("version_id") or source_identity.get("managed_blob"))
         task = GcTask(
             policy_id=policy_id,
             mount_id=mount_id,
             blob_path=blob_path,
             physical_id=physical_id,
             source_identity=source_identity,
-            state="retained" if source_identity is not None and not source_identity.get("version_id") else "pending",
+            state="retained" if retained else "pending",
         )
         self.session.add(task)
         await self.session.flush()

@@ -101,11 +101,13 @@ class ObjectGc:
             mount = mounts[node.mount_id]
             policy = policies[record.policy_id]
             extra = record.extra or {}
-            guarded = provider_id(policy.provider) in PATH_PROVIDERS and (
-                (mount.extra or {}).get("object_key_template") is not None or extra.get("path_blob_id") or identity in migrated
-            )
-            source = _cleanup_identity(extra, node.size) if guarded else None
-            if identity not in candidates or (source is not None and candidates[identity][3] is None):
+            source = None
+            if provider_id(policy.provider) in PATH_PROVIDERS:
+                source = _cleanup_identity(extra, node.size)
+                if not (source["external"] or (mount.extra or {}).get("object_key_template") is not None
+                        or extra.get("path_blob_id") or identity in migrated):
+                    source["managed_blob"] = True
+            if identity not in candidates or (source is not None and not source.get("managed_blob")):
                 candidates[identity] = (policy.id, mount.id, record.blob_path, source)
 
         task_ids: list[int] = []
@@ -117,7 +119,7 @@ class ObjectGc:
                 physical_id=identity,
                 source_identity=source,
             )
-            if source is None:
+            if source is None or source.get("managed_blob"):
                 task_ids.append(task.id)
         for node in nodes.values():
             if node.type != NodeType.FOLDER or not node.blob_path:
@@ -165,18 +167,26 @@ class ObjectGc:
                 policy = await self.policies.get_by_id(task.policy_id)
                 if mount is None or policy is None:
                     raise RuntimeError("Storage policy or mount no longer exists")
+                if source is None and provider_id(policy.provider) in PATH_PROVIDERS:
+                    # Legacy cloud jobs did not record whether the key belonged to an import.
+                    await self.tasks.skipped(task)
+                    continue
                 adapter = self.storage_manager.get_adapter(policy)
                 current_id = await call_adapter(adapter, "physical_id", policy, mount, task.blob_path)
                 if current_id != task.physical_id:
                     raise RuntimeError("Storage mapping changed after cleanup was staged")
-                if source is not None:
+                if source is not None and not source.get("managed_blob"):
+                    version_id = source.get("version_id")
+                    if not version_id:
+                        await self.tasks.skipped(task)
+                        continue
                     if source.get("external") and (mount.extra or {}).get("import_delete_source") is not True:
                         await self.tasks.skipped(task)
                         continue
                     if not mount.is_enabled or mount.read_only or policy.status != "active":
                         raise RuntimeError("Storage is no longer writable")
                     try:
-                        await call_adapter(adapter, "delete_object_version", policy, mount, task.blob_path, source["version_id"])
+                        await call_adapter(adapter, "delete_object_version", policy, mount, task.blob_path, version_id)
                     except Exception as exc:
                         if not is_not_found(exc):
                             raise
