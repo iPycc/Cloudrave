@@ -202,6 +202,10 @@ class BucketMount(Base, TimestampMixin):
         return bool((self.extra or {}).get("read_only", False))
 
     @property
+    def legacy_prefixed_keys(self) -> bool:
+        return bool((self.extra or {}).get("legacy_prefixed_keys", False))
+
+    @property
     def sync_status(self) -> str:
         return str(((self.extra or {}).get("_sync") or {}).get("status", "never"))
 
