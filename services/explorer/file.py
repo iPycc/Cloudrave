@@ -19,9 +19,10 @@ from models.enums import NodeStatus, NodeType
 from models.tables import BucketMount, Node, StoragePolicy, User
 from repositories.audit_logs import AuditLogRepository
 from repositories.mounts import BucketMountRepository
-from repositories.nodes import NodeRepository
+from repositories.nodes import NodeRepository, _unique_name
 from repositories.objects import ObjectRepository
 from repositories.policies import StoragePolicyRepository
+from repositories.uploads import UploadRepository
 from schemas.mount import BucketMountRead, mount_read
 from schemas.node import (
     FileCreateRequest,
@@ -36,12 +37,12 @@ from schemas.node import (
     NodeRenameRequest,
     NodeSearchResult,
 )
-from schemas.task import PathChangeQueued, PathMoveQueued
+from schemas.task import PathBatchQueued, PathChangeQueued
 from services.admin.path_plan import queue_file_path_change
 from services.explorer.archive import ArchiveDownloadService
 from services.explorer.access import MountAccessPolicy
 from services.explorer.path_write import new_file_path, object_path_template, put_new_file, put_new_folder
-from services.explorer.write_policy import StorageWritePolicy
+from services.explorer.write_policy import StorageWritePolicy, ensure_capacity
 from services.explorer.gc import ObjectGc
 from services.user.response import build_avatar_url
 from store.call import call_adapter
@@ -542,7 +543,7 @@ class FileExplorerService:
         )
         return {"nodes": [NodeRead.model_validate(node) for node in deleted]}
 
-    async def move_nodes(self, request: Request, actor: User, payload: NodeMoveRequest) -> list[NodeRead] | PathMoveQueued:
+    async def move_nodes(self, request: Request, actor: User, payload: NodeMoveRequest) -> list[NodeRead] | PathBatchQueued:
         nodes = [await self._require_node_access(actor, node_id) for node_id in payload.node_ids]
         if not nodes:
             return []
@@ -583,7 +584,7 @@ class FileExplorerService:
                 names.add(node.name)
                 task = await queue_file_path_change(self.session, mount, policy, node, template, move_to=target_parent_id)
                 task_ids.append(task.id)
-            return PathMoveQueued(task_ids=task_ids) if task_ids else []
+            return PathBatchQueued(task_ids=task_ids) if task_ids else []
 
         # Prevent moving a folder into its own subtree
         moved_ids = {node.id for node in nodes}
@@ -610,7 +611,7 @@ class FileExplorerService:
         )
         return [NodeRead.model_validate(node) for node in moved]
 
-    async def copy_nodes(self, request: Request, actor: User, payload: NodeCopyRequest) -> list[NodeRead]:
+    async def copy_nodes(self, request: Request, actor: User, payload: NodeCopyRequest) -> list[NodeRead] | PathBatchQueued:
         require_capability(actor, Capability.FILE_COPY)
         nodes = [await self._require_node_access(actor, node_id) for node_id in payload.node_ids]
         if not nodes:
@@ -620,6 +621,11 @@ class FileExplorerService:
         if any(node.mount_id != mount_id for node in nodes):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="All copied nodes must belong to one mount")
 
+        template = object_path_template(policy, mount)
+        if template is not None:
+            mount, policy = await self.mount_access.write(actor, mount_id, lock=True)
+            template = object_path_template(policy, mount)
+
         target_parent_id = payload.target_parent_id
         if target_parent_id is None:
             target = await self.nodes.ensure_mount_root(owner_id=mount.owner_id, mount_id=mount.id, name=mount.name)
@@ -628,6 +634,32 @@ class FileExplorerService:
             target = await self.nodes.get_by_id(target_parent_id)
             if target is None or target.mount_id != mount_id or target.type != NodeType.FOLDER:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target folder not found")
+
+        if template is not None:
+            if target.deleted_at is not None or target.status != NodeStatus.ACTIVE:
+                raise HTTPException(status_code=404, detail="找不到目标文件夹")
+            files = []
+            for node_id in dict.fromkeys(payload.node_ids):
+                node = await self.nodes.get_by_id_for_update(node_id)
+                if node is None or node.deleted_at is not None or node.status != NodeStatus.ACTIVE:
+                    raise HTTPException(status_code=404, detail="找不到要复制的文件")
+                if node.type != NodeType.FILE:
+                    raise HTTPException(status_code=409, detail="此存储的目录复制尚未开放")
+                files.append(node)
+            await ensure_capacity(mount, sum(node.size for node in files), nodes=self.nodes, uploads=UploadRepository(self.session))
+            children = await self.nodes.list_children(mount_id, target_parent_id, include_deleted=True)
+            names = {child.name for child in children}
+            task_ids = []
+            for node in files:
+                name = _unique_name(node.name, names)
+                if len(name) > 255:
+                    raise HTTPException(status_code=422, detail="副本文件名过长，请缩短原文件名后重试")
+                names.add(name)
+                task = await queue_file_path_change(
+                    self.session, mount, policy, node, template, copy_to=target_parent_id, copy_name=name,
+                )
+                task_ids.append(task.id)
+            return PathBatchQueued(task_ids=task_ids)
 
         copied: list[NodeRead] = []
         id_map: dict[int, int] = {}

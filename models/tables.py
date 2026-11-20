@@ -263,6 +263,8 @@ class PathPlanTask(Base, TimestampMixin):
     template: Mapped[str] = mapped_column(Text)
     rename_to: Mapped[str | None] = mapped_column(String(255), nullable=True)
     move_to: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    copy_to: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    copy_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     mapping: Mapped[str] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     cursor: Mapped[int] = mapped_column(Integer, default=0)
@@ -278,8 +280,12 @@ class PathPlanTask(Base, TimestampMixin):
 
 
     @property
-    def changes_node_path(self) -> bool:
-        return self.rename_to is not None or self.move_to is not None
+    def target_parent_id(self) -> int | None:
+        return self.copy_to if self.copy_to is not None else self.move_to
+
+    @property
+    def is_file_operation(self) -> bool:
+        return self.rename_to is not None or self.target_parent_id is not None
 
 
 class PathPlanEntry(Base):

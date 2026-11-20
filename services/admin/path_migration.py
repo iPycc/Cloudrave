@@ -18,7 +18,9 @@ from models.tables import BucketMount, Node, PathMigrationJob, PathMigrationReco
 from repositories.blobs import BlobRepository
 from repositories.nodes import NodeRepository
 from repositories.objects import ObjectRepository
-from services.admin.path_plan import PathPlanWorker, _snapshot, apply_queued_path_change, plan_mapping
+from repositories.uploads import UploadRepository
+from services.admin.path_plan import PathPlanWorker, _snapshot, apply_queued_file_operation, copy_blob_id, plan_mapping
+from services.explorer.write_policy import ensure_capacity
 from store.call import call_adapter
 from store.copy_guard import source_identity
 from store.errors import is_not_found, storage_error_code
@@ -229,6 +231,8 @@ async def copy_reserved_file(dep, job_id: str, record_id: int, lease_token: str)
             raise ValueError("Migration state changed before copying")
         node = await session.get(Node, entry.node_id)
         await _require_snapshot(session, node, plan, entry)
+        if plan.copy_to is not None and not await _copy_has_capacity(session, mount, entry.size):
+            raise MigrationConflict("存储配额不足，未复制文件")
         source_key = json.loads(entry.source_json or "null")
         target_key = json.loads(entry.target_json or "null")
         identity = json.loads(entry.source_identity_json or "null")
@@ -308,6 +312,46 @@ async def mark_abandoned_copy(dep, job_id: str, record_id: int, lease_token: str
         return record.status
 
 
+async def _copy_has_capacity(session, mount, size: int) -> bool:
+    try:
+        await ensure_capacity(mount, size, nodes=NodeRepository(session), uploads=UploadRepository(session))
+    except HTTPException:
+        return False
+    return True
+
+
+async def _apply_file_copy_result(session, mount, plan, node, obj, record, target_key, stored) -> str | None:
+    objects = ObjectRepository(session)
+    for identity in sorted((record.source_physical_id, record.target_physical_id)):
+        await objects.blobs.lock(identity)
+    if await objects.has_physical_reference(record.target_physical_id):
+        return "目标已被其他文件登记，源文件已保留"
+    is_copy = plan.copy_to is not None
+    if is_copy and not await _copy_has_capacity(session, mount, node.size):
+        return "存储配额不足，源文件已保留"
+    if plan.is_file_operation:
+        node = await apply_queued_file_operation(session, plan, node, target_key)
+        if node is None:
+            return "目标位置已变化或有同名条目，源文件已保留"
+
+    extra = {"origin": "managed_copy", "path_blob_id": copy_blob_id(plan.id)} if is_copy else dict(obj.extra or {})
+    extra.update(etag=stored.etag, version_id=stored.version_id)
+    extra.pop("last_modified", None)
+    if getattr(stored, "last_modified", None):
+        extra["last_modified"] = str(stored.last_modified)
+    if is_copy:
+        await objects.create_or_update(
+            node_id=node.id, policy_id=mount.policy_id, blob_path=target_key, physical_id=record.target_physical_id,
+            revive_physical=True, checksum=obj.checksum, content_type=obj.content_type, extra=extra,
+        )
+    else:
+        await objects.blobs.ensure(record.target_physical_id, revive=True)
+        node.blob_path = obj.blob_path = target_key
+        obj.physical_id = record.target_physical_id
+        obj.extra = extra
+    return None
+
+
 async def apply_copy(dep, job_id: str, record_id: int, lease_token: str) -> None:
     async with session_scope(dep.session_factory) as session:
         job = await session.get(PathMigrationJob, job_id)
@@ -355,38 +399,19 @@ async def apply_copy(dep, job_id: str, record_id: int, lease_token: str) -> None
             _, obj, fingerprint = await _snapshot(session, node, plan) if node is not None else (None, None, None)
         except ValueError:
             obj, fingerprint = None, None
+        error = None
         if not matches or fingerprint != entry.path_fingerprint or (is_file and (
             obj is None or obj.blob_path != json.loads(entry.source_json) or node.blob_path != obj.blob_path
         )):
+            error = "复制后文件或目标发生变化，源文件已保留"
+        elif is_file:
+            error = await _apply_file_copy_result(session, mount, plan, node, obj, record, target_key, stored)
+        if error is not None:
             record.status = "uncertain"
-            record.error = "复制后文件或目标发生变化，源文件已保留"
+            record.error = error
             job.conflicts += 1
         else:
-            if is_file:
-                objects = ObjectRepository(session)
-                for identity in sorted((record.source_physical_id, record.target_physical_id)):
-                    await objects.blobs.lock(identity)
-                if await objects.has_physical_reference(record.target_physical_id):
-                    record.status = "uncertain"
-                    record.error = "目标已被其他文件登记，源文件已保留"
-                    job.conflicts += 1
-                    job.cursor = entry.id
-                    return
-                if plan.changes_node_path and not await apply_queued_path_change(session, plan, node):
-                    record.status = "uncertain"
-                    record.error = "目标位置已变化或有同名条目，源文件已保留"
-                    job.conflicts += 1
-                    job.cursor = entry.id
-                    return
-                await objects.blobs.ensure(record.target_physical_id, revive=True)
-                node.blob_path = obj.blob_path = target_key
-                obj.physical_id = record.target_physical_id
-                extra = {**(obj.extra or {}), "etag": stored.etag, "version_id": stored.version_id}
-                extra.pop("last_modified", None)
-                if getattr(stored, "last_modified", None):
-                    extra["last_modified"] = str(stored.last_modified)
-                obj.extra = extra
-            record.status = "applied"
+            record.status = "duplicated" if plan.copy_to is not None else "applied"
             job.migrated += 1
         job.cursor = entry.id
 
