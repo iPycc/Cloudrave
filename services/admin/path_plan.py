@@ -238,6 +238,7 @@ class PathPlanWorker:
                             raise ValueError("external_readonly")
                     else:
                         item["target"] = format_directory_key(task.template, "/".join(components))
+                        item["source"] = node.blob_path
                 except ValueError as exc:
                     item["reason"] = str(exc) if str(exc) in {"source_missing", "external_readonly", "invalid_tree"} else "invalid_path"
                 items.append(item)
@@ -282,7 +283,10 @@ class PathPlanWorker:
                     continue
             exists = await _exists(adapter, policy, mount, item["target"], folder=item["kind"] == "folder")
             if exists:
-                item["reason"] = "target_exists"
+                if item["kind"] == "folder" and item["source"] == item["target"]:
+                    item["unchanged"] = True
+                else:
+                    item["reason"] = "target_exists"
 
         async with session_scope(self.dep.session_factory) as session:
             locked_mount = await self.dep.get_mount_repository(session).get_by_id_for_update(mount.id)

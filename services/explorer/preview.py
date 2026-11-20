@@ -34,7 +34,7 @@ from schemas.preview import (
 from security.jwt import AuthError, TokenService
 from security.capabilities import Capability, has_capability, require_capability
 from services.explorer.download import DownloadFileService
-from services.explorer.new_file import new_file_path, put_new_file
+from services.explorer.path_write import new_file_path, put_new_file
 from services.explorer.write_policy import StorageWritePolicy
 from services.explorer.view.arc import ARCHIVE_READ_ERRORS, ArcMixin
 from services.explorer.view.base import (

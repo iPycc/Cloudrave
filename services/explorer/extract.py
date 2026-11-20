@@ -23,7 +23,7 @@ import py7zr
 
 from models.enums import NodeType, UserStatus
 from security.capabilities import Capability, require_capability
-from services.explorer.new_file import new_file_path, put_new_file
+from services.explorer.path_write import new_file_path, put_new_file, put_new_folder
 from services.explorer.write_policy import StorageWritePolicy
 from services.explorer.archive_limits import BoundedArchiveFactory
 from repositories.nodes import _unique_name
@@ -251,7 +251,8 @@ async def _load_extract_source(dep, task: _Task, node_id: int, target_parent_id:
     async with dep.session_scope() as session:
         nodes = dep.get_node_repository(session)
         node = await nodes.get_by_id(node_id)
-        if node is None or node.owner_id != task.owner_id or node.deleted_at is not None or not node.blob_path:
+        if (node is None or node.type != NodeType.FILE or node.owner_id != task.owner_id
+                or node.deleted_at is not None or not node.blob_path):
             raise RuntimeError("ZIP source no longer exists")
         if node.size > MAX_ARCHIVE_BYTES:
             raise HTTPException(status_code=413, detail="Archive source exceeds 512 MB")
@@ -277,7 +278,7 @@ async def _load_extract_source(dep, task: _Task, node_id: int, target_parent_id:
 async def _create_extract_root(dep, task: _Task, source: _ExtractSource) -> int:
     _check_deadline(task)
     async with dep.session_scope() as session:
-        await _write_context(dep, session, task.owner_id, source.mount.id)
+        mount, policy = await _write_context(dep, session, task.owner_id, source.mount.id)
         nodes = dep.get_node_repository(session)
         existing = await nodes.get_child_names(source.mount.id, source.parent_id)
         root = await nodes.create_folder(
@@ -286,6 +287,7 @@ async def _create_extract_root(dep, task: _Task, source: _ExtractSource) -> int:
             parent_id=source.parent_id,
             name=_unique_name(Path(source.node_name).stem, existing),
         )
+        await put_new_folder(nodes, dep.storage_manager, policy, mount, root)
         return root.id
 
 
@@ -303,7 +305,7 @@ async def _ensure_folder_path(
         next_cursor = (*cursor, segment)
         if next_cursor not in folder_ids:
             async with dep.session_scope() as session:
-                await _write_context(dep, session, task.owner_id, mount_id)
+                mount, policy = await _write_context(dep, session, task.owner_id, mount_id)
                 nodes = dep.get_node_repository(session)
                 parent_id = folder_ids[cursor]
                 siblings = await nodes.get_child_names(mount_id, parent_id)
@@ -313,6 +315,7 @@ async def _ensure_folder_path(
                     parent_id=parent_id,
                     name=_unique_name(segment, siblings),
                 )
+                await put_new_folder(nodes, dep.storage_manager, policy, mount, folder)
                 folder_ids[next_cursor] = folder.id
         cursor = next_cursor
     return folder_ids[cursor]

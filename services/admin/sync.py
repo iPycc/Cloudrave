@@ -31,6 +31,7 @@ class _PageCache:
     root: Node | None = None
     folders: dict[tuple[int, str], Node | None] = field(default_factory=dict)
     revivals: dict[str, tuple[int, bool]] = field(default_factory=dict)
+    managed_markers: set[str] = field(default_factory=set)
 
 
 class MountSyncService:
@@ -215,6 +216,9 @@ class MountSyncService:
                 cache = _PageCache(revivals=revivals or {})
                 try:
                     async with self.session.begin_nested():
+                        cache.managed_markers = await self.nodes.directory_marker_keys(
+                            mount.id, {item.key.removesuffix("/") for item in page.items if item.is_directory},
+                        )
                         conflicts: dict[str, tuple[str, str]] = {}
                         for item in page.items:
                             next_state["scanned"] += 1
@@ -314,7 +318,7 @@ class MountSyncService:
 
         if item.is_directory:
             marker_hash = hashlib.sha256((item.physical_key.rstrip("/") + "/").encode("utf-8")).hexdigest()
-            if await self.objects.has_migration_marker(mount.id, marker_hash):
+            if key in cache.managed_markers or await self.objects.has_migration_marker(mount.id, marker_hash):
                 return "skipped", None
             if cache.root is None:
                 cache.root = await self.nodes.ensure_mount_root(

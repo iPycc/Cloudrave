@@ -11,7 +11,7 @@ from models.enums import NodeType
 from models.tables import User
 from repositories.nodes import _unique_name
 from services.explorer.archive import ArchiveService
-from services.explorer.new_file import new_file_path, put_new_file
+from services.explorer.path_write import new_file_path, put_new_file, put_new_folder
 from services.explorer.preview import build_local_preview_response
 from services.explorer.proxy import remote_response
 from services.explorer.shared import SharedService
@@ -122,6 +122,7 @@ class SharedIo:
                 parent_id=target_parent_id,
                 name=name,
             )
+            await put_new_folder(self.source.nodes, self.source.storage_manager, target_policy, target_mount, created)
             for child in await self.source.nodes.list_children(source_node.mount_id, source_node.id):
                 await self._copy_shared_node(actor, child, target_mount, target_policy, created.id)
             return created

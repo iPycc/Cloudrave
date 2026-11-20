@@ -38,7 +38,7 @@ from schemas.node import (
 )
 from services.explorer.archive import ArchiveDownloadService
 from services.explorer.access import MountAccessPolicy
-from services.explorer.new_file import new_file_path, put_new_file
+from services.explorer.path_write import new_file_path, put_new_file, put_new_folder
 from services.explorer.write_policy import StorageWritePolicy
 from services.explorer.gc import ObjectGc
 from services.user.response import build_avatar_url
@@ -278,7 +278,10 @@ class FileExplorerService:
         )
 
     async def create_folder(self, request: Request, actor: User, payload: FolderCreateRequest) -> NodeRead:
-        mount, _policy = await self._require_mount_write(actor, payload.mount_id)
+        mount, policy = await self._require_mount_write(actor, payload.mount_id)
+        use_marker = (getattr(mount, "extra", None) or {}).get("object_key_template") is not None
+        if use_marker:
+            mount, policy = await self.mount_access.write(actor, payload.mount_id, lock=True)
         parent = None
         if payload.parent_id is not None:
             parent = await self.nodes.get_by_id(payload.parent_id)
@@ -304,6 +307,8 @@ class FileExplorerService:
                         parent_id=parent_id,
                         name=folder_name,
                     )
+                    if use_marker:
+                        await put_new_folder(self.nodes, self.storage_manager, policy, mount, node)
                 break
             except IntegrityError:
                 continue

@@ -292,6 +292,14 @@ class NodeRepository:
         await self.session.flush()
         return node
 
+    async def directory_marker_keys(self, mount_id: int, keys: set[str]) -> set[str]:
+        if not keys:
+            return set()
+        matches = await self.session.scalars(select(Node.blob_path).where(
+            Node.mount_id == mount_id, Node.type == NodeType.FOLDER, Node.blob_path.in_(keys),
+        ))
+        return keys.intersection(matches)
+
     async def create_file(
         self,
         *,
@@ -429,7 +437,7 @@ class NodeRepository:
             type=source_node.type,
             status=NodeStatus.ACTIVE,
             name=new_name,
-            blob_path=source_node.blob_path,
+            blob_path=source_node.blob_path if source_node.type == NodeType.FILE else None,
             size=source_node.size,
         )
         self.session.add(new_node)
