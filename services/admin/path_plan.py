@@ -16,6 +16,7 @@ from sqlalchemy import func, select, update
 from db.base import session_scope
 from models.enums import NodeStatus, NodeType, UserRole, UserStatus
 from models.tables import BucketMount, Node, ObjectRecord, PathPlanEntry, PathPlanTask, User
+from repositories.objects import ObjectRepository
 from services.admin.sync import MountSyncService
 from services.admin.task_claim import LEASE_DURATION, claim_task
 from store.call import call_adapter
@@ -119,13 +120,16 @@ async def _exists(adapter, policy, mount, key, *, folder=False):
 
 
 class PathPlanWorker:
+    model = PathPlanTask
+    worker_name = "path-plan"
+
     def __init__(self, dep, manager=None, *, interval=1.0):
         self.dep, self.manager, self.interval = dep, manager, interval
         self.task = None
 
     def start(self):
         if self.task is None or self.task.done():
-            self.task = asyncio.create_task(self._loop(), name="path-plan-worker")
+            self.task = asyncio.create_task(self._loop(), name=f"{self.worker_name}-worker")
 
     async def stop(self):
         if self.task is not None:
@@ -140,7 +144,7 @@ class PathPlanWorker:
             claimed = None
             try:
                 if self.manager is None or (tracked := self.manager.begin_business_write()):
-                    claimed = await claim_task(self.dep.session_factory, PathPlanTask)
+                    claimed = await claim_task(self.dep.session_factory, self.model)
                     if claimed:
                         heartbeat = asyncio.create_task(self._heartbeat(*claimed))
                         try:
@@ -152,7 +156,7 @@ class PathPlanWorker:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                LOGGER.exception("Path precheck worker failed")
+                LOGGER.exception("%s worker failed", self.worker_name)
             finally:
                 if tracked:
                     self.manager.end_business_write()
@@ -165,9 +169,10 @@ class PathPlanWorker:
             try:
                 now = datetime.now(UTC)
                 async with session_scope(self.dep.session_factory) as session:
-                    result = await session.execute(update(PathPlanTask).where(
-                        PathPlanTask.id == task_id, PathPlanTask.status == "running",
-                        PathPlanTask.lease_token == token, PathPlanTask.lease_expires_at > now,
+                    model = self.model
+                    result = await session.execute(update(model).where(
+                        model.id == task_id, model.status == "running",
+                        model.lease_token == token, model.lease_expires_at > now,
                     ).values(lease_expires_at=now + LEASE_DURATION))
                     if result.rowcount != 1:
                         return
@@ -298,6 +303,10 @@ class PathPlanWorker:
                     except ValueError:
                         item["reason"] = "changed_during_scan"
                 target_hash = item.get("target_hash")
+                if target_hash and item["kind"] == "folder" and item["reason"] == "target_exists":
+                    if await ObjectRepository(session).has_migration_marker(mount.id, target_hash, node_id=item["id"]):
+                        item["reason"] = None
+                        item["unchanged"] = True
                 if target_hash:
                     prior = list(await session.scalars(select(PathPlanEntry).where(
                         PathPlanEntry.task_id == task.id, PathPlanEntry.target_hash == target_hash)))

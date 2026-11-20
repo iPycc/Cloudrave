@@ -9,7 +9,7 @@ from models.tables import User
 from models.tables import MountSyncTask
 from schemas.mount import BucketMountRead, MountUsageRead
 from schemas.sync import MountSyncRead, MountSyncRequest
-from schemas.task import MountSyncTaskRead, PathPlanRead, PathPlanRequest
+from schemas.task import MountSyncTaskRead, PathMigrationRead, PathPlanRead, PathPlanRequest
 from schemas.user_mount import (
     OssDomainRequest,
     UserMountCreate,
@@ -22,6 +22,7 @@ from services.admin.scan import BucketScanner
 from services.admin.sync import MountSyncService
 from services.admin.sync_task import start_sync_task, stop_sync_task
 from services.admin.path_plan import control_path_plan, start_path_plan
+from services.admin.path_migration import control_migration, start_migration
 from services.user.mount import UserMountService
 from web.mid.auth import get_current_user
 
@@ -248,6 +249,28 @@ async def control_mount_path_plan(
     async with dep.session_scope() as session:
         task = await control_path_plan(dep, session, mount_id, task_id, current_user.id, action)
         return PathPlanRead.model_validate(task)
+
+
+@router.post("/{mount_id}/path-plan/{task_id}/migrate/start", response_model=PathMigrationRead, status_code=202)
+async def start_mount_path_migration(
+    mount_id: int, task_id: str, request: Request, current_user: User = Depends(get_current_user),
+) -> PathMigrationRead:
+    require_mount_manager(current_user)
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        job = await start_migration(dep, session, mount_id, task_id, current_user.id)
+        return PathMigrationRead.model_validate(job)
+
+
+@router.post("/{mount_id}/path-plan/{task_id}/migrate/{action}", response_model=PathMigrationRead)
+async def control_mount_path_migration(
+    mount_id: int, task_id: str, action: str, request: Request, current_user: User = Depends(get_current_user),
+) -> PathMigrationRead:
+    require_mount_manager(current_user)
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        job = await control_migration(dep, session, mount_id, task_id, current_user.id, action)
+        return PathMigrationRead.model_validate(job)
 
 
 @router.post("/{mount_id}/sync/task/{task_id}/{action}", response_model=MountSyncTaskRead)

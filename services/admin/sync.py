@@ -313,6 +313,9 @@ class MountSyncService:
         key = item.key[:-1] if item.is_directory and item.key.endswith("/") else item.key
 
         if item.is_directory:
+            marker_hash = hashlib.sha256((item.physical_key.rstrip("/") + "/").encode("utf-8")).hexdigest()
+            if await self.objects.has_migration_marker(mount.id, marker_hash):
+                return "skipped", None
             if cache.root is None:
                 cache.root = await self.nodes.ensure_mount_root(
                     owner_id=mount.owner_id, mount_id=mount.id, name=mount.name,
@@ -348,6 +351,14 @@ class MountSyncService:
             if probe is None or not probe[1] or blob.state != "deleted" or blob.revision != probe[0]:
                 return "conflicts", "source_unavailable"
             await self.objects.blobs.ensure(physical_id, revive=True)
+
+        if await self.objects.has_migration_reservation(physical_id):
+            return "skipped", None
+        retained = await self.objects.retained_migration_source(physical_id, mount.id)
+        if retained is not None:
+            identity = json.loads(retained.source_identity_json)
+            if item.etag == identity["etag"] and item.size == identity["size"]:
+                return "skipped", None
 
         if cache.root is None:
             cache.root = await self.nodes.ensure_mount_root(

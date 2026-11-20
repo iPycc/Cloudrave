@@ -60,6 +60,14 @@ class PathPlanRequest(CloudraveSchema):
     template: str = Field(min_length=1, max_length=1024)
 
 
+class PathMigrationRead(CloudraveSchema):
+    id: str
+    status: Literal["pending", "running", "paused", "completed", "failed", "canceled"]
+    migrated: int
+    conflicts: int
+    error: str | None = None
+
+
 class PathPlanRead(CloudraveSchema):
     id: str
     mount_id: int
@@ -75,6 +83,7 @@ class PathPlanRead(CloudraveSchema):
     created_at: datetime
     updated_at: datetime
     name: str | None = None
+    migration: PathMigrationRead | None = None
 
 
 class PathPlanConflictRead(CloudraveSchema):

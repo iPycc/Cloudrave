@@ -8,10 +8,10 @@ from pathlib import Path
 
 from fastapi import APIRouter, Body, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import Response
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 
 from web.mid.auth import get_current_user
-from models.tables import BucketMount, MountSyncConflict, MountSyncTask, PathPlanEntry, PathPlanTask, User
+from models.tables import BucketMount, MountSyncConflict, MountSyncTask, PathMigrationJob, PathMigrationRecord, PathPlanEntry, PathPlanTask, User
 from schemas.preview import (
     OfficeCardPreviewRead,
     ArchiveEntryPageRead,
@@ -24,7 +24,7 @@ from schemas.preview import (
 )
 from schemas.node import NodeRead
 from schemas.task import (ArchiveExtractRequest, BackgroundTaskRead, MountSyncConflictPage, MountSyncConflictRead,
-                          MountSyncTaskRead, PathPlanRead, PathPlanConflictPage, PathPlanConflictRead)
+                          MountSyncTaskRead, PathMigrationRead, PathPlanRead, PathPlanConflictPage, PathPlanConflictRead)
 from services.explorer.extract import list_tasks, start_extract
 from services.explorer.preview import (
     DERIVED_CACHE_CONTROL,
@@ -134,11 +134,15 @@ async def list_sync_tasks(
 @router.get("/path-plans", response_model=list[PathPlanRead])
 async def list_path_plans(request: Request, current_user: User = Depends(get_current_user)) -> list[PathPlanRead]:
     async with request.app.state.dep.session_scope() as session:
-        rows = await session.execute(select(PathPlanTask, BucketMount).join(
+        rows = await session.execute(select(PathPlanTask, BucketMount, PathMigrationJob).join(
             BucketMount, BucketMount.id == PathPlanTask.mount_id
-        ).where(PathPlanTask.owner_id == current_user.id, BucketMount.owner_id == current_user.id)
-         .order_by(PathPlanTask.updated_at.desc()).limit(100))
-        return [PathPlanRead.model_validate(task).model_copy(update={"name": mount.name}) for task, mount in rows]
+        ).outerjoin(PathMigrationJob, PathMigrationJob.plan_id == PathPlanTask.id)
+         .where(PathPlanTask.owner_id == current_user.id, BucketMount.owner_id == current_user.id)
+         .order_by(func.coalesce(PathMigrationJob.updated_at, PathPlanTask.updated_at).desc()).limit(100))
+        return [PathPlanRead.model_validate(task).model_copy(update={
+            "name": mount.name,
+            "migration": PathMigrationRead.model_validate(job) if job is not None else None,
+        }) for task, mount, job in rows]
 
 
 @router.get("/path-plans/{task_id}/conflicts", response_model=PathPlanConflictPage)
@@ -152,14 +156,17 @@ async def list_path_plan_conflicts(
         ))
         if task is None:
             raise HTTPException(status_code=404, detail="Task not found")
-        rows = list(await session.scalars(select(PathPlanEntry).where(
-            PathPlanEntry.task_id == task.id, PathPlanEntry.status == "conflict", PathPlanEntry.id > after_id,
+        rows = list(await session.execute(select(PathPlanEntry, PathMigrationRecord.error).outerjoin(
+            PathMigrationRecord, PathMigrationRecord.plan_entry_id == PathPlanEntry.id,
+        ).where(
+            PathPlanEntry.task_id == task.id, PathPlanEntry.id > after_id,
+            or_(PathPlanEntry.status == "conflict", PathMigrationRecord.status.in_(("conflict", "uncertain"))),
         ).order_by(PathPlanEntry.id).limit(limit + 1)))
         selected = rows[:limit]
         return PathPlanConflictPage(items=[PathPlanConflictRead(
             id=row.id, node_id=row.node_id, source=json.loads(row.source_json) if row.source_json else None,
-            target=json.loads(row.target_json) if row.target_json else None, reason=row.reason or "unknown",
-        ) for row in selected], next_after_id=selected[-1].id if len(rows) > limit else None)
+            target=json.loads(row.target_json) if row.target_json else None, reason=error or row.reason or "unknown",
+        ) for row, error in selected], next_after_id=selected[-1][0].id if len(rows) > limit else None)
 
 
 @router.get("/sync-tasks/{task_id}/conflicts", response_model=MountSyncConflictPage)

@@ -5,7 +5,7 @@ from __future__ import annotations
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.tables import Node, ObjectRecord
+from models.tables import Node, ObjectRecord, PathMigrationJob, PathMigrationRecord, PathPlanEntry
 from repositories.blobs import BlobRepository
 
 
@@ -177,8 +177,38 @@ class ObjectRepository:
         return {value for value in rows if value}
 
     async def has_physical_reference(self, physical_id: str) -> bool:
-        statement = select(ObjectRecord.id).where(ObjectRecord.physical_id == physical_id).limit(1)
+        # A locking read observes the latest committed reference on MySQL's
+        # REPEATABLE READ, after the caller has locked the blob identity.
+        statement = select(ObjectRecord.id).where(ObjectRecord.physical_id == physical_id).limit(1).with_for_update()
         return await self.session.scalar(statement) is not None
+
+    async def has_migration_reservation(self, physical_id: str) -> bool:
+        statement = select(PathMigrationRecord.id).where(
+            PathMigrationRecord.target_physical_id == physical_id,
+            PathMigrationRecord.status.in_(("reserved", "copying", "copied", "uncertain")),
+        ).limit(1).with_for_update()
+        return await self.session.scalar(statement) is not None
+
+    async def retained_migration_source(self, physical_id: str, mount_id: int | None = None) -> PathPlanEntry | None:
+        query = select(PathPlanEntry).join(PathMigrationRecord, PathMigrationRecord.plan_entry_id == PathPlanEntry.id).where(
+            PathMigrationRecord.source_physical_id == physical_id, PathMigrationRecord.status == "applied",
+        )
+        if mount_id is not None:
+            query = query.join(PathMigrationJob, PathMigrationJob.id == PathMigrationRecord.job_id).where(
+                PathMigrationJob.mount_id == mount_id,
+            )
+        return await self.session.scalar(query.order_by(PathMigrationRecord.id.desc()).limit(1))
+
+    async def has_migration_marker(self, mount_id: int, target_hash: str, *, node_id: int | None = None) -> bool:
+        query = select(PathMigrationRecord.id).join(
+            PathPlanEntry, PathPlanEntry.id == PathMigrationRecord.plan_entry_id,
+        ).join(PathMigrationJob, PathMigrationJob.id == PathMigrationRecord.job_id).where(
+            PathMigrationJob.mount_id == mount_id, PathPlanEntry.target_hash == target_hash,
+            PathPlanEntry.kind == "folder", PathMigrationRecord.status.in_(("copying", "copied", "uncertain", "applied")),
+        )
+        if node_id is not None:
+            query = query.where(PathPlanEntry.node_id == node_id, PathMigrationRecord.status == "applied")
+        return await self.session.scalar(query.limit(1)) is not None
 
     async def list_missing_physical_page(
         self,

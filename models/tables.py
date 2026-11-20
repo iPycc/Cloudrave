@@ -299,6 +299,47 @@ class PathPlanEntry(Base):
     )
 
 
+class PathMigrationJob(Base, TimestampMixin):
+    """Durable execution state for a completed path precheck."""
+
+    __tablename__ = "path_migration_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    plan_id: Mapped[str] = mapped_column(ForeignKey("path_plan_tasks.id", ondelete="CASCADE"), unique=True)
+    mount_id: Mapped[int] = mapped_column(ForeignKey("bucket_mounts.id", ondelete="CASCADE"), index=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    cursor: Mapped[int] = mapped_column(Integer, default=0)
+    migrated: Mapped[int] = mapped_column(Integer, default=0)
+    conflicts: Mapped[int] = mapped_column(Integer, default=0)
+    lease_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class PathMigrationRecord(Base, TimestampMixin):
+    """Write-ahead record for one copy and its protected destination."""
+
+    __tablename__ = "path_migration_records"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_id: Mapped[str] = mapped_column(ForeignKey("path_migration_jobs.id", ondelete="CASCADE"))
+    plan_entry_id: Mapped[int] = mapped_column(ForeignKey("path_plan_entries.id", ondelete="CASCADE"))
+    source_physical_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    target_physical_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="reserved")
+    copy_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    target_etag: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    target_version_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("job_id", "plan_entry_id", name="uq_path_migration_entry"),
+        Index("ix_path_migration_reservation", "target_physical_id", "status"),
+        Index("ix_path_migration_source", "source_physical_id", "status"),
+    )
+
+
 class Node(Base, TimestampMixin):
     __tablename__ = "nodes"
 

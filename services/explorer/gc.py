@@ -110,7 +110,13 @@ class ObjectGc:
                 completed += 1
                 continue
             try:
-                if await self.objects.has_physical_reference(task.physical_id):
+                if await self.objects.has_migration_reservation(task.physical_id):
+                    # A migration writes its destination after reserving the
+                    # same blob lock. Revisit cleanup only after it resolves.
+                    await self.tasks.retry(task, "目标对象由路径迁移保留")
+                    continue
+                if (await self.objects.has_physical_reference(task.physical_id) or
+                    await self.objects.retained_migration_source(task.physical_id)):
                     await self.objects.blobs.active(blob)
                     await self.tasks.skipped(task)
                     continue

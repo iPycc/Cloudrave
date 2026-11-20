@@ -6,10 +6,10 @@ from uuid import uuid4
 from sqlalchemy import and_, or_, select, update
 
 from db.base import session_scope
-from models.tables import MountSyncTask, PathPlanTask, SYNC_CLAIM_GATE_KEY, SystemMeta
+from models.tables import MountSyncTask, PathMigrationJob, PathPlanTask, SYNC_CLAIM_GATE_KEY, SystemMeta
 
 LEASE_DURATION = timedelta(minutes=5)
-TASK_MODELS = (MountSyncTask, PathPlanTask)
+TASK_MODELS = (MountSyncTask, PathPlanTask, PathMigrationJob)
 MAX_ACTIVE_TASKS = 2
 
 
@@ -33,8 +33,9 @@ async def claim_task(session_factory, model):
         now = datetime.now(UTC)
         owners = []
         for task_model in TASK_MODELS:
+            active_statuses = ("running", "paused") if task_model is PathMigrationJob else ("running",)
             owners.extend(await session.scalars(select(task_model.owner_id).where(
-                task_model.status == "running", task_model.lease_expires_at > now
+                task_model.status.in_(active_statuses), task_model.lease_expires_at > now
             )))
         if len(owners) >= MAX_ACTIVE_TASKS:
             return None
