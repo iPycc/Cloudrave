@@ -79,6 +79,7 @@ class PathPlanRead(CloudraveSchema):
     copy_to: int | None = None
     copy_name: str | None = None
     root_node_id: int | None = None
+    is_restore: bool = False
     source_name: str | None = None
     status: Literal["pending", "running", "paused", "completed", "failed", "canceled"]
     scanned: int

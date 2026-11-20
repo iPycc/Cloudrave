@@ -53,14 +53,15 @@ def copy_blob_id(task, node_id: int) -> str:
 
 
 async def queue_path_operation(
-    session, mount, policy, node, template, *, rename_to=None, move_to=None, copy_to=None, copy_name=None,
+    session, mount, policy, node, template, *, rename_to=None, move_to=None, copy_to=None, copy_name=None, is_restore=False,
 ) -> PathPlanTask:
     job_status = ("pending", "running", "paused", "failed")
     active = await session.scalar(select(PathPlanTask.id).outerjoin(
         PathMigrationJob, PathMigrationJob.plan_id == PathPlanTask.id,
     ).where(
         PathPlanTask.mount_id == mount.id,
-        or_(PathPlanTask.rename_to.is_not(None), PathPlanTask.move_to.is_not(None), PathPlanTask.copy_to.is_not(None)),
+        or_(PathPlanTask.rename_to.is_not(None), PathPlanTask.move_to.is_not(None),
+            PathPlanTask.copy_to.is_not(None), PathPlanTask.is_restore.is_(True)),
         (func.coalesce(PathPlanTask.root_node_id, PathPlanTask.max_node_id) == node.id),
         (PathPlanTask.status.in_(job_status) | PathMigrationJob.status.in_(job_status)),
     ).limit(1))
@@ -68,9 +69,9 @@ async def queue_path_operation(
         raise HTTPException(status_code=409, detail="此条目已有未完成的路径任务")
     task = PathPlanTask(
         mount_id=mount.id, owner_id=mount.owner_id, template=template, rename_to=rename_to, move_to=move_to,
-        copy_to=copy_to, copy_name=copy_name, cursor=node.id - 1, max_node_id=node.id,
+        copy_to=copy_to, copy_name=copy_name, is_restore=is_restore, cursor=node.id - 1, max_node_id=node.id,
     )
-    if node.type == NodeType.FOLDER:
+    if node.type == NodeType.FOLDER or is_restore:
         if node.parent_id is None:
             raise HTTPException(status_code=409, detail="不能改动存储根目录")
         if task.target_parent_id is not None:
@@ -112,7 +113,7 @@ async def apply_queued_operation(session, task, node, target_key) -> Node | None
     else:
         node.name = new_name
         node.parent_id = parent_id
-        action = "node.move" if task.move_to is not None else "node.rename"
+        action = "node.restore" if task.is_restore else "node.move" if task.move_to is not None else "node.rename"
     detail = f"parent:{parent_id}" if task.target_parent_id is not None else node.name
     await AuditLogRepository(session).create(
         actor_id=task.owner_id, action=action, target=f"node:{node.id}", detail=detail,
@@ -139,6 +140,7 @@ async def start_path_plan(dep, session, mount_id: int, owner_id: int, template: 
     active = await session.scalar(select(PathPlanTask).where(
         PathPlanTask.mount_id == mount.id, PathPlanTask.status.in_(("pending", "running", "paused", "failed")),
         PathPlanTask.rename_to.is_(None), PathPlanTask.move_to.is_(None), PathPlanTask.copy_to.is_(None),
+        PathPlanTask.is_restore.is_(False),
     ).order_by(PathPlanTask.created_at.desc()).limit(1))
     if active:
         if active.template == template and active.status in {"pending", "running"}:
@@ -177,7 +179,7 @@ async def control_path_plan(dep, session, mount_id, task_id, owner_id, action):
     return task
 
 
-async def _path_chain(session, current, task):
+async def _path_chain(session, current, task, *, from_recycle=False):
     chain = []
     seen = set()
     while current is not None:
@@ -185,8 +187,11 @@ async def _path_chain(session, current, task):
             raise ValueError("invalid_tree")
         seen.add(current.id)
         chain.append([current.id, current.parent_id, current.name, str(current.status), str(current.updated_at)])
-        if current.status != NodeStatus.ACTIVE or current.deleted_at is not None:
+        expected = NodeStatus.DELETED if from_recycle else NodeStatus.ACTIVE
+        if current.status != expected or (current.deleted_at is not None) != from_recycle:
             raise ValueError("invalid_tree")
+        if current.id == task.root_node_id:
+            from_recycle = False
         if current.parent_id is None:
             break
         current = await session.get(Node, current.parent_id)
@@ -195,9 +200,11 @@ async def _path_chain(session, current, task):
     return chain
 
 
-def active_tree_nodes(task):
-    visible = and_(Node.mount_id == task.mount_id, Node.owner_id == task.owner_id,
-                   Node.status == NodeStatus.ACTIVE, Node.deleted_at.is_(None))
+def path_tree_nodes(task):
+    state = and_(Node.status == NodeStatus.DELETED, Node.deleted_at.is_not(None)) if task.is_restore else (
+        and_(Node.status == NodeStatus.ACTIVE, Node.deleted_at.is_(None))
+    )
+    visible = and_(Node.mount_id == task.mount_id, Node.owner_id == task.owner_id, state)
     tree = select(Node.id).where(Node.id == task.root_node_id, visible).cte(recursive=True)
     tree = tree.union(select(Node.id).where(Node.parent_id == tree.c.id, visible))
     return select(tree.c.id)
@@ -205,7 +212,7 @@ def active_tree_nodes(task):
 
 async def _snapshot(session, node, task):
     """Build the target path and snapshot the source and destination ancestry."""
-    chain = await _path_chain(session, node, task)
+    chain = await _path_chain(session, node, task, from_recycle=task.is_restore)
     if len(chain) < 2:
         raise ValueError("invalid_tree")
     components = [item[2] for item in reversed(chain[:-1])]
@@ -334,10 +341,12 @@ class PathPlanWorker:
                 raise RuntimeError("Storage or account changed")
             query = select(Node).where(
                 Node.mount_id == task.mount_id, Node.id > task.cursor, Node.id <= task.max_node_id,
-                Node.parent_id.is_not(None), Node.status == NodeStatus.ACTIVE, Node.deleted_at.is_(None),
+                Node.parent_id.is_not(None),
             )
             if task.root_node_id is not None:
-                query = query.where(Node.id.in_(active_tree_nodes(task)))
+                query = query.where(Node.id.in_(path_tree_nodes(task)))
+            else:
+                query = query.where(Node.status == NodeStatus.ACTIVE, Node.deleted_at.is_(None))
             rows = list(await session.scalars(query.order_by(Node.id).limit(PAGE_SIZE)))
             if task.is_path_operation and not rows and task.scanned == 0:
                 raise ValueError("Path-change source no longer exists")
@@ -361,8 +370,7 @@ class PathPlanWorker:
                             filename = task.copy_name or task.rename_to or filename
                         item["target"] = format_object_key(task.template, directory="/".join(components[:-1]),
                             filename=filename, blob_id=blob_id)
-                        if task.copy_to is None and extra.get("origin") == "bucket_import":
-                            raise ValueError("external_readonly")
+                        item["external"] = extra.get("origin") == "bucket_import"
                     else:
                         item["target"] = format_directory_key(task.template, "/".join(components))
                         item["source"] = node.blob_path
@@ -373,7 +381,8 @@ class PathPlanWorker:
             adapter = self.dep.storage_manager.get_adapter(policy)
 
         # All provider calls happen outside the database transaction.
-        await call_adapter(adapter, "_require_unversioned", policy)
+        if not task.is_restore:
+            await call_adapter(adapter, "_require_unversioned", policy)
         for item in items:
             if item["reason"]:
                 continue
@@ -387,8 +396,13 @@ class PathPlanWorker:
                 item["reason"] = "invalid_path"
                 continue
             if item["kind"] == "file":
+                reuse_source = task.is_restore and source_key == physical_target
+                if item["external"] and task.copy_to is None and not reuse_source:
+                    item["reason"] = "external_readonly"
+                    continue
                 try:
-                    source = await call_adapter(adapter, "inspect_copy_source", policy, mount, item["source"])
+                    method = "head_object" if reuse_source else "inspect_copy_source"
+                    source = await call_adapter(adapter, method, policy, mount, item["source"])
                 except Exception as exc:
                     if is_not_found(exc):
                         item["reason"] = "source_changed"
@@ -403,7 +417,8 @@ class PathPlanWorker:
                     item["reason"] = "source_changed"
                     continue
                 try:
-                    item["source_identity"] = source_identity(source.size, source.etag, source.modified)
+                    modified = getattr(source, "last_modified", None) if reuse_source else source.modified
+                    item["source_identity"] = source_identity(source.size, source.etag, modified)
                 except (ValueError, TypeError, OverflowError):
                     item["reason"] = "source_identity_unavailable"
                     continue

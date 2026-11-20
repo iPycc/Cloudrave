@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Body, Depends, Request
+from fastapi import APIRouter, Body, Depends, Request, Response
 
 from web.mid.auth import get_current_user
 from models.tables import User
 from schemas.node import NodeDeleteRequest, NodeRead, NodeRestoreRequest
+from schemas.task import PathBatchQueued
 from services.explorer.recycle import RecycleBinService
 
 
@@ -29,12 +30,13 @@ async def list_recycle_nodes(request: Request, current_user: User = Depends(get_
         return await service.list_deleted(current_user)
 
 
-@router.post("/restore", response_model=list[NodeRead])
+@router.post("/restore", response_model=list[NodeRead] | PathBatchQueued, responses={202: {"model": PathBatchQueued}})
 async def restore_recycle_nodes(
     request: Request,
+    response: Response,
     payload: NodeRestoreRequest = Body(...),
     current_user: User = Depends(get_current_user),
-) -> list[NodeRead]:
+) -> list[NodeRead] | PathBatchQueued:
     dep = request.app.state.dep
     async with dep.session_scope() as session:
         service = RecycleBinService(
@@ -46,7 +48,10 @@ async def restore_recycle_nodes(
             audits=dep.get_audit_repository(session),
             storage_manager=dep.storage_manager,
         )
-        return await service.restore_nodes(request, current_user, payload)
+        result = await service.restore_nodes(request, current_user, payload)
+        if isinstance(result, PathBatchQueued):
+            response.status_code = 202
+        return result
 
 
 @router.delete("", response_model=dict[str, list[int]])

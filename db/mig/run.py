@@ -27,6 +27,7 @@ from db.mig.v15 import upgrade as upgrade_v15
 from db.mig.v16 import upgrade as upgrade_v16
 from db.mig.v17 import upgrade as upgrade_v17
 from db.mig.v18 import upgrade as upgrade_v18
+from db.mig.v19 import upgrade as upgrade_v19
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +56,7 @@ MIGRATIONS = (
     Migration(16, "storage-path-move", upgrade_v16),
     Migration(17, "storage-path-copy", upgrade_v17),
     Migration(18, "storage-path-directories", upgrade_v18),
+    Migration(19, "storage-path-restore", upgrade_v19),
 )
 
 

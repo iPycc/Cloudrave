@@ -14,14 +14,14 @@ from fastapi import HTTPException
 from sqlalchemy import case, or_, select, update
 
 from db.base import session_scope
-from models.enums import NodeType, UserRole, UserStatus
+from models.enums import NodeStatus, NodeType, UserRole, UserStatus
 from models.tables import BucketMount, Node, PathMigrationJob, PathMigrationRecord, PathPlanEntry, PathPlanTask, User
 from repositories.blobs import BlobRepository
 from repositories.nodes import NodeRepository
 from repositories.objects import ObjectRepository
 from repositories.uploads import UploadRepository
 from services.admin.path_plan import (
-    PathPlanWorker, _snapshot, active_tree_nodes, apply_queued_operation, copy_blob_id, plan_mapping,
+    PathPlanWorker, _snapshot, apply_queued_operation, copy_blob_id, path_tree_nodes, plan_mapping,
 )
 from services.explorer.write_policy import ensure_capacity
 from store.call import call_adapter
@@ -517,7 +517,7 @@ async def finalize_tree(dep, job_id, token):
         await _require_current_policy(dep, session, mount, job, plan)
         entries = (await session.execute(_tree_results(plan.id, job.id))).all()
         nodes = {node.id: node for node in await session.scalars(select(Node).where(
-            Node.id.in_(active_tree_nodes(plan)),
+            Node.id.in_(path_tree_nodes(plan)),
         ).order_by(Node.id).with_for_update())}
         if not nodes or nodes.keys() != {entry.node_id for entry, _ in entries}:
             raise MigrationConflict("目录内容已变化，原目录已保留")
@@ -558,6 +558,9 @@ async def finalize_tree(dep, job_id, token):
         for entry, receipt in entries:
             node = destinations[entry.node_id]
             key = keys[entry.node_id]
+            if plan.is_restore:
+                node.status = NodeStatus.ACTIVE
+                node.deleted_at = None
             if node.type == NodeType.FOLDER:
                 node.blob_path = key
             elif receipt is not None:

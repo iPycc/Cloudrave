@@ -266,6 +266,7 @@ class PathPlanTask(Base, TimestampMixin):
     copy_to: Mapped[int | None] = mapped_column(Integer, nullable=True)
     copy_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     root_node_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    is_restore: Mapped[bool] = mapped_column(Boolean, default=False)
     mapping: Mapped[str] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     cursor: Mapped[int] = mapped_column(Integer, default=0)
@@ -286,7 +287,7 @@ class PathPlanTask(Base, TimestampMixin):
 
     @property
     def is_path_operation(self) -> bool:
-        return self.rename_to is not None or self.target_parent_id is not None
+        return self.is_restore or self.rename_to is not None or self.target_parent_id is not None
 
 
 class PathPlanEntry(Base):
