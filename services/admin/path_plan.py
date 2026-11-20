@@ -40,24 +40,24 @@ def _digest(value):
 
 def plan_mapping(task, policy, mount):
     current = MountSyncService.mapping_signature(policy, mount)
-    if task.rename_to is not None:
+    if task.changes_node_path:
         return _digest(_json([current, (mount.extra or {}).get("object_key_template"), mount.read_only]))
     return current
 
 
-async def queue_path_rename(session, mount, policy, node, name, template) -> PathPlanTask:
+async def queue_file_path_change(session, mount, policy, node, template, *, rename_to=None, move_to=None) -> PathPlanTask:
     job_status = ("pending", "running", "paused", "failed")
     active = await session.scalar(select(PathPlanTask.id).outerjoin(
         PathMigrationJob, PathMigrationJob.plan_id == PathPlanTask.id,
     ).where(
-        PathPlanTask.mount_id == mount.id, PathPlanTask.rename_to.is_not(None),
+        PathPlanTask.mount_id == mount.id, (PathPlanTask.rename_to.is_not(None) | PathPlanTask.move_to.is_not(None)),
         PathPlanTask.max_node_id == node.id,
         (PathPlanTask.status.in_(job_status) | PathMigrationJob.status.in_(job_status)),
     ).limit(1))
     if active is not None:
-        raise HTTPException(status_code=409, detail="此文件已有未完成的改名任务")
+        raise HTTPException(status_code=409, detail="此文件已有未完成的路径任务")
     task = PathPlanTask(
-        mount_id=mount.id, owner_id=mount.owner_id, template=template, rename_to=name,
+        mount_id=mount.id, owner_id=mount.owner_id, template=template, rename_to=rename_to, move_to=move_to,
         cursor=node.id - 1, max_node_id=node.id,
     )
     task.mapping = plan_mapping(task, policy, mount)
@@ -66,13 +66,24 @@ async def queue_path_rename(session, mount, policy, node, name, template) -> Pat
     return task
 
 
-async def apply_queued_rename(session, task, node) -> bool:
-    sibling = await NodeRepository(session).get_child_any(task.mount_id, node.parent_id, task.rename_to)
+async def apply_queued_path_change(session, task, node) -> bool:
+    nodes = NodeRepository(session)
+    new_name = task.rename_to or node.name
+    parent_id = node.parent_id
+    if task.move_to is not None:
+        parent = await nodes.get_by_id_for_update(task.move_to)
+        if parent is None or parent.deleted_at is not None or parent.status != NodeStatus.ACTIVE:
+            return False
+        parent_id = parent.id
+    sibling = await nodes.get_child_any(task.mount_id, parent_id, new_name)
     if sibling is not None and sibling.id != node.id:
         return False
-    node.name = task.rename_to
+    node.name = new_name
+    node.parent_id = parent_id
+    action = "node.move" if task.move_to is not None else "node.rename"
+    detail = f"parent:{parent_id}" if task.move_to is not None else node.name
     await AuditLogRepository(session).create(
-        actor_id=task.owner_id, action="node.rename", target=f"node:{node.id}", detail=node.name,
+        actor_id=task.owner_id, action=action, target=f"node:{node.id}", detail=detail,
         ip=None, user_agent=None, request_id=None,
     )
     return True
@@ -95,7 +106,7 @@ async def start_path_plan(dep, session, mount_id: int, owner_id: int, template: 
         raise HTTPException(status_code=409, detail="旧版前缀映射暂不支持路径预检查")
     active = await session.scalar(select(PathPlanTask).where(
         PathPlanTask.mount_id == mount.id, PathPlanTask.status.in_(("pending", "running", "paused", "failed")),
-        PathPlanTask.rename_to.is_(None),
+        PathPlanTask.rename_to.is_(None), PathPlanTask.move_to.is_(None),
     ).order_by(PathPlanTask.created_at.desc()).limit(1))
     if active:
         if active.template == template and active.status in {"pending", "running"}:
@@ -134,10 +145,8 @@ async def control_path_plan(dep, session, mount_id, task_id, owner_id, action):
     return task
 
 
-async def _snapshot(session, node, task):
-    """Build the logical path and a fingerprint of all its ancestors."""
+async def _path_chain(session, current, task):
     chain = []
-    current = node
     seen = set()
     while current is not None:
         if current.id in seen or current.mount_id != task.mount_id or current.owner_id != task.owner_id:
@@ -149,13 +158,28 @@ async def _snapshot(session, node, task):
         if current.parent_id is None:
             break
         current = await session.get(Node, current.parent_id)
-    if current is None or len(chain) < 2:
+    if current is None:
+        raise ValueError("invalid_tree")
+    return chain
+
+
+async def _snapshot(session, node, task):
+    """Build the target path and snapshot the source and destination ancestry."""
+    chain = await _path_chain(session, node, task)
+    if len(chain) < 2:
         raise ValueError("invalid_tree")
     components = [item[2] for item in reversed(chain[:-1])]
     record = await session.scalar(select(ObjectRecord).where(ObjectRecord.node_id == node.id)) if node.type == NodeType.FILE else None
     record_state = None if record is None else [record.id, record.policy_id, record.blob_path, record.physical_id, record.extra, str(record.updated_at)]
-    fingerprint = _digest(_json([chain, node.size, record_state]))
-    return components, record, fingerprint
+    snapshot = [chain, node.size, record_state]
+    if task.move_to is not None:
+        target = await session.get(Node, task.move_to)
+        if target is None or target.type != NodeType.FOLDER:
+            raise ValueError("invalid_tree")
+        destination_chain = await _path_chain(session, target, task)
+        components = [part[2] for part in reversed(destination_chain[:-1])] + [node.name]
+        snapshot.append(destination_chain)
+    return components, record, _digest(_json(snapshot))
 
 
 async def _exists(adapter, policy, mount, key, *, folder=False):
@@ -262,8 +286,8 @@ class PathPlanWorker:
                 Node.mount_id == task.mount_id, Node.id > task.cursor, Node.id <= task.max_node_id,
                 Node.parent_id.is_not(None), Node.status == NodeStatus.ACTIVE, Node.deleted_at.is_(None),
             ).order_by(Node.id).limit(PAGE_SIZE)))
-            if task.rename_to is not None and not rows:
-                raise ValueError("Rename source no longer exists")
+            if task.changes_node_path and not rows:
+                raise ValueError("Path-change source no longer exists")
             for node in rows:
                 item = {"id": node.id, "kind": node.type.value, "size": node.size, "source": None,
                         "target": None, "fingerprint": None, "physical_id": None, "reason": None}
@@ -348,7 +372,7 @@ class PathPlanWorker:
             for item in items:
                 node = (
                     await NodeRepository(session).get_by_id_for_update(item["id"])
-                    if task.rename_to is not None else await session.get(Node, item["id"])
+                    if task.changes_node_path else await session.get(Node, item["id"])
                 )
                 if item["fingerprint"] is not None:
                     try:
@@ -372,8 +396,8 @@ class PathPlanWorker:
                                 task.ready -= 1
                                 task.conflicts += 1
                                 task.bytes_to_copy -= previous.size
-                if task.rename_to is not None and item.get("unchanged") and item["reason"] is None:
-                    if not await apply_queued_rename(session, task, node):
+                if task.changes_node_path and item.get("unchanged") and item["reason"] is None:
+                    if not await apply_queued_path_change(session, task, node):
                         item["reason"] = "name_conflict"
                 status = "conflict" if item["reason"] else "unchanged" if item.get("unchanged") else "ready"
                 task.scanned += 1
@@ -393,7 +417,7 @@ class PathPlanWorker:
                 task.cursor = items[-1]["id"]
             if len(items) < PAGE_SIZE:
                 task.status = "completed"
-                if task.rename_to is not None and task.ready:
+                if task.changes_node_path and task.ready:
                     session.add(PathMigrationJob(plan_id=task.id, mount_id=task.mount_id, owner_id=task.owner_id))
             else:
                 task.status = "pending"

@@ -24,6 +24,7 @@ from db.mig.v12 import upgrade as upgrade_v12
 from db.mig.v13 import upgrade as upgrade_v13
 from db.mig.v14 import upgrade as upgrade_v14
 from db.mig.v15 import upgrade as upgrade_v15
+from db.mig.v16 import upgrade as upgrade_v16
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +50,7 @@ MIGRATIONS = (
     Migration(13, "blob-lifecycle-revision", upgrade_v13),
     Migration(14, "storage-path-migration-journal", upgrade_v14),
     Migration(15, "storage-path-rename", upgrade_v15),
+    Migration(16, "storage-path-move", upgrade_v16),
 )
 
 

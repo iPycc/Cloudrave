@@ -262,6 +262,7 @@ class PathPlanTask(Base, TimestampMixin):
     owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     template: Mapped[str] = mapped_column(Text)
     rename_to: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    move_to: Mapped[int | None] = mapped_column(Integer, nullable=True)
     mapping: Mapped[str] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     cursor: Mapped[int] = mapped_column(Integer, default=0)
@@ -274,6 +275,11 @@ class PathPlanTask(Base, TimestampMixin):
     lease_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+    @property
+    def changes_node_path(self) -> bool:
+        return self.rename_to is not None or self.move_to is not None
 
 
 class PathPlanEntry(Base):

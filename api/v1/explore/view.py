@@ -8,10 +8,10 @@ from pathlib import Path
 
 from fastapi import APIRouter, Body, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import Response
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 
 from web.mid.auth import get_current_user
-from models.tables import BucketMount, MountSyncConflict, MountSyncTask, PathMigrationJob, PathMigrationRecord, PathPlanEntry, PathPlanTask, User
+from models.tables import BucketMount, MountSyncConflict, MountSyncTask, Node, PathMigrationJob, PathMigrationRecord, PathPlanEntry, PathPlanTask, User
 from schemas.preview import (
     OfficeCardPreviewRead,
     ArchiveEntryPageRead,
@@ -134,15 +134,18 @@ async def list_sync_tasks(
 @router.get("/path-plans", response_model=list[PathPlanRead])
 async def list_path_plans(request: Request, current_user: User = Depends(get_current_user)) -> list[PathPlanRead]:
     async with request.app.state.dep.session_scope() as session:
-        rows = await session.execute(select(PathPlanTask, BucketMount, PathMigrationJob).join(
+        rows = await session.execute(select(PathPlanTask, BucketMount, PathMigrationJob, Node.name).join(
             BucketMount, BucketMount.id == PathPlanTask.mount_id
-        ).outerjoin(PathMigrationJob, PathMigrationJob.plan_id == PathPlanTask.id)
+        ).outerjoin(PathMigrationJob, PathMigrationJob.plan_id == PathPlanTask.id).outerjoin(Node, and_(
+            PathPlanTask.move_to.is_not(None), Node.id == PathPlanTask.max_node_id, Node.mount_id == PathPlanTask.mount_id,
+        ))
          .where(PathPlanTask.owner_id == current_user.id, BucketMount.owner_id == current_user.id)
          .order_by(func.coalesce(PathMigrationJob.updated_at, PathPlanTask.updated_at).desc()).limit(100))
         return [PathPlanRead.model_validate(task).model_copy(update={
             "name": mount.name,
+            "source_name": source_name,
             "migration": PathMigrationRead.model_validate(job) if job is not None else None,
-        }) for task, mount, job in rows]
+        }) for task, mount, job, source_name in rows]
 
 
 @router.get("/path-plans/{task_id}/conflicts", response_model=PathPlanConflictPage)

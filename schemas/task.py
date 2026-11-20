@@ -74,6 +74,8 @@ class PathPlanRead(CloudraveSchema):
     owner_id: int
     template: str
     rename_to: str | None = None
+    move_to: int | None = None
+    source_name: str | None = None
     status: Literal["pending", "running", "paused", "completed", "failed", "canceled"]
     scanned: int
     ready: int
@@ -90,6 +92,11 @@ class PathPlanRead(CloudraveSchema):
 class PathChangeQueued(CloudraveSchema):
     kind: Literal["path_change"] = "path_change"
     task_id: str
+
+
+class PathMoveQueued(CloudraveSchema):
+    kind: Literal["path_change"] = "path_change"
+    task_ids: list[str]
 
 
 class PathPlanConflictRead(CloudraveSchema):

@@ -15,7 +15,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.enums import NodeType
+from models.enums import NodeStatus, NodeType
 from models.tables import BucketMount, Node, StoragePolicy, User
 from repositories.audit_logs import AuditLogRepository
 from repositories.mounts import BucketMountRepository
@@ -36,8 +36,8 @@ from schemas.node import (
     NodeRenameRequest,
     NodeSearchResult,
 )
-from schemas.task import PathChangeQueued
-from services.admin.path_plan import queue_path_rename
+from schemas.task import PathChangeQueued, PathMoveQueued
+from services.admin.path_plan import queue_file_path_change
 from services.explorer.archive import ArchiveDownloadService
 from services.explorer.access import MountAccessPolicy
 from services.explorer.path_write import new_file_path, object_path_template, put_new_file, put_new_folder
@@ -461,7 +461,7 @@ class FileExplorerService:
                 sibling = await self.nodes.get_child_any(mount.id, node.parent_id, payload.name)
                 if sibling is not None and sibling.id != node.id:
                     raise HTTPException(status_code=409, detail="目标位置已存在同名文件或文件夹")
-                task = await queue_path_rename(self.session, mount, policy, node, payload.name, template)
+                task = await queue_file_path_change(self.session, mount, policy, node, template, rename_to=payload.name)
                 return PathChangeQueued(task_id=task.id)
         updated = await self.nodes.rename(node, payload.name)
         await self.audits.create(
@@ -542,7 +542,7 @@ class FileExplorerService:
         )
         return {"nodes": [NodeRead.model_validate(node) for node in deleted]}
 
-    async def move_nodes(self, request: Request, actor: User, payload: NodeMoveRequest) -> list[NodeRead]:
+    async def move_nodes(self, request: Request, actor: User, payload: NodeMoveRequest) -> list[NodeRead] | PathMoveQueued:
         nodes = [await self._require_node_access(actor, node_id) for node_id in payload.node_ids]
         if not nodes:
             return []
@@ -550,6 +550,11 @@ class FileExplorerService:
         mount, policy = await self._require_mount_write(actor, mount_id)
         if any(node.mount_id != mount_id for node in nodes):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="All moved nodes must belong to one mount")
+
+        template = object_path_template(policy, mount)
+        if template is not None:
+            mount, policy = await self.mount_access.write(actor, mount_id, lock=True)
+            template = object_path_template(policy, mount)
 
         target_parent_id = payload.target_parent_id
         if target_parent_id is None:
@@ -559,6 +564,26 @@ class FileExplorerService:
             target = await self.nodes.get_by_id(target_parent_id)
             if target is None or target.mount_id != mount_id or target.type != NodeType.FOLDER:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target folder not found")
+
+        if template is not None:
+            if target.deleted_at is not None or target.status != NodeStatus.ACTIVE:
+                raise HTTPException(status_code=404, detail="找不到目标文件夹")
+            task_ids = []
+            names = set()
+            for node_id in dict.fromkeys(payload.node_ids):
+                node = await self.nodes.get_by_id_for_update(node_id)
+                if node is None or node.deleted_at is not None or node.status != NodeStatus.ACTIVE:
+                    raise HTTPException(status_code=404, detail="找不到要移动的文件")
+                if node.type != NodeType.FILE:
+                    raise HTTPException(status_code=409, detail="此存储的目录移动尚未开放")
+                if node.parent_id == target_parent_id:
+                    continue
+                if node.name in names or await self.nodes.get_child_any(mount_id, target_parent_id, node.name) is not None:
+                    raise HTTPException(status_code=409, detail=f"目标位置已有同名条目：{node.name}")
+                names.add(node.name)
+                task = await queue_file_path_change(self.session, mount, policy, node, template, move_to=target_parent_id)
+                task_ids.append(task.id)
+            return PathMoveQueued(task_ids=task_ids) if task_ids else []
 
         # Prevent moving a folder into its own subtree
         moved_ids = {node.id for node in nodes}

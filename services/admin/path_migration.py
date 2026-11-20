@@ -18,7 +18,7 @@ from models.tables import BucketMount, Node, PathMigrationJob, PathMigrationReco
 from repositories.blobs import BlobRepository
 from repositories.nodes import NodeRepository
 from repositories.objects import ObjectRepository
-from services.admin.path_plan import PathPlanWorker, _snapshot, apply_queued_rename, plan_mapping
+from services.admin.path_plan import PathPlanWorker, _snapshot, apply_queued_path_change, plan_mapping
 from store.call import call_adapter
 from store.copy_guard import source_identity
 from store.errors import is_not_found, storage_error_code
@@ -372,9 +372,9 @@ async def apply_copy(dep, job_id: str, record_id: int, lease_token: str) -> None
                     job.conflicts += 1
                     job.cursor = entry.id
                     return
-                if plan.rename_to is not None and not await apply_queued_rename(session, plan, node):
+                if plan.changes_node_path and not await apply_queued_path_change(session, plan, node):
                     record.status = "uncertain"
-                    record.error = "已有同名文件或文件夹，源文件已保留"
+                    record.error = "目标位置已变化或有同名条目，源文件已保留"
                     job.conflicts += 1
                     job.cursor = entry.id
                     return

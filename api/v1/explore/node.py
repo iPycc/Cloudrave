@@ -26,7 +26,7 @@ from schemas.node import (
     NodeSearchResult,
     NodeSort,
 )
-from schemas.task import PathChangeQueued
+from schemas.task import PathChangeQueued, PathMoveQueued
 from services.user.storage import UserStorageProvisionService
 from api.v1.explore.dep import node_service
 
@@ -214,16 +214,20 @@ async def delete_nodes(
         return await service.delete_nodes(request, current_user, payload)
 
 
-@router.post("/node/move", response_model=list[NodeRead])
+@router.post("/node/move", response_model=list[NodeRead] | PathMoveQueued, responses={202: {"model": PathMoveQueued}})
 async def move_nodes(
     request: Request,
+    response: Response,
     payload: NodeMoveRequest = Body(...),
     current_user: User = Depends(get_current_user),
-) -> list[NodeRead]:
+) -> list[NodeRead] | PathMoveQueued:
     dep = request.app.state.dep
     async with dep.session_scope() as session:
         service = node_service(dep, session)
-        return await service.move_nodes(request, current_user, payload)
+        result = await service.move_nodes(request, current_user, payload)
+        if isinstance(result, PathMoveQueued):
+            response.status_code = 202
+        return result
 
 
 @router.post("/node/copy", response_model=list[NodeRead])
