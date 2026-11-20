@@ -27,6 +27,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from drives.remote_drive.common import (
     RemoteAuthenticationError,
     RemoteProtocolError,
+    RemoteUploadUnconfirmedError,
     decode_upload_state,
     encode_upload_state,
     parse_datetime,
@@ -397,9 +398,7 @@ class DriveWoClient:
                 "partIndex": str(part_number),
             },
             file_field="file",
-            # WoPan accepts a browser multipart POST but does not expose the
-            # response through CORS. The browser records an opaque successful
-            # transfer and completion verifies the resulting remote object.
+            # WoPan hides the browser response; only the resulting file confirms the upload.
             record_etag=f"part:{part_number}",
             response_mode="opaque",
         )
@@ -464,6 +463,7 @@ class DriveWoClient:
             # Direct browser uploads have an opaque response because WoPan's
             # upload host does not publish CORS response headers. The completed
             # object can appear in the file list slightly after the last part.
+            saw_size_mismatch = False
             for attempt in range(10):
                 matches = [
                     entry
@@ -475,9 +475,12 @@ class DriveWoClient:
                     raise RemoteProtocolError("联通云盘返回多个同名文件，无法确认上传结果")
                 if matches and matches[0].size == int(state["s"]):
                     return matches[0]
+                saw_size_mismatch |= bool(matches)
                 if attempt < 9:
                     time.sleep(min(0.2 * (attempt + 1), 1.0))
-            raise RemoteProtocolError("联通云盘直传完成后未找到文件")
+            if saw_size_mismatch:
+                raise RemoteProtocolError("联通云盘的同名文件大小与上传任务不一致")
+            raise RemoteUploadUnconfirmedError("联通云盘尚未找到上传文件，请重试")
         return RemoteEntry(remote_id, str(state["p"]), str(state["n"]), False, int(state["s"]), download_id=remote_id)
 
     def abort_upload(self, upload: MultipartUploadState) -> bool:
