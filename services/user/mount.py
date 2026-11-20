@@ -30,7 +30,7 @@ from schemas.user_mount import (
     UserMountUpdate,
 )
 from services.explorer.upload_cleanup import UploadCleanup
-from services.explorer.path_write import validate_mount_path
+from services.explorer.path_write import validate_import_permissions, validate_mount_path
 from store.call import call_adapter
 from store.manager import StorageManager
 from drives.ids import provider_id
@@ -89,6 +89,7 @@ class UserMountService:
             policy.credential_version = version
             mount_payload.policy_id = policy.id
             mount = await self.mounts.create(actor.id, mount_payload)
+            validate_import_permissions(actor, policy, mount)
             await validate_mount_path(self.storage_manager, policy, mount)
             await self.nodes.ensure_mount_root(owner_id=actor.id, mount_id=mount.id, name=mount.name)
             await self._validate_storage(policy, mount)
@@ -116,7 +117,8 @@ class UserMountService:
     ) -> UserMountRead:
         mount = await self._owned_mount(actor, mount_id, for_update=True)
         policy = await self._policy(mount.policy_id)
-        previous_template = (mount.extra or {}).get("object_key_template")
+        previous_extra = dict(mount.extra or {})
+        previous_template = previous_extra.get("object_key_template")
         policy_patch = payload.policy
         mount_patch = payload.mount
 
@@ -146,6 +148,7 @@ class UserMountService:
                 policy.credential_version = version
             if mount_patch is not None:
                 mount = await self.mounts.update(mount, mount_patch)
+            validate_import_permissions(actor, policy, mount, previous_extra=None if mapping_changed else previous_extra)
             if mapping_changed or connection_changed or (mount.extra or {}).get("object_key_template") != previous_template:
                 await validate_mount_path(self.storage_manager, policy, mount)
             if mapping_changed or connection_changed:

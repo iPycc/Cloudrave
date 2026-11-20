@@ -40,10 +40,22 @@ def _digest(value):
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _can_relocate_imports(task, mount) -> bool:
+    extra = mount.extra or {}
+    return (
+        (task.rename_to is not None or task.move_to is not None)
+        and mount.mode == "mirror"
+        and extra.get("import_writeback") is True
+    )
+
+
 def plan_mapping(task, policy, mount):
     current = MountSyncService.mapping_signature(policy, mount)
     if task.is_path_operation:
-        return _digest(_json([current, (mount.extra or {}).get("object_key_template"), mount.read_only]))
+        values = [current, (mount.extra or {}).get("object_key_template"), mount.read_only]
+        if _can_relocate_imports(task, mount):
+            values.append(True)
+        return _digest(_json(values))
     return current
 
 
@@ -393,6 +405,7 @@ class PathPlanWorker:
         # All provider calls happen outside the database transaction.
         if not task.is_restore:
             await call_adapter(adapter, "_require_unversioned", policy)
+        can_relocate = _can_relocate_imports(task, mount)
         for item in items:
             if item["reason"]:
                 continue
@@ -407,7 +420,7 @@ class PathPlanWorker:
                 continue
             if item["kind"] == "file":
                 reuse_source = task.is_restore and source_key == physical_target
-                if item["external"] and task.copy_to is None and not reuse_source:
+                if item["external"] and task.copy_to is None and not reuse_source and not can_relocate:
                     item["reason"] = "external_readonly"
                     continue
                 try:

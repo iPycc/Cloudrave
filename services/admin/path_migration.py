@@ -358,6 +358,8 @@ async def _register_copy(objects, mount, plan, node, source, receipt, key, store
 
 
 def _stored_metadata(extra, stored):
+    if extra.get("origin") == "bucket_import":
+        extra = {"origin": "managed_move"}
     extra.update(etag=stored.etag, version_id=stored.version_id)
     extra.pop("last_modified", None)
     if getattr(stored, "last_modified", None):

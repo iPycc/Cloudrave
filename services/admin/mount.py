@@ -25,7 +25,7 @@ from schemas.mount import (
 from drives.ids import provider_id
 from services.explorer.upload_cleanup import UploadCleanup
 from store.manager import StorageManager
-from services.explorer.path_write import validate_mount_path
+from services.explorer.path_write import validate_import_permissions, validate_mount_path
 from store.call import call_adapter
 from core.log import LogOperation, LogOutcome
 
@@ -74,6 +74,7 @@ class MountAdminService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Storage policy not found")
 
         mount = await self.mounts.create(owner_id, payload)
+        validate_import_permissions(actor, policy, mount)
         await validate_mount_path(self.storage_manager, policy, mount)
         await self.nodes.ensure_mount_root(owner_id=owner_id, mount_id=mount.id, name=mount.name)
         adapter = self.storage_manager.get_adapter(policy)
@@ -167,8 +168,10 @@ class MountAdminService:
             )
         updated = await self.mounts.update(mount, payload)
         policy = await self.policies.get_by_id(updated.policy_id)
-        if policy is not None and (changed_mapping or legacy_changed or (updated.extra or {}).get("object_key_template") != previous_template):
-            await validate_mount_path(self.storage_manager, policy, updated)
+        if policy is not None:
+            validate_import_permissions(actor, policy, updated)
+            if changed_mapping or legacy_changed or (updated.extra or {}).get("object_key_template") != previous_template:
+                await validate_mount_path(self.storage_manager, policy, updated)
         await self.audits.create(
             actor_id=actor.id,
             action="mount.update",

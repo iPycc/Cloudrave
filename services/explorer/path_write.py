@@ -9,6 +9,7 @@ from fastapi import HTTPException
 
 from drives.ids import provider_id
 from schemas.task import PathTemplatePreview
+from security.rbac import require_admin
 from services.explorer.up_path import UploadPath
 from store.call import call_adapter
 from store.errors import storage_error_code
@@ -32,6 +33,16 @@ def object_path_template(policy, mount) -> str | None:
     if not isinstance(template, str):
         raise HTTPException(status_code=422, detail="对象路径模板无效")
     return template
+
+
+def validate_import_permissions(actor, policy, mount, *, previous_extra: dict | None = None) -> None:
+    extra = mount.extra or {}
+    previous = previous_extra or {}
+    if any(extra.get(key) is True and previous.get(key) is not True
+           for key in ("import_writeback", "import_delete_source")):
+        require_admin(actor)
+    if extra.get("import_writeback") is True and (mount.mode != "mirror" or object_path_template(policy, mount) is None):
+        raise HTTPException(status_code=422, detail="导入文件回写需要启用镜像和真实目录")
 
 
 def path_template_examples(adapter, policy, mount, template: str) -> PathTemplatePreview:
