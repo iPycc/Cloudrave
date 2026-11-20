@@ -9,6 +9,7 @@ from fastapi import HTTPException, Request, UploadFile, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from drives.ids import ALIYUN_OSS
 from models.enums import UploadMode, UploadState
 from models.tables import BucketMount, StoragePolicy, User
 from repositories.audit_logs import AuditLogRepository
@@ -199,22 +200,22 @@ class CreateUploadSessionService:
                 if record.mode == UploadMode.SINGLE:
                     await self.uploads.sync_parts(record.id, [(1, stored.etag or "part-1", record.size)])
             elif record.mode == UploadMode.MULTIPART and adapter.capabilities.supports_part_listing:
-                storage_parts = await call_adapter(
-                    adapter,
-                    "list_parts",
-                    policy,
-                    mount,
-                    self._build_upload_state(record, policy, mount),
-                )
-                reconciled: list[tuple[int, str | None, int]] = []
-                for part in storage_parts:
-                    try:
-                        expected_size = self._expected_part_size(record, part.part_number)
-                    except HTTPException:
-                        continue
-                    if part.etag and part.size == expected_size:
-                        reconciled.append((part.part_number, part.etag, part.size))
-                await self.uploads.sync_parts(record.id, reconciled)
+                try:
+                    storage_parts = await call_adapter(
+                        adapter, "list_parts", policy, mount, self._build_upload_state(record, policy, mount),
+                    )
+                except Exception as exc:
+                    await self._recover_missing_oss_upload(adapter, policy, mount, record, exc)
+                else:
+                    reconciled: list[tuple[int, str | None, int]] = []
+                    for part in storage_parts:
+                        try:
+                            expected_size = self._expected_part_size(record, part.part_number)
+                        except HTTPException:
+                            continue
+                        if part.etag and part.size == expected_size:
+                            reconciled.append((part.part_number, part.etag, part.size))
+                    await self.uploads.sync_parts(record.id, reconciled)
             await self.uploads.touch(record.id)
         return await self._to_read(record)
 
@@ -389,7 +390,9 @@ class CreateUploadSessionService:
                 )
 
             stored_object = None
-            if record.path_token or record.state == UploadState.FAILED or record.mode == UploadMode.SINGLE:
+            if record.state == UploadState.FAILED and self._is_oss_blob_multipart(adapter, record):
+                stored_object = await self._completed_oss_object(adapter, policy, mount, record)
+            elif record.path_token or record.state == UploadState.FAILED or record.mode == UploadMode.SINGLE:
                 stored_object = await self._head_path(adapter, policy, mount, record.path)
                 if stored_object is not None and stored_object.size != record.size:
                     raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Uploaded object size does not match session")
@@ -445,7 +448,7 @@ class CreateUploadSessionService:
                     except Exception as exc:
                         if record.path_token and storage_error_code(exc) in {"FileAlreadyExists", "PreconditionFailed"}:
                             raise HTTPException(status_code=409, detail="存储桶中的目标路径已被占用") from exc
-                        raise
+                        stored_object = await self._recover_missing_oss_upload(adapter, policy, mount, record, exc)
             elif stored_object is None:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Uploaded object was not found")
 
@@ -573,6 +576,33 @@ class CreateUploadSessionService:
             raise HTTPException(status_code=409, detail="存储桶中的目标路径已被占用")
         if stored.size != record.size:
             raise HTTPException(status_code=409, detail="存储对象大小与上传会话不匹配")
+
+    @staticmethod
+    def _is_oss_blob_multipart(adapter, record) -> bool:
+        return adapter.provider_type == ALIYUN_OSS and record.mode == UploadMode.MULTIPART and not record.path_token
+
+    async def _recover_missing_oss_upload(self, adapter, policy, mount, record, exc: Exception):
+        if not self._is_oss_blob_multipart(adapter, record) or storage_error_code(exc) != "NoSuchUpload":
+            raise exc
+        stored = await self._completed_oss_object(adapter, policy, mount, record)
+        if stored is None:
+            raise HTTPException(status_code=409, detail="OSS 分片会话已失效，请重新上传文件") from exc
+        return stored
+
+    async def _completed_oss_object(self, adapter, policy, mount, record):
+        stored = await self._head_path(adapter, policy, mount, record.path)
+        if stored is None:
+            return None
+        if record.checksum:
+            identified = stored.metadata.get("sha256") == record.checksum
+        else:
+            identified = (
+                stored.metadata.get("file-name") == record.file_name
+                and stored.metadata.get("part-size") == str(record.part_size)
+            )
+        if stored.size != record.size or not identified:
+            raise HTTPException(status_code=409, detail="OSS 中的对象与原上传会话不匹配")
+        return stored
 
     async def _require_mount_access(self, actor: User, mount_id: int) -> tuple[BucketMount, StoragePolicy]:
         return await self.mount_access.read(actor, mount_id, lock=True)
