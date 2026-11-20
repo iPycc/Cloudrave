@@ -22,6 +22,7 @@ from repositories.uploads import UploadRepository
 from schemas.mount import BucketMountCreate, BucketMountRead, BucketMountUpdate, mount_read
 from schemas.policy import StoragePolicyCreate, StoragePolicyRead, StoragePolicyUpdate
 from schemas.user_mount import (
+    UploadCorsRead,
     UserBucketMountCreate,
     UserMountCreate,
     UserMountDeletePreview,
@@ -30,6 +31,8 @@ from schemas.user_mount import (
     UserMountUpdate,
 )
 from services.explorer.upload_cleanup import UploadCleanup
+from services.explorer.path_write import validate_import_permissions, validate_mount_path
+from services.user.upload_cors import check_direct_upload_cors
 from store.call import call_adapter
 from store.manager import StorageManager
 from drives.ids import provider_id
@@ -88,6 +91,8 @@ class UserMountService:
             policy.credential_version = version
             mount_payload.policy_id = policy.id
             mount = await self.mounts.create(actor.id, mount_payload)
+            validate_import_permissions(actor, policy, mount)
+            await validate_mount_path(self.storage_manager, policy, mount)
             await self.nodes.ensure_mount_root(owner_id=actor.id, mount_id=mount.id, name=mount.name)
             await self._validate_storage(policy, mount)
         except IntegrityError as exc:
@@ -114,6 +119,8 @@ class UserMountService:
     ) -> UserMountRead:
         mount = await self._owned_mount(actor, mount_id, for_update=True)
         policy = await self._policy(mount.policy_id)
+        previous_extra = dict(mount.extra or {})
+        previous_template = previous_extra.get("object_key_template")
         policy_patch = payload.policy
         mount_patch = payload.mount
 
@@ -143,6 +150,9 @@ class UserMountService:
                 policy.credential_version = version
             if mount_patch is not None:
                 mount = await self.mounts.update(mount, mount_patch)
+            validate_import_permissions(actor, policy, mount, previous_extra=None if mapping_changed else previous_extra)
+            if mapping_changed or connection_changed or (mount.extra or {}).get("object_key_template") != previous_template:
+                await validate_mount_path(self.storage_manager, policy, mount)
             if mapping_changed or connection_changed:
                 await self._validate_storage(policy, mount)
         except IntegrityError as exc:
@@ -269,6 +279,18 @@ class UserMountService:
         await self.session.flush()
         await self._audit(request, actor, "mount.cors", mount, str(result.get("status", "configured")))
         return result
+
+    async def check_upload_cors(self, actor: User, mount_id: int, origin: str) -> UploadCorsRead:
+        mount = await self._owned_mount(actor, mount_id)
+        policy = await self._policy(mount.policy_id)
+        if provider_id(policy.provider) not in {"tencent_cos", "aliyun_oss"}:
+            raise HTTPException(status_code=422, detail="当前存储不使用 COS／OSS 直传")
+        if mount.read_only:
+            return UploadCorsRead(status="read_only")
+        if not mount.is_enabled or policy.status != "active":
+            return UploadCorsRead(status="unavailable")
+        result = await check_direct_upload_cors(self.storage_manager.get_adapter(policy), policy, mount, origin)
+        return UploadCorsRead(status=result)
 
     async def require_owned_mount(self, actor: User, mount_id: int) -> BucketMount:
         return await self._owned_mount(actor, mount_id)

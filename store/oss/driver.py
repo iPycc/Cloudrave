@@ -469,8 +469,11 @@ class AliyunOssAdapter(StorageAdapterBase):
         total_size: int | None = None,
         mime_type: str | None = None,
         metadata: dict[str, str] | None = None,
+        no_overwrite: bool = False,
         _copy_snapshot: CopySnapshot | None = None,
     ) -> MultipartUploadState:
+        if no_overwrite:
+            self._require_unversioned(policy)
         # OSS signs these as x-oss-meta-* headers and does not allow underscores in their names.
         oss_metadata = (dict(_copy_snapshot.metadata) if _copy_snapshot is not None else
                         {key.replace("_", "-"): value for key, value in (metadata or {}).items() if value})
@@ -485,13 +488,13 @@ class AliyunOssAdapter(StorageAdapterBase):
             "expires": _copy_snapshot.expires,
             "storage_class": _copy_snapshot.storage_class,
             "tagging": _copy_snapshot.tagging_header(),
-            "forbid_overwrite": True,
         }
         result = self._client_for(policy).initiate_multipart_upload(oss.InitiateMultipartUploadRequest(
             bucket=self._bucket(policy),
             key=self._key(policy, mount, object_key),
             content_type=mime_type,
             metadata=oss_metadata or None,
+            forbid_overwrite=True if no_overwrite or _copy_snapshot is not None else None,
             **copy_args,
             **(_copy_snapshot.encryption_args() if _copy_snapshot is not None else self._encryption_args(policy)),
         ))

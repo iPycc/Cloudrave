@@ -93,6 +93,6 @@ class UploadCleanup:
 
         adapter = self.storage_manager.get_adapter(policy)
         upload = build_upload_state(record, policy, mount, self.storage_manager)
-        await cleanup_upload(adapter, policy, mount, upload, record.mode)
+        await cleanup_upload(adapter, policy, mount, upload, record.mode, protected=record.path_token is not None)
         await self.uploads.set_state(record.id, UploadState.EXPIRED)
         return True

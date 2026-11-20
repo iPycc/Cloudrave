@@ -22,6 +22,7 @@ from repositories.objects import ObjectRepository
 from schemas.task import PathTemplatePreview
 from services.admin.sync import MountSyncService
 from services.admin.task_claim import LEASE_DURATION, claim_task
+from services.explorer.path_write import path_template_examples
 from store.call import call_adapter
 from store.copy_guard import source_identity
 from store.errors import is_not_found, storage_error_code
@@ -39,10 +40,21 @@ def _digest(value):
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _relocates_mirror_items(task, mount) -> bool:
+    return mount.mode == "mirror" and (task.rename_to is not None or task.move_to is not None)
+
+
+def _can_relocate_imports(task, mount) -> bool:
+    return _relocates_mirror_items(task, mount) and (mount.extra or {}).get("import_writeback") is True
+
+
 def plan_mapping(task, policy, mount):
     current = MountSyncService.mapping_signature(policy, mount)
     if task.is_path_operation:
-        return _digest(_json([current, (mount.extra or {}).get("object_key_template"), mount.read_only]))
+        values = [current, (mount.extra or {}).get("object_key_template"), mount.read_only]
+        if _can_relocate_imports(task, mount):
+            values.append(True)
+        return _digest(_json(values))
     return current
 
 
@@ -138,29 +150,14 @@ async def _path_plan_mount(dep, session, mount_id, owner_id, *, lock: bool):
     return mount, policy
 
 
-def _path_examples(adapter, policy, mount, template: str) -> PathTemplatePreview:
-    blob_id = "0123456789abcdef" * 2
-    try:
-        root = format_object_key(template, directory="", filename="说明.txt", blob_id=blob_id)
-        nested = format_object_key(template, directory="项目", filename="合同.pdf", blob_id=blob_id)
-        directory = format_directory_key(template, "项目")
-        return PathTemplatePreview(
-            root_key=adapter._key(policy, mount, root),
-            nested_key=adapter._key(policy, mount, nested),
-            directory_key=adapter._validate_physical_key(adapter._key(policy, mount, directory) + "/"),
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"路径模板无效：{exc}") from exc
-
-
 async def preview_path_template(dep, session, mount_id: int, owner_id: int, template: str) -> PathTemplatePreview:
     mount, policy = await _path_plan_mount(dep, session, mount_id, owner_id, lock=False)
-    return _path_examples(dep.storage_manager.get_adapter(policy), policy, mount, template)
+    return path_template_examples(dep.storage_manager.get_adapter(policy), policy, mount, template)
 
 
 async def start_path_plan(dep, session, mount_id: int, owner_id: int, template: str):
     mount, policy = await _path_plan_mount(dep, session, mount_id, owner_id, lock=True)
-    _path_examples(dep.storage_manager.get_adapter(policy), policy, mount, template)
+    path_template_examples(dep.storage_manager.get_adapter(policy), policy, mount, template)
     active = await session.scalar(select(PathPlanTask).where(
         PathPlanTask.mount_id == mount.id, PathPlanTask.status.in_(("pending", "running", "paused", "failed")),
         PathPlanTask.rename_to.is_(None), PathPlanTask.move_to.is_(None), PathPlanTask.copy_to.is_(None),
@@ -398,6 +395,9 @@ class PathPlanWorker:
                     else:
                         item["target"] = format_directory_key(task.template, "/".join(components))
                         item["source"] = node.blob_path
+                        if node.blob_path is None and _relocates_mirror_items(task, mount):
+                            chain = await _path_chain(session, node, task)
+                            item["marker_candidate"] = "/".join(part[2] for part in reversed(chain[:-1]))
                 except ValueError as exc:
                     item["reason"] = str(exc) if str(exc) in {"source_missing", "external_readonly", "invalid_tree"} else "invalid_path"
                 items.append(item)
@@ -407,10 +407,17 @@ class PathPlanWorker:
         # All provider calls happen outside the database transaction.
         if not task.is_restore:
             await call_adapter(adapter, "_require_unversioned", policy)
+        can_relocate = _can_relocate_imports(task, mount)
         for item in items:
             if item["reason"]:
                 continue
             try:
+                candidate = item.get("marker_candidate")
+                if candidate and await _exists(adapter, policy, mount, candidate, folder=True):
+                    if not can_relocate:
+                        item["reason"] = "external_readonly"
+                        continue
+                    item["source"] = candidate
                 physical_target = adapter._validate_physical_key(adapter._key(policy, mount, item["target"]) + ("/" if item["kind"] == "folder" else ""))
                 item["target_hash"] = _digest(physical_target)
                 source_key = adapter._key(policy, mount, item["source"]) if item["kind"] == "file" else None
@@ -421,7 +428,7 @@ class PathPlanWorker:
                 continue
             if item["kind"] == "file":
                 reuse_source = task.is_restore and source_key == physical_target
-                if item["external"] and task.copy_to is None and not reuse_source:
+                if item["external"] and task.copy_to is None and not reuse_source and not can_relocate:
                     item["reason"] = "external_readonly"
                     continue
                 try:

@@ -115,6 +115,7 @@ class UploadSessionRead(CloudraveSchema):
     transport: str
     required_response_headers: list[str] = Field(default_factory=list)
     part_checksum_algorithm: str | None = None
+    ready_to_complete: bool = False
     parts: list[UploadPartRead] = Field(default_factory=list)
 
 

@@ -9,12 +9,13 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from models.enums import ShareAccess
+from models.enums import NodeType, ShareAccess
 from models.shared import ShareMount
 from models.tables import Node, ShareRecord, User
 from repositories.shared import SharedRepository
 from schemas.shared import SharedCreate, SharedNode, SharedRead, SharedSummaryRead, SharedOwnerRead
 from services.explorer.share import ShareService
+from services.explorer.view.base import preview_version
 from services.user.response import build_avatar_url
 from security.capabilities import Capability, require_capability
 
@@ -252,6 +253,8 @@ class SharedService:
             owner_username=owner.username if owner is not None else None,
             owner_avatar=build_avatar_url(owner) if owner is not None else None,
             available=True,
+            expires_at=share.expires_at,
+            max_downloads=share.max_downloads,
             roots=[cls._node(node) for node in nodes],
             detail_url=f"/api/v1/shared/{mount.id}",
             nodes_url=f"/api/v1/shared/{mount.id}/nodes",
@@ -269,4 +272,5 @@ class SharedService:
             name=node.name,
             type=node.type.value,
             size=node.size,
+            preview_version=preview_version(node) if node.type == NodeType.FILE else None,
         )

@@ -57,6 +57,13 @@ class UserMountRead(CloudraveSchema):
     mount: BucketMountRead
 
 
+UploadCorsStatus = Literal["ready", "same_origin", "read_only", "blocked", "missing_etag", "unavailable"]
+
+
+class UploadCorsRead(CloudraveSchema):
+    status: UploadCorsStatus
+
+
 class UserMountDeletePreview(CloudraveSchema):
     mount_id: int
     mount_name: str

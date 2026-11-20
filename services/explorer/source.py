@@ -94,6 +94,14 @@ class FileSourceService:
         return await self._resolve(node)
 
     async def _resolve(self, node: "Node") -> tuple["Node", "BucketMount", "StoragePolicy"]:
+        if node.deleted_at is not None and node.type == NodeType.FILE:
+            record = await self.objects.get_by_node_id(node.id)
+            extra = (record.extra or {}) if record else {}
+            if extra.get("external_missing") and not extra.get("missing_while_recycled"):
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="存储中的源文件暂时找不到。请恢复源文件并重新同步后再试。",
+                )
         if node.deleted_at is not None or node.type != NodeType.FILE or not node.blob_path:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File node not found")
         mount = await self.mounts.get_by_id(node.mount_id)

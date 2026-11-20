@@ -23,6 +23,7 @@ from repositories.mounts import BucketMountRepository
 from repositories.nodes import NodeRepository
 from repositories.objects import ObjectRepository
 from repositories.policies import StoragePolicyRepository
+from repositories.uploads import UploadRepository
 from schemas.sync import MountSyncRead, MountSyncRequest
 from services.admin.scan import BucketItem, BucketPage, BucketScanner
 from store.copy_guard import source_identity
@@ -256,9 +257,15 @@ class MountSyncService:
                             _marker_identity(item) if item.is_directory else self._physical_id(mount, item)
                             for item in page.items
                         })
+                        active_uploads = await UploadRepository(self.session).active_paths(
+                            mount.id, {item.key for item in page.items if not item.is_directory},
+                        )
                         conflicts: dict[str, tuple[str, str]] = {}
                         for item in page.items:
                             next_state["scanned"] += 1
+                            if not item.is_directory and item.key in active_uploads:
+                                next_state["skipped"] += 1
+                                continue
                             outcome, reason = await self._upsert_item(
                                 mount,
                                 item,

@@ -55,6 +55,7 @@ class SharedNodeRead(CloudraveSchema):
     name: str
     type: str
     size: int
+    preview_version: str | None = None
 
 
 class ShareNodeInfo(CloudraveSchema):

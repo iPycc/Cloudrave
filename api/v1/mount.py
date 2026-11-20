@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
+from pydantic import HttpUrl
 
 from models.enums import UserRole
 from models.tables import User
@@ -12,6 +13,7 @@ from schemas.sync import MountSyncRead, MountSyncRequest
 from schemas.task import MountSyncTaskRead, PathMigrationRead, PathPlanRead, PathPlanRequest, PathTemplatePreview
 from schemas.user_mount import (
     OssDomainRequest,
+    UploadCorsRead,
     UserMountCreate,
     UserMountDeletePreview,
     UserMountDeleteResult,
@@ -182,6 +184,22 @@ async def configure_cors(
     dep = request.app.state.dep
     async with dep.session_scope() as session:
         return await _service(request, session).configure_cors(request, current_user, mount_id)
+
+
+@router.get("/{mount_id}/cors/check", response_model=UploadCorsRead)
+async def check_upload_cors(
+    mount_id: int,
+    request: Request,
+    origin: HttpUrl = Query(),
+    current_user: User = Depends(get_current_user),
+) -> UploadCorsRead:
+    require_mount_manager(current_user)
+    if (origin.path not in {"", "/", None} or origin.query is not None or origin.fragment is not None or
+            origin.username is not None or origin.password is not None):
+        raise HTTPException(status_code=422, detail="请提供站点来源地址")
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        return await _service(request, session).check_upload_cors(current_user, mount_id, str(origin).rstrip("/"))
 
 
 @router.get("/{mount_id}/sync", response_model=MountSyncRead)
