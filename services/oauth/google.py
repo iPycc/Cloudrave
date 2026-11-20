@@ -25,6 +25,9 @@ GOOGLE_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 GOOGLE_SCOPE = "openid email profile"
+GOOGLE_CONFIGURATION_ERRORS = frozenset({
+    "admin_policy_enforced", "invalid_client", "org_internal", "redirect_uri_mismatch",
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,7 +46,9 @@ class GoogleIdentityProfile:
 
 
 class GoogleOAuthProtocolError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, result: str = "provider_error") -> None:
+        super().__init__(message)
+        self.result = result
 
 
 class GoogleIdentityNotLinkedError(RuntimeError):
@@ -296,6 +301,11 @@ class GoogleOAuthClient:
                         "redirect_uri": credentials.callback_url,
                     },
                 )
+                if token_response.is_client_error:
+                    error_payload = token_response.json()
+                    provider_error = error_payload.get("error") if isinstance(error_payload, dict) else None
+                    if isinstance(provider_error, str) and provider_error in GOOGLE_CONFIGURATION_ERRORS:
+                        raise GoogleOAuthProtocolError("Google rejected the OAuth configuration", result=provider_error)
                 token_response.raise_for_status()
                 token_payload = token_response.json()
                 if not isinstance(token_payload, dict):

@@ -26,6 +26,7 @@ from schemas.oauth import (
 from security.auth_cookies import set_auth_cookies, set_oauth_two_factor_cookie
 from security.rbac import require_admin
 from services.oauth.google import (
+    GOOGLE_CONFIGURATION_ERRORS,
     GoogleIdentityConflictError,
     GoogleIdentityNotLinkedError,
     GoogleOAuthClient,
@@ -253,7 +254,10 @@ async def finish_google_oauth(
     expected_state = request.cookies.get(GOOGLE_STATE_COOKIE, "")
     verifier = request.cookies.get(GOOGLE_VERIFIER_COOKIE, "")
     if error or not code:
-        return _clear_flow_cookies(error_redirect("access_denied"), request, dep.config)
+        result = "access_denied"
+        if is_test_flow and error and error != "access_denied":
+            result = error if error in GOOGLE_CONFIGURATION_ERRORS else "provider_error"
+        return _clear_flow_cookies(error_redirect(result), request, dep.config)
     if not expected_state or not state_value or not hmac.compare_digest(expected_state, state_value) or not verifier:
         return _clear_flow_cookies(error_redirect("invalid_state"), request, dep.config)
     if is_link_flow and link_user_uid is None:
@@ -272,7 +276,7 @@ async def finish_google_oauth(
                 code=code,
                 code_verifier=verifier,
             )
-        except GoogleOAuthProtocolError:
+        except GoogleOAuthProtocolError as exc:
             LOGGER.warning(
                 "Google OAuth callback failed",
                 extra={
@@ -284,7 +288,7 @@ async def finish_google_oauth(
                     "actor": "google",
                 },
             )
-            return _clear_flow_cookies(error_redirect("provider_error"), request, dep.config)
+            return _clear_flow_cookies(error_redirect(exc.result if is_test_flow else "provider_error"), request, dep.config)
 
         if is_test_flow:
             user = await dep.get_user_repository(session).get_by_uid(test_user_uid)
