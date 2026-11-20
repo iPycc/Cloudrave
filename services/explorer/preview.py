@@ -330,14 +330,16 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
         policy: StoragePolicy,
         manifest: PreviewManifestRead,
     ) -> None:
+        if manifest.metadata["extension"] == "svg":
+            return
+
         try:
             image_metadata = await self._cached_json(
                 node, "image-metadata", lambda: self._probe_image(node, mount, policy),
             )
         except (OSError, UnidentifiedImageError, Image.DecompressionBombError) as exc:
             manifest.metadata["probe_error"] = "Image metadata unavailable"
-            if manifest.metadata["extension"] != "svg":
-                manifest.error = str(exc)
+            manifest.error = str(exc)
             return
 
         manifest.metadata.update(image_metadata)
