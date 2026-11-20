@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Executor
 from dataclasses import dataclass
+from functools import partial
 
 from models.tables import BucketMount, StoragePolicy
 from store.manager import StorageManager
@@ -32,8 +34,9 @@ class BucketPage:
 
 
 class BucketScanner:
-    def __init__(self, storage_manager: StorageManager) -> None:
+    def __init__(self, storage_manager: StorageManager, *, executor: Executor | None = None) -> None:
         self.storage_manager = storage_manager
+        self._call = partial(call_adapter, executor=executor)
 
     async def list_page(
         self,
@@ -44,7 +47,7 @@ class BucketScanner:
         page_size: int,
     ) -> BucketPage:
         adapter = self.storage_manager.get_adapter(policy)
-        page = await call_adapter(
+        page = await self._call(
             adapter,
             "list_objects",
             policy,
@@ -70,9 +73,9 @@ class BucketScanner:
             if is_directory or invalid:
                 identity = ""
             elif hasattr(adapter, "listed_physical_id"):
-                identity = await call_adapter(adapter, "listed_physical_id", policy, mount, raw)
+                identity = await self._call(adapter, "listed_physical_id", policy, mount, raw)
             else:
-                identity = await call_adapter(adapter, "physical_id", policy, mount, raw.object_key)
+                identity = await self._call(adapter, "physical_id", policy, mount, raw.object_key)
             version_id = _optional_text(raw.version_id)
             items.append(
                 BucketItem(
@@ -98,7 +101,7 @@ class BucketScanner:
     async def exists(self, policy: StoragePolicy, mount: BucketMount, key: str) -> bool:
         adapter = self.storage_manager.get_adapter(policy)
         try:
-            await call_adapter(adapter, "head_object", policy, mount, key)
+            await self._call(adapter, "head_object", policy, mount, key)
         except Exception as exc:
             if is_not_found(exc):
                 return False

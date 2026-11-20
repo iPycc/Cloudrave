@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 import logging
@@ -46,7 +47,7 @@ def _is_transient(exc: Exception) -> bool:
         return False
 
 
-def sync_service(dep, session) -> MountSyncService:
+def sync_service(dep, session, *, executor: ThreadPoolExecutor | None = None) -> MountSyncService:
     return MountSyncService(
         session=session,
         mounts=dep.get_mount_repository(session),
@@ -54,7 +55,7 @@ def sync_service(dep, session) -> MountSyncService:
         nodes=dep.get_node_repository(session),
         objects=dep.get_object_repository(session),
         audits=dep.get_audit_repository(session),
-        scanner=BucketScanner(dep.storage_manager),
+        scanner=BucketScanner(dep.storage_manager, executor=executor),
     )
 
 
@@ -140,10 +141,13 @@ class MountSyncWorker:
         self.manager = manager
         self.interval = interval
         self.task: asyncio.Task | None = None
+        self._storage_executor: ThreadPoolExecutor | None = None
         self._next_conflict_prune = 0.0
 
     def start(self) -> None:
         if self.task is None or self.task.done():
+            if self._storage_executor is None:
+                self._storage_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cloudrave-import")
             self.task = asyncio.create_task(self._loop(), name="mount-sync-worker")
 
     async def stop(self) -> None:
@@ -152,6 +156,9 @@ class MountSyncWorker:
             with suppress(asyncio.CancelledError):
                 await self.task
             self.task = None
+        if self._storage_executor is not None:
+            self._storage_executor.shutdown(wait=False, cancel_futures=True)
+            self._storage_executor = None
 
     async def _loop(self) -> None:
         while True:
@@ -257,7 +264,7 @@ class MountSyncWorker:
                 state = MountSyncService._state(mount)
                 complete = state.get("generation") == task.generation and state.get("status") == "complete"
                 if not complete:
-                    result = await sync_service(self.dep, session).run(
+                    result = await sync_service(self.dep, session, executor=self._storage_executor).run(
                         request, actor, task.mount_id, MountSyncRequest(page_size=200),
                         generation=task.generation, lease=(task_id, token),
                     )
