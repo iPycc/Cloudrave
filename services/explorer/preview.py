@@ -34,6 +34,7 @@ from schemas.preview import (
 from security.jwt import AuthError, TokenService
 from security.capabilities import Capability, has_capability, require_capability
 from services.explorer.download import DownloadFileService
+from services.explorer.new_file import new_file_path, put_new_file
 from services.explorer.write_policy import StorageWritePolicy
 from services.explorer.view.arc import ARCHIVE_READ_ERRORS, ArcMixin
 from services.explorer.view.base import (
@@ -632,17 +633,13 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
         existing = await self.nodes.get_child_names(source.mount_id, source.parent_id)
         target_name = _unique_name(safe_name, existing)
         adapter = self.storage_manager.get_adapter(policy)
-        object_key = managed_key(
-            actor.id,
-            target_name,
-            style=str((mount.extra or {}).get("object_key_style", "readable")),
-        )
-        stored = await call_adapter(
+        file_path = await new_file_path(self.nodes, self.objects, adapter, policy, mount, source.parent_id, target_name)
+        object_key = file_path.key
+        stored = await put_new_file(
             adapter,
-            "put_object",
             policy,
             mount,
-            object_key,
+            file_path,
             payload,
             mime_type=mime_type,
             metadata={"origin": "preview_image_edit", "source_node_id": str(source.id)},
@@ -655,19 +652,18 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
             blob_path=object_key,
             size=len(payload),
         )
+        extra = {"origin": "preview_image_edit", "source_node_id": source.id, "etag": getattr(stored, "etag", None)}
+        if file_path.blob_id is not None:
+            extra["path_blob_id"] = file_path.blob_id
         await self.objects.create_or_update(
             node_id=created.id,
             policy_id=policy.id,
             blob_path=object_key,
-            physical_id=await call_adapter(adapter, "physical_id", policy, mount, object_key),
+            physical_id=file_path.physical_id or await call_adapter(adapter, "physical_id", policy, mount, object_key),
             revive_physical=True,
             checksum=hashlib.sha256(payload).hexdigest(),
             content_type=mime_type,
-            extra={
-                "origin": "preview_image_edit",
-                "source_node_id": source.id,
-                "etag": getattr(stored, "etag", None),
-            },
+            extra=extra,
         )
         await self.audits.create(
             actor_id=actor.id,

@@ -11,6 +11,7 @@ from models.enums import NodeType
 from models.tables import User
 from repositories.nodes import _unique_name
 from services.explorer.archive import ArchiveService
+from services.explorer.new_file import new_file_path, put_new_file
 from services.explorer.preview import build_local_preview_response
 from services.explorer.proxy import remote_response
 from services.explorer.shared import SharedService
@@ -18,7 +19,6 @@ from services.explorer.share import require_share_preview
 from services.explorer.write_policy import StorageWritePolicy
 from services.explorer.source import FileSourceService, download_probe_response
 from store.call import call_adapter
-from store.key import managed_key
 
 
 class SharedIo:
@@ -129,19 +129,17 @@ class SharedIo:
         resolved_node, source_mount, source_policy = await self.source.resolve_shared(source_node.id)
         source_adapter = self.source.storage_manager.get_adapter(source_policy)
         target_adapter = self.source.storage_manager.get_adapter(target_policy)
-        object_key = managed_key(
-            actor.id,
-            name,
-            style=str((target_mount.extra or {}).get("object_key_style", "readable")),
+        file_path = await new_file_path(
+            self.source.nodes, self.source.objects, target_adapter, target_policy, target_mount, target_parent_id, name,
         )
+        object_key = file_path.key
         stream = await call_adapter(source_adapter, "open_object", source_policy, source_mount, resolved_node.blob_path)
         with closing(stream):
-            stored = await call_adapter(
+            stored = await put_new_file(
                 target_adapter,
-                "put_object",
                 target_policy,
                 target_mount,
-                object_key,
+                file_path,
                 stream,
                 mime_type=mimetypes.guess_type(name)[0] or "application/octet-stream",
                 metadata={"origin": "shared_save"},
@@ -154,17 +152,22 @@ class SharedIo:
             blob_path=object_key,
             size=source_node.size,
         )
+        extra = {
+            "origin": "shared_save",
+            "etag": getattr(stored, "etag", None),
+            "version_id": getattr(stored, "version_id", None),
+        }
+        if file_path.blob_id is not None:
+            extra["path_blob_id"] = file_path.blob_id
         await self.source.objects.create_or_update(
             node_id=created.id,
             policy_id=target_policy.id,
             blob_path=object_key,
-            physical_id=await call_adapter(target_adapter, "physical_id", target_policy, target_mount, object_key),
+            physical_id=file_path.physical_id or await call_adapter(
+                target_adapter, "physical_id", target_policy, target_mount, object_key,
+            ),
             revive_physical=True,
             content_type=mimetypes.guess_type(name)[0] or "application/octet-stream",
-            extra={
-                "origin": "shared_save",
-                "etag": getattr(stored, "etag", None),
-                "version_id": getattr(stored, "version_id", None),
-            },
+            extra=extra,
         )
         return created

@@ -229,10 +229,12 @@ class PathPlanWorker:
                         if record is None or record.policy_id != policy.id:
                             raise ValueError("source_missing")
                         item["source"], item["physical_id"] = record.blob_path, record.physical_id
-                        item["etag"] = (record.extra or {}).get("etag")
+                        extra = record.extra or {}
+                        item["etag"] = extra.get("etag")
+                        blob_id = extra.get("path_blob_id") or uuid5(NAMESPACE_URL, f"cloudrave:{mount.id}:{node.id}").hex
                         item["target"] = format_object_key(task.template, directory="/".join(components[:-1]),
-                            filename=components[-1], blob_id=uuid5(NAMESPACE_URL, f"cloudrave:{mount.id}:{node.id}").hex)
-                        if (record.extra or {}).get("origin") == "bucket_import":
+                            filename=components[-1], blob_id=blob_id)
+                        if extra.get("origin") == "bucket_import":
                             raise ValueError("external_readonly")
                     else:
                         item["target"] = format_directory_key(task.template, "/".join(components))

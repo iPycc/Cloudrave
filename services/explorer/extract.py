@@ -23,12 +23,12 @@ import py7zr
 
 from models.enums import NodeType, UserStatus
 from security.capabilities import Capability, require_capability
+from services.explorer.new_file import new_file_path, put_new_file
 from services.explorer.write_policy import StorageWritePolicy
 from services.explorer.archive_limits import BoundedArchiveFactory
 from repositories.nodes import _unique_name
 from schemas.task import BackgroundTaskRead
 from store.call import call_adapter
-from store.key import managed_key
 
 
 MAX_ENTRIES = 10_000
@@ -325,7 +325,6 @@ async def _persist_uploaded_file(
     source: _ExtractSource,
     parent_id: int,
     filename: str,
-    object_key: str,
     size: int,
     checksum: str,
     content_type: str,
@@ -343,22 +342,27 @@ async def _persist_uploaded_file(
             if (parent is None or parent.owner_id != task.owner_id or parent.mount_id != mount.id
                     or parent.type != NodeType.FOLDER or parent.deleted_at is not None):
                 raise HTTPException(status_code=404, detail="Target folder not found")
-            adapter = dep.storage_manager.get_adapter(policy)
-            stored = await call_adapter(adapter, "put_object", policy, mount, object_key, payload,
-                mime_type=content_type, metadata={"origin": "archive_extract"})
-            object_written = True
             siblings = await nodes.get_child_names(mount.id, parent_id)
             target_name = _unique_name(filename, siblings)
+            adapter = dep.storage_manager.get_adapter(policy)
+            objects = dep.get_object_repository(session)
+            file_path = await new_file_path(nodes, objects, adapter, policy, mount, parent_id, target_name)
+            object_key = file_path.key
+            stored = await put_new_file(adapter, policy, mount, file_path, payload,
+                mime_type=content_type, metadata={"origin": "archive_extract"})
+            object_written = True
             created = await nodes.create_file(owner_id=task.owner_id, mount_id=mount.id,
                 parent_id=parent_id, name=target_name, blob_path=object_key, size=size)
-            await dep.get_object_repository(session).create_or_update(
+            extra = {"origin": "archive_extract", "etag": getattr(stored, "etag", None)}
+            if file_path.blob_id is not None:
+                extra["path_blob_id"] = file_path.blob_id
+            await objects.create_or_update(
                 node_id=created.id, policy_id=policy.id, blob_path=object_key,
-                physical_id=await call_adapter(adapter, "physical_id", policy, mount, object_key), revive_physical=True,
-                checksum=checksum, content_type=content_type,
-                extra={"origin": "archive_extract", "etag": getattr(stored, "etag", None)})
+                physical_id=file_path.physical_id or await call_adapter(adapter, "physical_id", policy, mount, object_key),
+                revive_physical=True, checksum=checksum, content_type=content_type, extra=extra)
         return target_name
     except BaseException:
-        if object_written:
+        if object_written and file_path.blob_id is None:
             await _cleanup_uploaded_object(adapter, source, object_key)
         raise
 
@@ -488,11 +492,6 @@ async def _run_extract_7z(
                     folder_ids=folder_ids,
                     parts=folder_parts,
                 )
-                object_key = managed_key(
-                    task.owner_id,
-                    filename,
-                    style=str((source_info.mount.extra or {}).get("object_key_style", "readable")),
-                )
                 content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
                 digest = hashlib.sha256()
                 with payload_path.open("rb") as entry, tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024) as payload:
@@ -502,7 +501,7 @@ async def _run_extract_7z(
                         payload.write(chunk)
                     payload.seek(0)
                     await _persist_uploaded_file(dep, task, source=source_info, parent_id=parent_id,
-                        filename=filename, object_key=object_key, size=payload_path.stat().st_size,
+                        filename=filename, size=payload_path.stat().st_size,
                         checksum=digest.hexdigest(), content_type=content_type, payload=payload)
                 written += int(info.uncompressed or payload_path.stat().st_size)
                 _update(
@@ -607,11 +606,6 @@ async def _run_extract(
                         folder_ids=folder_ids,
                         parts=folder_parts,
                     )
-                    object_key = managed_key(
-                        task.owner_id,
-                        filename,
-                        style=str((source_info.mount.extra or {}).get("object_key_style", "readable")),
-                    )
                     content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
                     digest = hashlib.sha256()
                     with archive.open(info) as entry, tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024) as payload:
@@ -625,7 +619,7 @@ async def _run_extract(
                             payload.write(chunk)
                         payload.seek(0)
                         await _persist_uploaded_file(dep, task, source=source_info, parent_id=parent_id,
-                            filename=filename, object_key=object_key, size=actual_size,
+                            filename=filename, size=actual_size,
                             checksum=digest.hexdigest(), content_type=content_type, payload=payload)
                     written += info.file_size
                     _update(

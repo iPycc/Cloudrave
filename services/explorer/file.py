@@ -38,11 +38,11 @@ from schemas.node import (
 )
 from services.explorer.archive import ArchiveDownloadService
 from services.explorer.access import MountAccessPolicy
+from services.explorer.new_file import new_file_path, put_new_file
 from services.explorer.write_policy import StorageWritePolicy
 from services.explorer.gc import ObjectGc
 from services.user.response import build_avatar_url
 from store.call import call_adapter
-from store.key import managed_key
 from store.manager import StorageManager
 from core.log import LogOperation, LogOutcome
 from security.capabilities import Capability, require_capability
@@ -336,7 +336,7 @@ class FileExplorerService:
 
     async def create_file(self, request: Request, actor: User, payload: FileCreateRequest) -> NodeRead:
         require_capability(actor, Capability.FILE_EDIT)
-        mount, policy = await self._require_mount_write(actor, payload.mount_id)
+        mount, policy = await self.mount_access.write(actor, payload.mount_id, lock=True)
         parent = await self._resolve_parent_folder(mount, payload.parent_id)
         requested_name = payload.name.strip()
         if "/" in requested_name or "\\" in requested_name or requested_name in {".", ".."}:
@@ -360,18 +360,16 @@ class FileExplorerService:
                 counter += 1
             file_name = f"{base} ({counter}){suffix}"
 
-        object_key = managed_key(
-            actor.id,
-            file_name,
-            style=str((mount.extra or {}).get("object_key_style", "readable")),
-        )
         content_type = "text/markdown; charset=utf-8" if extension in {".md", ".markdown"} else "text/plain; charset=utf-8"
         adapter = self.storage_manager.get_adapter(policy)
+        file_path = await new_file_path(self.nodes, self.objects, adapter, policy, mount, parent.id, file_name)
+        object_key = file_path.key
 
         object_written = False
 
         async def cleanup_object() -> None:
-            if not object_written:
+            # A user-chosen path could be replaced externally after the write.
+            if not object_written or file_path.blob_id is not None:
                 return
             try:
                 await call_adapter(adapter, "delete_object", policy, mount, object_key, hard_delete=True)
@@ -379,12 +377,11 @@ class FileExplorerService:
                 LOGGER.exception("Failed to clean up object after text file creation failed", extra={"object_key": object_key})
 
         try:
-            await call_adapter(
+            stored = await put_new_file(
                 adapter,
-                "put_object",
                 policy,
                 mount,
-                object_key,
+                file_path,
                 b"",
                 mime_type=content_type,
             )
@@ -397,15 +394,18 @@ class FileExplorerService:
                 blob_path=object_key,
                 size=0,
             )
+            extra = {"origin": "managed_create"}
+            if file_path.blob_id is not None:
+                extra.update(path_blob_id=file_path.blob_id, etag=stored.etag)
             await self.objects.create_or_update(
                 node_id=node.id,
                 policy_id=policy.id,
                 blob_path=object_key,
-                physical_id=await call_adapter(adapter, "physical_id", policy, mount, object_key),
+                physical_id=file_path.physical_id or await call_adapter(adapter, "physical_id", policy, mount, object_key),
                 revive_physical=True,
                 checksum=hashlib.sha256(b"").hexdigest(),
                 content_type=content_type,
-                extra={"origin": "managed_create"},
+                extra=extra,
             )
             await self.audits.create(
                 actor_id=actor.id,
