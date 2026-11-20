@@ -36,6 +36,7 @@ from services.explorer.up_check import (
     validate_part_number,
 )
 from services.explorer.access import MountAccessPolicy
+from services.explorer.oss_upload_errors import call_upload_storage
 from services.explorer.path_write import new_file_path, object_path_template
 from services.explorer.write_policy import ensure_capacity
 from services.explorer.up_abort import cleanup_upload
@@ -203,7 +204,7 @@ class CreateUploadSessionService:
                     await self.uploads.sync_parts(record.id, [(1, stored.etag or "part-1", record.size)])
             elif record.mode == UploadMode.MULTIPART and adapter.capabilities.supports_part_listing:
                 try:
-                    storage_parts = await call_adapter(
+                    storage_parts = await call_upload_storage(
                         adapter, "list_parts", policy, mount, self._build_upload_state(record, policy, mount),
                     )
                 except Exception as exc:
@@ -319,7 +320,7 @@ class CreateUploadSessionService:
             upload_state = self._build_upload_state(record, policy, mount)
             upload_state.metadata["part_checksum"] = hashlib.md5(await file.read(expected_size + 1)).hexdigest()
             await file.seek(0)
-            part = await call_adapter(
+            part = await call_upload_storage(
                 adapter,
                 "upload_part",
                 policy,
@@ -426,7 +427,7 @@ class CreateUploadSessionService:
                         for part in parts
                     ]
                     if adapter.capabilities.supports_part_listing:
-                        storage_parts = await call_adapter(
+                        storage_parts = await call_upload_storage(
                             adapter,
                             "list_parts",
                             policy,
@@ -434,7 +435,7 @@ class CreateUploadSessionService:
                             upload_state,
                         )
                     self._validate_complete_parts(record, storage_parts)
-                    stored_object = await call_adapter(
+                    stored_object = await call_upload_storage(
                         adapter,
                         "complete_multipart_upload",
                         policy,
@@ -446,7 +447,7 @@ class CreateUploadSessionService:
                 else:
                     guarded = {"no_overwrite": True} if record.path_token else {}
                     try:
-                        stored_object = await call_adapter(
+                        stored_object = await call_upload_storage(
                             adapter,
                             "complete_multipart_upload",
                             policy,
@@ -468,7 +469,7 @@ class CreateUploadSessionService:
             if record.path_token:
                 self._check_path_object(record, stored_object)
             try:
-                await call_adapter(
+                await call_upload_storage(
                     adapter,
                     "validate_completed_object",
                     policy,
@@ -577,7 +578,7 @@ class CreateUploadSessionService:
     @staticmethod
     async def _head_path(adapter, policy, mount, key):
         try:
-            return await call_adapter(adapter, "head_object", policy, mount, key)
+            return await call_upload_storage(adapter, "head_object", policy, mount, key)
         except Exception as exc:
             if not is_not_found(exc):
                 raise
@@ -595,8 +596,13 @@ class CreateUploadSessionService:
         return adapter.provider_type == ALIYUN_OSS and record.mode == UploadMode.MULTIPART and not record.path_token
 
     async def _recover_missing_oss_upload(self, adapter, policy, mount, record, exc: Exception):
-        if not self._is_oss_blob_multipart(adapter, record) or storage_error_code(exc) != "NoSuchUpload":
+        if adapter.provider_type != ALIYUN_OSS or storage_error_code(exc) != "NoSuchUpload":
             raise exc
+        if record.path_token:
+            stored = await self._head_path(adapter, policy, mount, record.path)
+            if stored is not None:
+                self._check_path_object(record, stored)
+            return stored
         return await self._completed_oss_object(adapter, policy, mount, record)
 
     async def _completed_oss_object(self, adapter, policy, mount, record):

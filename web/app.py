@@ -158,7 +158,9 @@ def create_app(
             "If-Range",
             "Range",
         ],
-        expose_headers=["Accept-Ranges", "Content-Length", "Content-Range", "ETag", "Last-Modified"],
+        expose_headers=[
+            "Accept-Ranges", "Content-Length", "Content-Range", "ETag", "Last-Modified", "X-Request-ID", "X-Upload-Retryable",
+        ],
     )
     app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(AvatarBodyLimitMiddleware)
