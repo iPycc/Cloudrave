@@ -22,6 +22,7 @@ from repositories.objects import ObjectRepository
 from schemas.task import PathTemplatePreview
 from services.admin.sync import MountSyncService
 from services.admin.task_claim import LEASE_DURATION, claim_task
+from services.explorer.path_write import path_template_examples
 from store.call import call_adapter
 from store.copy_guard import source_identity
 from store.errors import is_not_found, storage_error_code
@@ -138,29 +139,14 @@ async def _path_plan_mount(dep, session, mount_id, owner_id, *, lock: bool):
     return mount, policy
 
 
-def _path_examples(adapter, policy, mount, template: str) -> PathTemplatePreview:
-    blob_id = "0123456789abcdef" * 2
-    try:
-        root = format_object_key(template, directory="", filename="说明.txt", blob_id=blob_id)
-        nested = format_object_key(template, directory="项目", filename="合同.pdf", blob_id=blob_id)
-        directory = format_directory_key(template, "项目")
-        return PathTemplatePreview(
-            root_key=adapter._key(policy, mount, root),
-            nested_key=adapter._key(policy, mount, nested),
-            directory_key=adapter._validate_physical_key(adapter._key(policy, mount, directory) + "/"),
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"路径模板无效：{exc}") from exc
-
-
 async def preview_path_template(dep, session, mount_id: int, owner_id: int, template: str) -> PathTemplatePreview:
     mount, policy = await _path_plan_mount(dep, session, mount_id, owner_id, lock=False)
-    return _path_examples(dep.storage_manager.get_adapter(policy), policy, mount, template)
+    return path_template_examples(dep.storage_manager.get_adapter(policy), policy, mount, template)
 
 
 async def start_path_plan(dep, session, mount_id: int, owner_id: int, template: str):
     mount, policy = await _path_plan_mount(dep, session, mount_id, owner_id, lock=True)
-    _path_examples(dep.storage_manager.get_adapter(policy), policy, mount, template)
+    path_template_examples(dep.storage_manager.get_adapter(policy), policy, mount, template)
     active = await session.scalar(select(PathPlanTask).where(
         PathPlanTask.mount_id == mount.id, PathPlanTask.status.in_(("pending", "running", "paused", "failed")),
         PathPlanTask.rename_to.is_(None), PathPlanTask.move_to.is_(None), PathPlanTask.copy_to.is_(None),

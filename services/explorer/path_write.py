@@ -8,6 +8,7 @@ from uuid import uuid4
 from fastapi import HTTPException
 
 from drives.ids import provider_id
+from schemas.task import PathTemplatePreview
 from services.explorer.up_path import UploadPath
 from store.call import call_adapter
 from store.errors import storage_error_code
@@ -31,6 +32,33 @@ def object_path_template(policy, mount) -> str | None:
     if not isinstance(template, str):
         raise HTTPException(status_code=422, detail="对象路径模板无效")
     return template
+
+
+def path_template_examples(adapter, policy, mount, template: str) -> PathTemplatePreview:
+    blob_id = "0123456789abcdef" * 2
+    try:
+        root = format_object_key(template, directory="", filename="说明.txt", blob_id=blob_id)
+        nested = format_object_key(template, directory="项目", filename="合同.pdf", blob_id=blob_id)
+        directory = format_directory_key(template, "项目")
+        return PathTemplatePreview(
+            root_key=adapter._key(policy, mount, root),
+            nested_key=adapter._key(policy, mount, nested),
+            directory_key=adapter._validate_physical_key(adapter._key(policy, mount, directory) + "/"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"路径模板无效：{exc}") from exc
+
+
+async def validate_mount_path(storage_manager, policy, mount) -> None:
+    template = object_path_template(policy, mount)
+    if template is None:
+        return
+    adapter = storage_manager.get_adapter(policy)
+    path_template_examples(adapter, policy, mount, template)
+    try:
+        await call_adapter(adapter, "_require_unversioned", policy)
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail="真实目录需要未启用版本控制的存储桶，请检查版本控制及其读取权限") from exc
 
 
 async def new_file_path(nodes, objects, adapter, policy, mount, parent_id: int | None, filename: str) -> NewFilePath:
