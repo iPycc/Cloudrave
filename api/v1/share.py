@@ -11,6 +11,7 @@ from web.mid.auth import get_current_user
 from web.mid.rate import share_password_rate_limit
 from models.enums import NodeType
 from models.tables import Node, ShareRecord, User
+from services.explorer.idempotency import execute_once
 from schemas.common import MessageResponse
 from schemas.preview import PreviewManifestRead
 from schemas.share import (
@@ -18,6 +19,7 @@ from schemas.share import (
     ShareCreateRequest,
     ShareNodeInfo,
     ShareRead,
+    ShareUpdateRequest,
     ShareVerifyRequest,
     SharedNodeRead,
 )
@@ -118,7 +120,10 @@ async def create_share(
 ) -> ShareRead:
     dep = request.app.state.dep
     async with dep.session_scope() as session:
-        return await _build_share_service(request, session).create_share(request, current_user, payload)
+        service = _build_share_service(request, session)
+        result = await execute_once(session, request, current_user, "share.create", payload,
+                                    lambda: service.create_share(request, current_user, payload))
+        return ShareRead.model_validate(result)
 
 
 @router.get("/my", response_model=list[ShareRead])
@@ -129,6 +134,18 @@ async def list_my_shares(
     dep = request.app.state.dep
     async with dep.session_scope() as session:
         return await _build_share_service(request, session).list_shares(current_user)
+
+
+@router.patch("/{share_id}", response_model=ShareRead)
+async def update_share(
+    share_id: str,
+    request: Request,
+    payload: ShareUpdateRequest = Body(...),
+    current_user: User = Depends(get_current_user),
+) -> ShareRead:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        return await _build_share_service(request, session).update_share(request, current_user, share_id, payload)
 
 
 @router.delete("/{share_id}", response_model=MessageResponse)

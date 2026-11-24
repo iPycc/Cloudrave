@@ -26,7 +26,7 @@ class _Uploads:
         self.states.append(target)
         return True
 
-    async def set_state(self, upload_session_id: str, state: UploadState):
+    async def set_state(self, upload_session_id: str, state: UploadState, *, reason: str | None = None):
         self.record.state = state
         self.states.append(state)
         return self.record
@@ -41,6 +41,8 @@ class _Lookup:
 
 
 class _Adapter:
+    provider_type = "tencent_cos"
+
     def __init__(self) -> None:
         self.deleted: list[str] = []
 
@@ -69,6 +71,7 @@ async def test_failed_upload_is_cleaned_and_expired() -> None:
         state=UploadState.FAILED,
         mode=UploadMode.SINGLE,
         path="blob/orphan.bin",
+        path_token=None,
         upload_id=None,
         part_size=1,
         size=1,

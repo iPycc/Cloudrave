@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from drives.ids import ALIYUN_OSS
 from models.enums import UploadMode, UploadState
-from models.tables import BucketMount, StoragePolicy, User
+from models.tables import BucketMount, DerivedTask, StoragePolicy, User
 from repositories.audit_logs import AuditLogRepository
 from repositories.mounts import BucketMountRepository
 from repositories.nodes import NodeRepository
@@ -36,6 +36,9 @@ from services.explorer.up_check import (
     validate_part_number,
 )
 from services.explorer.access import MountAccessPolicy
+from services.explorer.idempotency import idempotency_key as read_idempotency_key, request_digest
+from services.explorer.derived_job import hash_object
+from services.explorer.view.base import preview_kind, preview_version
 from services.explorer.oss_upload_errors import call_upload_storage
 from services.explorer.path_write import new_file_path, object_path_template
 from services.explorer.write_policy import ensure_capacity
@@ -73,6 +76,43 @@ class CreateUploadSessionService:
         self.mount_access = MountAccessPolicy(mounts=mounts, policies=policies)
 
     async def create(self, request: Request, actor: User, payload: UploadSessionCreate) -> UploadSessionPlan:
+        idempotency_key = read_idempotency_key(request)
+        request_hash = request_digest(payload) if idempotency_key else None
+        if idempotency_key:
+            existing = await self.uploads.get_by_idempotency_key(actor.id, idempotency_key)
+            if existing is not None:
+                if (
+                    existing.mount_id != payload.mount_id
+                    or existing.file_name != payload.file_name
+                    or existing.size != payload.size
+                    or (existing.request_hash is not None and existing.request_hash != request_hash)
+                ):
+                    raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="上传幂等键已经用于其他文件")
+                mount, policy = await self._require_mount_access(actor, existing.mount_id)
+                if existing.state in (UploadState.ABORTED, UploadState.EXPIRED):
+                    raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="原上传会话已结束，请创建新任务")
+                capability = self.storage_manager.get_adapter(policy).capabilities
+                part_size = max(existing.part_size, 1)
+                urls = []
+                if existing.mode == UploadMode.SINGLE and existing.state != UploadState.COMPLETED:
+                    urls = [await sign_put(
+                        self.storage_manager.get_adapter(policy), policy, mount, existing.path,
+                        existing.content_type, existing.checksum, path_token=existing.path_token,
+                    )]
+                return UploadSessionPlan(
+                    session_id=existing.id,
+                    upload_mode=existing.mode,
+                    upload_id=existing.upload_id,
+                    object_key=existing.path,
+                    part_size=part_size,
+                    part_count=max(1, (existing.size + part_size - 1) // part_size),
+                    upload_urls=urls,
+                    is_duplicate=existing.state == UploadState.COMPLETED,
+                    node_id=existing.node_id if existing.state == UploadState.COMPLETED else None,
+                    transport=capability.upload_transport,
+                    required_response_headers=["ETag"] if capability.requires_part_etag else [],
+                    part_checksum_algorithm=capability.part_checksum_algorithm,
+                )
         mount, policy = await self._require_mount_write(actor, payload.mount_id)
         adapter = self.storage_manager.get_adapter(policy)
         parent, file_name = await self.paths.target(
@@ -119,6 +159,8 @@ class CreateUploadSessionService:
                 )
                 session_record = await self.uploads.create_session(
                     owner_id=mount.owner_id,
+                    idempotency_key=idempotency_key,
+                    request_hash=request_hash,
                     mount_id=mount.id,
                     node_id=parent.id if parent else None,
                     path=existing_object.blob_path,
@@ -133,6 +175,8 @@ class CreateUploadSessionService:
                     state=UploadState.COMPLETED,
                 )
                 await self.uploads.bind_node(session_record.id, file_node.id)
+                if actor.thumbnails_enabled and preview_kind(file_node.name) == "image" and not file_node.name.lower().endswith(".svg"):
+                    self.session.add(DerivedTask(node_id=file_node.id, kind="thumbnail", version=preview_version(file_node)))
                 await self.audits.create(
                     actor_id=actor.id,
                     action="upload.dedup",
@@ -174,6 +218,8 @@ class CreateUploadSessionService:
             object_key=file_path.key,
             payload=payload,
             path_token=file_path.blob_id,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
         )
         await self.audits.create(
             actor_id=actor.id,
@@ -242,7 +288,13 @@ class CreateUploadSessionService:
         if record.state not in (UploadState.CREATED, UploadState.UPLOADING, UploadState.FAILED):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Upload session cannot issue part URLs")
         self._validate_part_number(record, part_number)
-        mount, policy = await self._require_mount_write(actor, record.mount_id)
+        mount, policy = await self._retry_mount(actor, record)
+        if record.state not in (UploadState.CREATED, UploadState.UPLOADING, UploadState.FAILED):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Upload session cannot issue part URLs")
+        if record.state == UploadState.FAILED:
+            resumed = await self.uploads.transition_state(record.id, expected=(UploadState.FAILED,), target=UploadState.UPLOADING)
+            if not resumed:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Upload session no longer accepts parts")
         await self.uploads.touch(record.id)
         adapter = self.storage_manager.get_adapter(policy)
         if record.mode == UploadMode.SINGLE:
@@ -308,7 +360,9 @@ class CreateUploadSessionService:
         if record.state not in (UploadState.CREATED, UploadState.UPLOADING, UploadState.FAILED):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Upload session cannot accept parts")
         expected_size = self._expected_part_size(record, part_number)
-        mount, policy = await self._require_mount_write(actor, record.mount_id)
+        mount, policy = await self._retry_mount(actor, record)
+        if record.state not in (UploadState.CREATED, UploadState.UPLOADING, UploadState.FAILED):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Upload session cannot accept parts")
         adapter = self.storage_manager.get_adapter(policy)
 
         resolved_etag = etag
@@ -365,6 +419,9 @@ class CreateUploadSessionService:
         record = await self._require_upload_access(actor, session_id)
         if record.state == UploadState.COMPLETED:
             return await self._to_read(record)
+        mount, policy = await self._retry_mount(actor, record)
+        if record.state == UploadState.COMPLETED:
+            return await self._to_read(record)
         claimed = await self.uploads.transition_state(
             record.id,
             expected=(UploadState.CREATED, UploadState.UPLOADING, UploadState.FAILED),
@@ -377,7 +434,6 @@ class CreateUploadSessionService:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Upload session is not in a completable state")
 
         try:
-            mount, policy = await self._require_mount_write(actor, record.mount_id)
             adapter = self.storage_manager.get_adapter(policy)
             declared_checksum = getattr(record, "checksum", None)
             physical_id = None
@@ -492,13 +548,11 @@ class CreateUploadSessionService:
             except IntegrityError as exc:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="目标位置已存在同名文件") from exc
 
-            checksum = None
-            if adapter.capabilities.upload_transport == "cloudrave":
-                checksum = await asyncio.to_thread(self._compute_sha256_from_adapter, adapter, policy, mount, record.path)
-                if declared_checksum and checksum != declared_checksum:
+            checksum = declared_checksum
+            if adapter.capabilities.upload_transport == "cloudrave" and declared_checksum:
+                computed = await asyncio.to_thread(hash_object, adapter, policy, mount, record.path)
+                if computed != declared_checksum:
                     raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Uploaded object checksum mismatch")
-            else:
-                checksum = declared_checksum
 
             await self.objects.create_or_update(
                 node_id=file_node.id,
@@ -517,6 +571,10 @@ class CreateUploadSessionService:
             )
             await self.uploads.bind_node(record.id, file_node.id)
             await self.uploads.set_state(record.id, UploadState.COMPLETED)
+            if checksum is None:
+                self.session.add(DerivedTask(node_id=file_node.id, kind="hash", version=preview_version(file_node)))
+            if actor.thumbnails_enabled and preview_kind(file_node.name) == "image" and not file_node.name.lower().endswith(".svg"):
+                self.session.add(DerivedTask(node_id=file_node.id, kind="thumbnail", version=preview_version(file_node)))
             await self.audits.create(
                 actor_id=actor.id,
                 action="upload.complete",
@@ -527,11 +585,11 @@ class CreateUploadSessionService:
                 request_id=getattr(request.state, "request_id", None),
             )
             return await self._to_read(record)
-        except Exception:
+        except Exception as exc:
             await self.session.rollback()
             failed = await self.uploads.get_session(session_id)
             if failed is not None and failed.state not in (UploadState.COMPLETED, UploadState.ABORTED, UploadState.EXPIRED):
-                await self.uploads.set_state(session_id, UploadState.FAILED)
+                await self.uploads.set_state(session_id, UploadState.FAILED, reason=str(exc))
                 await self.session.commit()
             raise
 
@@ -626,6 +684,13 @@ class CreateUploadSessionService:
     async def _require_mount_write(self, actor: User, mount_id: int) -> tuple[BucketMount, StoragePolicy]:
         return await self.mount_access.write(actor, mount_id, lock=True)
 
+    async def _retry_mount(self, actor: User, record) -> tuple[BucketMount, StoragePolicy]:
+        mount, policy = await self._require_mount_write(actor, record.mount_id)
+        await self.session.refresh(record)
+        if record.state == UploadState.FAILED:
+            await ensure_capacity(mount, record.size, nodes=self.nodes, uploads=self.uploads)
+        return mount, policy
+
     async def _require_mount_cleanup(self, actor: User, mount_id: int) -> tuple[BucketMount, StoragePolicy]:
         return await self.mount_access.cleanup(actor, mount_id)
 
@@ -636,19 +701,6 @@ class CreateUploadSessionService:
         if record.owner_id != actor.id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Upload session access denied")
         return record
-
-    def _compute_sha256_from_adapter(
-        self,
-        adapter,
-        policy,
-        mount,
-        object_key: str,
-    ) -> str:
-        hasher = hashlib.sha256()
-        with adapter.open_object(policy, mount, object_key) as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                hasher.update(chunk)
-        return hasher.hexdigest()
 
     @staticmethod
     def _part_count(record) -> int:
@@ -691,6 +743,9 @@ class CreateUploadSessionService:
             part_size=record.part_size,
             created_at=record.created_at,
             updated_at=record.updated_at,
+            expires_at=record.expires_at,
+            last_seen_at=record.last_seen_at,
+            error_reason=record.error_reason,
             transport=capability.upload_transport,
             required_response_headers=["ETag"] if capability.requires_part_etag else [],
             part_checksum_algorithm=capability.part_checksum_algorithm,

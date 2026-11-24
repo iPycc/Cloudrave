@@ -458,9 +458,14 @@ class ShareItem(Base):
 
 class UploadSessionRecord(Base, TimestampMixin):
     __tablename__ = "upload_sessions"
+    __table_args__ = (
+        Index("ix_upload_sessions_owner_idempotency", "owner_id", "idempotency_key", unique=True),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    request_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     mount_id: Mapped[int] = mapped_column(ForeignKey("bucket_mounts.id", ondelete="CASCADE"), index=True)
     node_id: Mapped[int | None] = mapped_column(ForeignKey("nodes.id", ondelete="SET NULL"), nullable=True)
     path: Mapped[str] = mapped_column(String(1024))
@@ -474,6 +479,9 @@ class UploadSessionRecord(Base, TimestampMixin):
     provider_checksum: Mapped[str | None] = mapped_column(String(128), nullable=True)
     size: Mapped[int] = mapped_column(BigInteger, default=0)
     part_size: Mapped[int] = mapped_column(BigInteger, default=0)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
 
 class UploadPartRecord(Base):
@@ -505,3 +513,34 @@ class AuditLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     __table_args__ = (Index("ix_audit_logs_actor_created", "actor_id", "created_at"),)
+
+
+class IdempotencyRecord(Base):
+    __tablename__ = "idempotency_records"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    operation: Mapped[str] = mapped_column(String(40))
+    key: Mapped[str] = mapped_column(String(128))
+    request_hash: Mapped[str] = mapped_column(String(64))
+    response: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (UniqueConstraint("owner_id", "operation", "key", name="uq_idempotency_owner_operation_key"),)
+
+
+class DerivedTask(Base):
+    __tablename__ = "derived_tasks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(20))
+    version: Mapped[str] = mapped_column(String(20))
+    state: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (UniqueConstraint("node_id", "kind", "version", name="uq_derived_node_kind_version"),)

@@ -85,6 +85,7 @@ class NodeRenameRequest(CloudraveSchema):
 class NodeMoveRequest(CloudraveSchema):
     node_ids: list[int] = Field(min_length=1)
     target_parent_id: int | None = None
+    on_conflict: Literal["rename", "replace", "skip", "error"] = "rename"
 
 
 class NodeCopyRequest(CloudraveSchema):

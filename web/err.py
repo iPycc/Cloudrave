@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -52,7 +53,14 @@ async def logged_http_exception_handler(
     exc: StarletteHTTPException,
 ) -> Response:
     request.state.failure_reason = _http_failure_reason(exc.detail)
-    return await http_exception_handler(request, exc)
+    response = await http_exception_handler(request, exc)
+    payload = json.loads(response.body)
+    payload.setdefault("code", {
+        401: "authentication_required", 403: "permission_denied", 404: "not_found",
+        409: "conflict", 413: "quota_exceeded", 429: "rate_limited",
+    }.get(exc.status_code, "request_failed" if exc.status_code < 500 else "service_unavailable"))
+    payload["request_id"] = request.state.request_id
+    return JSONResponse(status_code=exc.status_code, content=payload, headers=exc.headers)
 
 
 async def logged_validation_exception_handler(
@@ -60,7 +68,10 @@ async def logged_validation_exception_handler(
     exc: RequestValidationError,
 ) -> Response:
     request.state.failure_reason = _validation_failure_reason(exc)
-    return await request_validation_exception_handler(request, exc)
+    response = await request_validation_exception_handler(request, exc)
+    payload = json.loads(response.body)
+    payload.update(code="validation_error", request_id=request.state.request_id)
+    return JSONResponse(status_code=response.status_code, content=payload)
 
 
 async def remote_protocol_exception_handler(
@@ -70,11 +81,20 @@ async def remote_protocol_exception_handler(
     detail = _single_line(exc)
     request.state.failure_reason = detail
     if isinstance(exc, RemoteAuthenticationError):
-        return JSONResponse(status_code=409, content={"detail": detail, "code": "storage_reauthorization_required"})
-    return JSONResponse(status_code=502, content={"detail": detail})
+        return JSONResponse(status_code=409, content={"detail": detail, "code": "storage_reauthorization_required",
+                                                     "request_id": request.state.request_id})
+    return JSONResponse(status_code=502, content={"detail": detail, "code": "storage_unavailable",
+                                                 "request_id": request.state.request_id})
+
+
+async def unexpected_exception_handler(request: Request, exc: Exception) -> Response:
+    request.state.failure_reason = _single_line(exc)
+    return JSONResponse(status_code=500, content={"detail": "服务器暂时无法完成请求", "code": "internal_error",
+                                                  "request_id": request.state.request_id})
 
 
 def install_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(StarletteHTTPException, logged_http_exception_handler)
     app.add_exception_handler(RequestValidationError, logged_validation_exception_handler)
     app.add_exception_handler(RemoteProtocolError, remote_protocol_exception_handler)
+    app.add_exception_handler(Exception, unexpected_exception_handler)

@@ -150,6 +150,7 @@ def create_app(
             "Authorization",
             "Content-Type",
             "X-Request-ID",
+            "Idempotency-Key",
             "X-Device-Fingerprint",
             "X-Cloudrave-Local-Write",
             "X-Cloudrave-Local-Part",

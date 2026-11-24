@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import Field, field_validator
@@ -62,6 +63,13 @@ UploadCorsStatus = Literal["ready", "same_origin", "read_only", "blocked", "miss
 
 class UploadCorsRead(CloudraveSchema):
     status: UploadCorsStatus
+
+
+class MountHealthRead(CloudraveSchema):
+    status: Literal["healthy", "reauthorization_required", "failed"]
+    detail: str
+    checked_at: datetime
+    capabilities: dict[str, bool] = Field(default_factory=dict)
 
 
 class UserMountDeletePreview(CloudraveSchema):

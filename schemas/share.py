@@ -25,6 +25,11 @@ class ShareCreateRequest(CloudraveSchema):
         return self
 
 
+class ShareUpdateRequest(CloudraveSchema):
+    expires_in_hours: int | None = Field(default=None, ge=1, le=720)
+    max_downloads: int | None = Field(default=None, ge=1, le=100000)
+
+
 class ShareRead(CloudraveSchema):
     id: str
     node_id: int

@@ -49,6 +49,7 @@ async def test_completed_upload_retry_returns_existing_result_without_storage_io
 async def test_in_progress_completion_returns_conflict_without_repeating_storage_io():
     service = object.__new__(CreateUploadSessionService)
     service._require_upload_access = AsyncMock(return_value=SimpleNamespace(id="id", state=UploadState.COMPLETING))
+    service._retry_mount = AsyncMock(return_value=("mount", "policy"))
     service.uploads = SimpleNamespace(transition_state=AsyncMock(return_value=False))
     service.session = SimpleNamespace(refresh=AsyncMock())
     with pytest.raises(HTTPException) as error:
@@ -89,6 +90,7 @@ async def test_sync_parts_replaces_stale_database_records(tmp_path):
 @pytest.mark.asyncio
 async def test_get_upload_reconciles_provider_parts_before_returning_session():
     class _Adapter:
+        provider_type = "tencent_cos"
         capabilities = SimpleNamespace(supports_part_listing=True)
 
         def list_parts(self, policy, mount, upload):
@@ -102,6 +104,7 @@ async def test_get_upload_reconciles_provider_parts_before_returning_session():
         mount_id=9,
         mode=UploadMode.MULTIPART,
         state=UploadState.UPLOADING,
+        path_token=None,
     )
     service = object.__new__(CreateUploadSessionService)
     service._require_upload_access = AsyncMock(return_value=record)

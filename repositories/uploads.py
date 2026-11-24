@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +12,7 @@ from models.tables import UploadPartRecord, UploadSessionRecord
 
 
 TERMINAL_STATES = (UploadState.COMPLETED, UploadState.ABORTED, UploadState.EXPIRED)
+UPLOAD_LIFETIME = timedelta(days=7)
 
 
 class UploadRepository:
@@ -22,6 +23,8 @@ class UploadRepository:
         self,
         *,
         owner_id: int,
+        idempotency_key: str | None = None,
+        request_hash: str | None = None,
         mount_id: int,
         node_id: int | None,
         path: str,
@@ -38,6 +41,8 @@ class UploadRepository:
     ) -> UploadSessionRecord:
         record = UploadSessionRecord(
             owner_id=owner_id,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
             mount_id=mount_id,
             node_id=node_id,
             path=path,
@@ -51,10 +56,20 @@ class UploadRepository:
             provider_checksum=provider_checksum,
             size=size,
             part_size=part_size,
+            expires_at=datetime.now(UTC) + UPLOAD_LIFETIME,
+            last_seen_at=datetime.now(UTC),
         )
         self.session.add(record)
         await self.session.flush()
         return record
+
+    async def get_by_idempotency_key(self, owner_id: int, key: str) -> UploadSessionRecord | None:
+        return await self.session.scalar(
+            select(UploadSessionRecord).where(
+                UploadSessionRecord.owner_id == owner_id,
+                UploadSessionRecord.idempotency_key == key,
+            )
+        )
 
     async def get_session(self, upload_session_id: str) -> UploadSessionRecord | None:
         return await self.session.get(UploadSessionRecord, upload_session_id)
@@ -108,7 +123,10 @@ class UploadRepository:
                     UploadSessionRecord.state == UploadState.ABORTING,
                     and_(
                         UploadSessionRecord.state.in_((*stale_states, UploadState.FAILED)),
-                        UploadSessionRecord.updated_at <= stale_before,
+                        or_(
+                            UploadSessionRecord.expires_at <= datetime.now(UTC),
+                            and_(UploadSessionRecord.expires_at.is_(None), UploadSessionRecord.updated_at <= stale_before),
+                        ),
                     ),
                 )
             )
@@ -171,11 +189,12 @@ class UploadRepository:
         await self.session.flush()
         return record
 
-    async def set_state(self, upload_session_id: str, state: UploadState) -> UploadSessionRecord | None:
+    async def set_state(self, upload_session_id: str, state: UploadState, *, reason: str | None = None) -> UploadSessionRecord | None:
         record = await self.get_session(upload_session_id)
         if record is None:
             return None
         record.state = state
+        record.error_reason = reason[:500] if state == UploadState.FAILED and reason else None
         await self.session.flush()
         return record
 
@@ -183,7 +202,8 @@ class UploadRepository:
         record = await self.get_session(upload_session_id)
         if record is None:
             return None
-        record.updated_at = datetime.now(UTC)
+        record.updated_at = record.last_seen_at = datetime.now(UTC)
+        record.expires_at = record.last_seen_at + UPLOAD_LIFETIME
         await self.session.flush()
         return record
 
@@ -196,7 +216,8 @@ class UploadRepository:
                     (UploadState.CREATED, UploadState.UPLOADING, UploadState.COMPLETING, UploadState.FAILED)
                 ),
             )
-            .values(updated_at=datetime.now(UTC))
+            .values(updated_at=datetime.now(UTC), last_seen_at=datetime.now(UTC),
+                    expires_at=datetime.now(UTC) + UPLOAD_LIFETIME)
             .execution_options(synchronize_session=False)
         )
         await self.session.flush()
@@ -217,7 +238,7 @@ class UploadRepository:
                 UploadSessionRecord.id == upload_session_id,
                 UploadSessionRecord.state.in_(expected),
             )
-            .values(state=target, updated_at=datetime.now(UTC))
+            .values(state=target, updated_at=datetime.now(UTC), error_reason=None)
             .execution_options(synchronize_session=False)
         )
         await self.session.flush()
