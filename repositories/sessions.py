@@ -72,12 +72,20 @@ class SessionRepository:
         self,
         session_id: str,
         *,
+        expected_hash: str,
+        expected_version: int,
         refresh_token_hash: str,
         refresh_expires_at: datetime,
-    ) -> None:
-        await self.session.execute(
+    ) -> bool:
+        result = await self.session.execute(
             update(Session)
-            .where(Session.id == session_id, Session.revoked_at.is_(None))
+            .where(
+                Session.id == session_id,
+                Session.revoked_at.is_(None),
+                Session.status == SessionStatus.ACTIVE,
+                Session.refresh_token_hash == expected_hash,
+                Session.token_version == expected_version,
+            )
             .values(
                 refresh_token_hash=refresh_token_hash,
                 refresh_expires_at=refresh_expires_at,
@@ -85,3 +93,4 @@ class SessionRepository:
                 last_seen_at=datetime.now(UTC),
             )
         )
+        return result.rowcount == 1
