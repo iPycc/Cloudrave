@@ -528,8 +528,10 @@ class DatabaseMigrationManager:
             try:
                 await self.wait_for_business_writes()
                 if job.data_choice == "source":
+                    await dep.mount_health_worker.stop()
                     await dep.upload_cleanup_worker.stop()
                     await dep.gc_worker.stop()
+                    await dep.derived_worker.stop()
                     workers_stopped = True
                 self._set(job, phase="connecting", progress=5, detail="正在连接目标数据库")
                 target_config = self.config_for(job.target_backend)
@@ -597,7 +599,9 @@ class DatabaseMigrationManager:
                 self.maintenance = False
                 if workers_stopped:
                     dep.gc_worker.start()
+                    dep.derived_worker.start()
                     dep.upload_cleanup_worker.start()
+                    dep.mount_health_worker.start()
                 if target_engine is not None:
                     await target_engine.dispose()
 
