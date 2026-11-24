@@ -27,7 +27,7 @@
 
 ## 📖 简介
 
-Cloudrave 是基于 Python + FastAPI 的多用户文件管理服务，提供身份认证、文件管理、分享、回收站和在线预览 API。当前版本为 **v1.0.0-beta.4**。
+Cloudrave 是基于 Python + FastAPI 的多用户文件管理服务，提供身份认证、文件管理、分享、回收站和在线预览 API。当前开发版本为 **v1.0.0-beta.5**。
 
 后端采用异步 SQLAlchemy ORM，支持 SQLite、PostgreSQL 和 MySQL。存储策略可连接本地文件系统、腾讯云 COS、阿里云 OSS，以及 139 移动云盘、189 天翼云盘和联通云盘。
 
