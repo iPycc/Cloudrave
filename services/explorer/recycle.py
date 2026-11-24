@@ -120,7 +120,7 @@ class RecycleBinService:
             objects=self.objects,
             storage_manager=self.storage_manager,
         )
-        task_ids = await gc.stage(deleted_ids)
+        await gc.stage(deleted_ids)
         await self.objects.delete_by_node_ids(deleted_ids)
         await self.nodes.hard_delete(payload.node_ids)
         await self.audits.create(
@@ -132,8 +132,4 @@ class RecycleBinService:
             user_agent=request.headers.get("user-agent"),
             request_id=getattr(request.state, "request_id", None),
         )
-        await self.session.commit()
-        if task_ids:
-            await gc.run(task_ids)
-            await self.session.commit()
         return {"deleted_node_ids": deleted_ids}

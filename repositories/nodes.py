@@ -412,7 +412,7 @@ class NodeRepository:
         if not nodes:
             return []
         mount_id = nodes[0].mount_id
-        existing = await self.get_child_names(mount_id, target_parent_id)
+        existing = {child.name for child in await self.list_children(mount_id, target_parent_id, include_deleted=True)}
         for node in nodes:
             node.parent_id = target_parent_id
             node.name = _unique_name(node.name, existing)

@@ -9,6 +9,7 @@ from fastapi.responses import Response
 
 from web.mid.auth import get_current_user
 from models.tables import User
+from services.explorer.idempotency import execute_once
 from schemas.common import HealthResponse
 from schemas.mount import BucketMountRead
 from schemas.node import (
@@ -211,7 +212,8 @@ async def delete_nodes(
     dep = request.app.state.dep
     async with dep.session_scope() as session:
         service = node_service(dep, session)
-        return await service.delete_nodes(request, current_user, payload)
+        return await execute_once(session, request, current_user, "node.delete", payload,
+                                  lambda: service.delete_nodes(request, current_user, payload))
 
 
 @router.post("/node/move", response_model=list[NodeRead] | PathBatchQueued, responses={202: {"model": PathBatchQueued}})

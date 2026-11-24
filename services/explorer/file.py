@@ -490,7 +490,7 @@ class FileExplorerService:
                 objects=self.objects,
                 storage_manager=self.storage_manager,
             )
-            task_ids = await gc.stage(all_ids)
+            await gc.stage(all_ids)
             await self.objects.delete_by_node_ids(all_ids)
             await self.nodes.hard_delete(payload.node_ids)
             await self.audits.create(
@@ -515,10 +515,6 @@ class FileExplorerService:
                     "actor": actor.email,
                 },
             )
-            await self.session.commit()
-            if task_ids:
-                await gc.run(task_ids)
-                await self.session.commit()
             return {"deleted_node_ids": all_ids}
 
         deleted = await self.nodes.soft_delete(payload.node_ids)
@@ -550,15 +546,13 @@ class FileExplorerService:
         if not nodes:
             return []
         mount_id = nodes[0].mount_id
-        mount, policy = await self._require_mount_write(actor, mount_id)
+        mount, policy = await self.mount_access.write(actor, mount_id, lock=True)
         if any(node.mount_id != mount_id for node in nodes):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="All moved nodes must belong to one mount")
+        if any(node.deleted_at is not None or node.status != NodeStatus.ACTIVE for node in nodes):
+            raise HTTPException(status_code=404, detail="找不到要移动的条目")
 
         template = object_path_template(policy, mount)
-        if template is not None:
-            mount, policy = await self.mount_access.write(actor, mount_id, lock=True)
-            template = object_path_template(policy, mount)
-
         target_parent_id = payload.target_parent_id
         if target_parent_id is None:
             target = await self.nodes.ensure_mount_root(owner_id=mount.owner_id, mount_id=mount.id, name=mount.name)
@@ -567,22 +561,31 @@ class FileExplorerService:
             target = await self.nodes.get_by_id(target_parent_id)
             if target is None or target.mount_id != mount_id or target.type != NodeType.FOLDER:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target folder not found")
+        if target.deleted_at is not None or target.status != NodeStatus.ACTIVE:
+            raise HTTPException(status_code=404, detail="找不到目标文件夹")
 
         if template is not None:
-            if target.deleted_at is not None or target.status != NodeStatus.ACTIVE:
-                raise HTTPException(status_code=404, detail="找不到目标文件夹")
             task_ids = []
-            names = set()
+            names = {child.name: child for child in await self.nodes.list_children(mount_id, target_parent_id, include_deleted=True)}
             for node_id in dict.fromkeys(payload.node_ids):
                 node = await self.nodes.get_by_id_for_update(node_id)
                 if node is None or node.deleted_at is not None or node.status != NodeStatus.ACTIVE:
                     raise HTTPException(status_code=404, detail="找不到要移动的条目")
                 if node.parent_id == target_parent_id:
                     continue
-                if node.name in names or await self.nodes.get_child_any(mount_id, target_parent_id, node.name) is not None:
-                    raise HTTPException(status_code=409, detail=f"目标位置已有同名条目：{node.name}")
-                names.add(node.name)
-                task = await queue_path_operation(self.session, mount, policy, node, template, move_to=target_parent_id)
+                existing = names.get(node.name)
+                if existing is not None:
+                    if payload.on_conflict == "error":
+                        raise self._move_conflict(node, existing, replace_allowed=False)
+                    if payload.on_conflict == "skip":
+                        continue
+                    if payload.on_conflict == "replace":
+                        raise HTTPException(status_code=409, detail="当前存储的路径映射不支持覆盖移动")
+                new_name = _unique_name(node.name, set(names)) if existing is not None else node.name
+                names[new_name] = node
+                task = await queue_path_operation(self.session, mount, policy, node, template,
+                                                  rename_to=new_name if new_name != node.name else None,
+                                                  move_to=target_parent_id)
                 task_ids.append(task.id)
             return PathBatchQueued(task_ids=task_ids) if task_ids else []
 
@@ -599,7 +602,37 @@ class FileExplorerService:
                         detail="Cannot move a folder into its own subtree",
                     )
 
-        moved = await self.nodes.move_nodes(nodes, target_parent_id)
+        destinations = {child.name: child for child in await self.nodes.list_children(mount_id, target_parent_id, include_deleted=True)}
+        to_move: list[Node] = []
+        to_replace: list[Node] = []
+        for node in {node.id: node for node in nodes}.values():
+            if node.parent_id == target_parent_id:
+                continue
+            existing = destinations.get(node.name)
+            if existing is not None:
+                if payload.on_conflict == "error":
+                    raise self._move_conflict(node, existing, replace_allowed=True)
+                if payload.on_conflict == "skip":
+                    continue
+                if payload.on_conflict == "replace":
+                    if existing.id in moved_ids:
+                        raise HTTPException(status_code=409, detail="所选条目中有重名文件，无法同时覆盖")
+                    to_replace.append(existing)
+                    destinations.pop(node.name)
+            to_move.append(node)
+            destinations[node.name] = node
+
+        if to_replace:
+            replaced_ids = await self.nodes.collect_descendant_ids([node.id for node in to_replace])
+            if moved_ids.intersection(replaced_ids):
+                raise HTTPException(status_code=409, detail="不能覆盖包含待移动条目的文件夹")
+            gc = ObjectGc(mounts=self.mounts, nodes=self.nodes, policies=self.policies,
+                          objects=self.objects, storage_manager=self.storage_manager)
+            await gc.stage(replaced_ids)
+            await self.objects.delete_by_node_ids(replaced_ids)
+            await self.nodes.hard_delete([node.id for node in to_replace])
+
+        moved = await self.nodes.move_nodes(to_move, target_parent_id)
         await self.audits.create(
             actor_id=actor.id,
             action="node.move",
@@ -610,6 +643,15 @@ class FileExplorerService:
             request_id=getattr(request.state, "request_id", None),
         )
         return [NodeRead.model_validate(node) for node in moved]
+
+    @staticmethod
+    def _move_conflict(source: Node, existing: Node, *, replace_allowed: bool) -> HTTPException:
+        return HTTPException(status_code=409, detail={
+            "kind": "move_conflict",
+            "source": NodeRead.model_validate(source).model_dump(mode="json"),
+            "existing": NodeRead.model_validate(existing).model_dump(mode="json"),
+            "replace_allowed": replace_allowed,
+        })
 
     async def copy_nodes(self, request: Request, actor: User, payload: NodeCopyRequest) -> list[NodeRead] | PathBatchQueued:
         require_capability(actor, Capability.FILE_COPY)
