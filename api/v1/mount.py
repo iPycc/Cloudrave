@@ -13,6 +13,7 @@ from schemas.sync import MountSyncRead, MountSyncRequest
 from schemas.task import MountSyncTaskRead, PathMigrationRead, PathPlanRead, PathPlanRequest, PathTemplatePreview
 from schemas.user_mount import (
     OssDomainRequest,
+    MountHealthRead,
     UploadCorsRead,
     UserMountCreate,
     UserMountDeletePreview,
@@ -200,6 +201,19 @@ async def check_upload_cors(
     dep = request.app.state.dep
     async with dep.session_scope() as session:
         return await _service(request, session).check_upload_cors(current_user, mount_id, str(origin).rstrip("/"))
+
+
+@router.post("/{mount_id}/health", response_model=MountHealthRead)
+async def check_mount_health(
+    mount_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+) -> MountHealthRead:
+    require_mount_manager(current_user)
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        origin = request.headers.get("origin") or str(request.base_url).rstrip("/")
+        return await _service(request, session).check_health(current_user, mount_id, origin)
 
 
 @router.get("/{mount_id}/sync", response_model=MountSyncRead)

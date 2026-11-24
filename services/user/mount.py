@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import logging
+import asyncio
+import inspect
+from datetime import UTC, datetime
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -15,6 +18,7 @@ from models.enums import NodeType, UploadState
 from models.gc import GcTask
 from models.tables import BucketMount, Node, UploadSessionRecord, User
 from repositories.audit_logs import AuditLogRepository
+from repositories.gc import GcRepository
 from repositories.mounts import BucketMountRepository
 from repositories.nodes import NodeRepository
 from repositories.policies import StoragePolicyRepository
@@ -22,6 +26,7 @@ from repositories.uploads import UploadRepository
 from schemas.mount import BucketMountCreate, BucketMountRead, BucketMountUpdate, mount_read
 from schemas.policy import StoragePolicyCreate, StoragePolicyRead, StoragePolicyUpdate
 from schemas.user_mount import (
+    MountHealthRead,
     UploadCorsRead,
     UserBucketMountCreate,
     UserMountCreate,
@@ -36,6 +41,7 @@ from services.user.upload_cors import check_direct_upload_cors
 from store.call import call_adapter
 from store.manager import StorageManager
 from drives.ids import provider_id
+from drives.remote_drive.common import RemoteAuthenticationError
 
 
 LOGGER = logging.getLogger("cloudrave.store")
@@ -167,6 +173,8 @@ class UserMountService:
             ) from exc
 
         await self._audit(request, actor, "mount.update", mount, ",".join(mapping_changed) or "settings")
+        if connection_changed:
+            await self._audit(request, actor, "mount.reauthorize", mount, provider_id(policy.provider))
         return self._read(mount, policy)
 
     async def delete_preview(self, actor: User, mount_id: int) -> UserMountDeletePreview:
@@ -291,6 +299,128 @@ class UserMountService:
             return UploadCorsRead(status="unavailable")
         result = await check_direct_upload_cors(self.storage_manager.get_adapter(policy), policy, mount, origin)
         return UploadCorsRead(status=result)
+
+    async def check_health(self, actor: User, mount_id: int, origin: str = "") -> MountHealthRead:
+        mount = await self._owned_mount(actor, mount_id)
+        policy = await self._policy(mount.policy_id)
+        adapter = self.storage_manager.get_adapter(policy)
+        available = mount.is_enabled and policy.status == "active"
+        can_upload = available and not mount.read_only and (
+            adapter.capabilities.supports_multipart or adapter.capabilities.supports_single_put
+        )
+        capabilities = {
+            "download": available,
+            "upload": can_upload,
+            "multipart": can_upload and adapter.capabilities.supports_multipart,
+            "direct_upload": can_upload and adapter.capabilities.upload_transport == "presigned",
+            "batch": available and not mount.read_only and (
+                adapter.capabilities.supports_direct_write or provider_id(policy.provider) in {"tencent_cos", "aliyun_oss"}
+            ),
+        }
+        if self.storage_manager.remote_auth.status(policy):
+            result = MountHealthRead(status="reauthorization_required", detail="存储授权已失效", checked_at=datetime.now(UTC),
+                                     capabilities={name: False for name in capabilities})
+        elif not mount.is_enabled or policy.status != "active":
+            result = MountHealthRead(status="failed", detail="挂载或存储策略已停用", checked_at=datetime.now(UTC),
+                                     capabilities={name: False for name in capabilities})
+        else:
+            try:
+                await self._validate_storage(policy, mount)
+            except HTTPException as exc:
+                auth_failed = isinstance(exc.__cause__, RemoteAuthenticationError) or bool(self.storage_manager.remote_auth.status(policy))
+                result = MountHealthRead(status="reauthorization_required" if auth_failed else "failed",
+                                         detail=str(exc.__cause__ or exc.detail), checked_at=datetime.now(UTC),
+                                         capabilities={name: False for name in capabilities})
+            else:
+                try:
+                    probe_error = await self._probe_transfer(adapter, policy, mount, capabilities)
+                except Exception as exc:
+                    probe_error = f"存储能力探测失败：{exc}"
+                    capabilities = {name: False for name in capabilities}
+                if provider_id(policy.provider) in {"tencent_cos", "aliyun_oss"} and capabilities["direct_upload"]:
+                    try:
+                        cors = await check_direct_upload_cors(adapter, policy, mount, origin) if origin else "unavailable"
+                        capabilities["direct_upload"] = cors in {"ready", "same_origin"}
+                    except Exception as exc:
+                        capabilities["direct_upload"] = False
+                        probe_error = probe_error or f"CORS 检查失败：{exc}"
+                health_status = (
+                    "reauthorization_required" if probe_error and self.storage_manager.remote_auth.status(policy)
+                    else "failed" if probe_error else "healthy"
+                )
+                result = MountHealthRead(status=health_status,
+                                         detail=probe_error or "存储连接正常", checked_at=datetime.now(UTC),
+                                         capabilities=capabilities)
+        mount.extra = {**(mount.extra or {}), "_health": result.model_dump(mode="json")}
+        await self.session.flush()
+        return result
+
+    async def _probe_transfer(self, adapter, policy, mount, capabilities: dict[str, bool]) -> str | None:
+        if not capabilities["upload"] or provider_id(policy.provider) not in {"local_fs", "tencent_cos", "aliyun_oss"}:
+            return await self._probe_existing_download(adapter, policy, mount, capabilities)
+
+        key = f".cloudrave-health/{uuid4().hex}"
+        written = False
+        version_id = None
+        error = None
+        try:
+            stored = await call_adapter(adapter, "put_object", policy, mount, key, b"ok")
+            written = True
+            version = getattr(stored, "version_id", None)
+            version_id = version if version and str(version).lower() != "null" else None
+            if await self._read_probe(adapter, policy, mount, key) != b"ok":
+                raise OSError("读回内容与写入内容不一致")
+        except Exception as exc:
+            error = f"上传或下载探测失败：{exc}"
+            if not written:
+                capabilities["upload"] = False
+                capabilities["multipart"] = capabilities["direct_upload"] = capabilities["batch"] = False
+                return await self._probe_existing_download(adapter, policy, mount, capabilities) or error
+            capabilities["download"] = False
+        finally:
+            if written:
+                try:
+                    if version_id:
+                        await call_adapter(adapter, "delete_object_version", policy, mount, key, version_id)
+                    else:
+                        await call_adapter(adapter, "delete_object", policy, mount, key, hard_delete=True)
+                except Exception as exc:
+                    physical_id = await call_adapter(adapter, "physical_id", policy, mount, key)
+                    await GcRepository(self.session).create(policy_id=policy.id, mount_id=mount.id,
+                                                            blob_path=key, physical_id=physical_id,
+                                                            source_identity={"version_id": version_id} if version_id
+                                                            else {"managed_blob": True})
+                    error = f"健康探测对象清理失败：{exc}"
+        if not capabilities["upload"]:
+            capabilities["multipart"] = capabilities["direct_upload"] = capabilities["batch"] = False
+        return error
+
+    async def _probe_existing_download(self, adapter, policy, mount, capabilities: dict[str, bool]) -> str | None:
+        try:
+            page = await call_adapter(adapter, "list_objects", policy, mount, max_keys=1)
+            if page.objects:
+                if adapter.capabilities.download_transport == "browser":
+                    await call_adapter(adapter, "build_download_url", policy, mount,
+                                       page.objects[0].object_key, expires_in=60)
+                else:
+                    await self._read_probe(adapter, policy, mount, page.objects[0].object_key)
+        except Exception as exc:
+            capabilities["download"] = False
+            return f"下载探测失败：{exc}"
+        return None
+
+    @staticmethod
+    async def _read_probe(adapter, policy, mount, key: str) -> bytes:
+        stream = await call_adapter(adapter, "open_object", policy, mount, key)
+        try:
+            if inspect.iscoroutinefunction(stream.read):
+                return await stream.read(2)
+            return await asyncio.to_thread(stream.read, 2)
+        finally:
+            if inspect.iscoroutinefunction(stream.close):
+                await stream.close()
+            else:
+                await asyncio.to_thread(stream.close)
 
     async def require_owned_mount(self, actor: User, mount_id: int) -> BucketMount:
         return await self._owned_mount(actor, mount_id)
@@ -443,11 +573,11 @@ class UserMountService:
     async def _validate_storage(self, policy, mount: BucketMount) -> None:
         adapter = self.storage_manager.get_adapter(policy)
         definition = self.storage_manager.definition_for(policy.provider)
-        if definition.kind == "local":
-            await call_adapter(adapter, "prepare_mount_root", mount)
-            return
         try:
-            await call_adapter(adapter, "validate_mount", policy, mount)
+            if definition.kind == "local":
+                await call_adapter(adapter, "prepare_mount_root", mount)
+            else:
+                await call_adapter(adapter, "validate_mount", policy, mount)
         except Exception as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
