@@ -30,6 +30,11 @@ from db.mig.v18 import upgrade as upgrade_v18
 from db.mig.v19 import upgrade as upgrade_v19
 from db.mig.v20 import upgrade as upgrade_v20
 from db.mig.v21 import upgrade as upgrade_v21
+from db.mig.v22 import upgrade as upgrade_v22
+from db.mig.v23 import upgrade as upgrade_v23
+from db.mig.v24 import upgrade as upgrade_v24
+from db.mig.v25 import upgrade as upgrade_v25
+from db.mig.v26 import upgrade as upgrade_v26
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +66,11 @@ MIGRATIONS = (
     Migration(19, "storage-path-restore", upgrade_v19),
     Migration(20, "storage-guarded-cleanup", upgrade_v20),
     Migration(21, "upload-path-ownership", upgrade_v21),
+    Migration(22, "upload-idempotency", upgrade_v22),
+    Migration(23, "upload-lifecycle", upgrade_v23),
+    Migration(24, "operation-idempotency", upgrade_v24),
+    Migration(25, "upload-request-fingerprint", upgrade_v25),
+    Migration(26, "derived-file-tasks", upgrade_v26),
 )
 
 
