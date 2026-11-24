@@ -80,7 +80,7 @@ async def sign_put(
     )
 
 
-async def make_plan(*, uploads, storage_manager, policy, mount, parent, file_name, object_key, payload, path_token=None):
+async def make_plan(*, uploads, storage_manager, policy, mount, parent, file_name, object_key, payload, path_token=None, idempotency_key=None, request_hash=None):
     adapter = storage_manager.get_adapter(policy)
     capability = adapter.capabilities
     size = apply_threshold(
@@ -103,6 +103,8 @@ async def make_plan(*, uploads, storage_manager, policy, mount, parent, file_nam
         put = await sign_put(adapter, policy, mount, object_key, payload.content_type, payload.checksum, path_token=path_token)
         record = await uploads.create_session(
             owner_id=mount.owner_id,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
             mount_id=mount.id,
             node_id=parent.id if parent else None,
             path=object_key,
@@ -157,6 +159,8 @@ async def make_plan(*, uploads, storage_manager, policy, mount, parent, file_nam
     try:
         record = await uploads.create_session(
             owner_id=mount.owner_id,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
             mount_id=mount.id,
             node_id=parent.id if parent else None,
             path=object_key,

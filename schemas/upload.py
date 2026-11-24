@@ -112,6 +112,9 @@ class UploadSessionRead(CloudraveSchema):
     part_size: int
     created_at: datetime
     updated_at: datetime
+    expires_at: datetime | None = None
+    last_seen_at: datetime | None = None
+    error_reason: str | None = None
     transport: str
     required_response_headers: list[str] = Field(default_factory=list)
     part_checksum_algorithm: str | None = None
