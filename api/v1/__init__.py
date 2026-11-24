@@ -3,6 +3,7 @@
 from fastapi import APIRouter
 
 from api.v1.admin_mount import router as admin_mount_router
+from api.v1.admin_audit import router as admin_audit_router
 from api.v1.admin_guest import router as admin_guest_router
 from api.v1.admin_policy import router as admin_policy_router
 from api.v1.admin_sync import router as admin_sync_router
@@ -34,6 +35,7 @@ router.include_router(share_router)
 router.include_router(shared_router)
 router.include_router(site_router)
 router.include_router(admin_policy_router)
+router.include_router(admin_audit_router)
 router.include_router(admin_guest_router)
 router.include_router(admin_mount_router)
 router.include_router(admin_sync_router)
