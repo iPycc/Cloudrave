@@ -75,3 +75,7 @@ tests/*
 !tests/test_storage_drives.py
 !tests/test_oss_download.py
 !tests/test_oss_domains.py
+.agents
+.trae
+skills-lock.json
+!tests/test_security_compatibility.py
