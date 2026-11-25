@@ -72,11 +72,7 @@ class CloudraveFormatter(logging.Formatter):
         timestamp = datetime.fromtimestamp(record.created).astimezone().strftime("%Y-%m-%d %H:%M:%S")
         level = f"{record.levelname.upper():<8}"
         source = self._source(record)
-        message = re.sub(
-            r"(?i)([?&](?:client_secret|access_token|refresh_token|code)=)[^\s&#\"']*",
-            r"\1[REDACTED]",
-            record.getMessage(),
-        )
+        message = record.getMessage()
         context = self._context(record)
         if context:
             message = f"{message} [{context}]"
@@ -91,7 +87,11 @@ class CloudraveFormatter(logging.Formatter):
             rendered = f"{rendered}\n{self.formatException(record.exc_info)}"
         if record.stack_info:
             rendered = f"{rendered}\n{self.formatStack(record.stack_info)}"
-        return rendered
+        return re.sub(
+            r"(?i)([?&](?:client_?secret|access_?token|refresh_?token|code)=)[^\s&#\"']*",
+            r"\1[REDACTED]",
+            rendered,
+        )
 
     def _source(self, record: logging.LogRecord) -> str:
         path = Path(record.pathname)

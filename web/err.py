@@ -15,6 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from qcloud_cos.cos_exception import CosException
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse, Response
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from drives.remote_drive.common import RemoteAuthenticationError, RemoteProtocolError
 from store.errors import storage_error_details
@@ -65,7 +66,7 @@ async def logged_http_exception_handler(
     if isinstance(exc.detail, dict):
         payload["message"] = str(exc.detail.get("message") or exc.detail.get("detail") or "请求失败")
         payload["code"] = str(exc.detail.get("code") or payload["code"])
-    elif isinstance(exc.__cause__, (CosException, OssSdkError)):
+    elif isinstance(exc.__cause__, (CosException, OssSdkError)) and exc.detail == str(exc.__cause__):
         payload.update(storage_error_details(exc.__cause__))
         payload["detail"] = payload["message"]
     else:
@@ -102,6 +103,14 @@ async def unexpected_exception_handler(request: Request, exc: Exception) -> Resp
     request.state.failure_reason = _single_line(exc)
     return JSONResponse(status_code=500, content={"detail": "服务器暂时无法完成请求", "message": "服务器暂时无法完成请求", "code": "internal_error",
                                                   "request_id": request.state.request_id})
+
+
+class UnexpectedErrorMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        try:
+            return await call_next(request)
+        except Exception as exc:
+            return await unexpected_exception_handler(request, exc)
 
 
 async def storage_exception_handler(request: Request, exc: Exception) -> Response:

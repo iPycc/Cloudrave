@@ -16,7 +16,7 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         supplied = request.headers.get(self.header_name, "")
-        request_id = supplied if re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", supplied) else str(uuid4())
+        request_id = supplied if re.fullmatch(r"[A-Za-z0-9._:-]{1,64}", supplied) else str(uuid4())
         request.state.request_id = request_id
         response = await call_next(request)
         response.headers[self.header_name] = request_id

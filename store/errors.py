@@ -38,7 +38,7 @@ def storage_error_details(exc: Exception) -> dict[str, str]:
         digest = digest_getter()
         message = (digest.get("message") or digest.get("Message")) if isinstance(digest, Mapping) else None
     else:
-        message = getattr(current, "message", None) or str(current)
+        message = getattr(current, "message", None) if storage_error_code(current) else None
     status_getter = getattr(current, "get_status_code", None)
     status = status_getter() if callable(status_getter) else getattr(current, "status_code", None)
     return {

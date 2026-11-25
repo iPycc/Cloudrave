@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from core.ver import __version__
 from api.v1 import router as v1_router
 from core.dep import Dep
-from web.err import install_exception_handlers
+from web.err import UnexpectedErrorMiddleware, install_exception_handlers
 from web.mid.log import LoggingMiddleware
 from web.mid.database import DatabaseMaintenanceMiddleware
 from web.mid.rid import RequestIdMiddleware
@@ -141,6 +141,12 @@ def create_app(
 
     # Added from inner to outer. Authentication endpoints retain their focused
     # anti-brute-force dependency; ordinary API traffic is not globally capped.
+    request_id_header = config.app.request_id_header.strip() or "X-Request-ID"
+    app.add_middleware(AvatarBodyLimitMiddleware)
+    app.add_middleware(DatabaseMaintenanceMiddleware)
+    app.add_middleware(LoggingMiddleware)
+    app.add_middleware(UnexpectedErrorMiddleware)
+    app.add_middleware(RequestIdMiddleware, header_name=request_id_header)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(config.app.cors_origins),
@@ -149,7 +155,7 @@ def create_app(
         allow_headers=[
             "Authorization",
             "Content-Type",
-            "X-Request-ID",
+            request_id_header,
             "Idempotency-Key",
             "X-Device-Fingerprint",
             "X-Cloudrave-Local-Write",
@@ -160,14 +166,10 @@ def create_app(
             "Range",
         ],
         expose_headers=[
-            "Accept-Ranges", "Content-Length", "Content-Range", "ETag", "Last-Modified", "X-Request-ID", "X-Upload-Retryable",
+            "Accept-Ranges", "Content-Length", "Content-Range", "ETag", "Last-Modified", request_id_header, "X-Upload-Retryable",
         ],
     )
     app.add_middleware(SecurityHeadersMiddleware)
-    app.add_middleware(AvatarBodyLimitMiddleware)
-    app.add_middleware(DatabaseMaintenanceMiddleware)
-    app.add_middleware(LoggingMiddleware)
-    app.add_middleware(RequestIdMiddleware, header_name=config.app.request_id_header)
 
     install_exception_handlers(app)
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 
 from fastapi import HTTPException, Request, UploadFile, status
 from sqlalchemy.exc import IntegrityError
@@ -42,7 +43,7 @@ from services.explorer.view.base import preview_kind, preview_version
 from services.explorer.oss_upload_errors import call_upload_storage
 from services.explorer.path_write import new_file_path, object_path_template
 from services.explorer.write_policy import ensure_capacity
-from services.explorer.up_abort import cleanup_upload
+from services.explorer.up_abort import cleanup_upload, upload_error_reason
 from services.explorer.up_path import UploadPath
 from services.explorer.up_plan import PATH_TOKEN_METADATA, make_plan, sign_part, sign_put
 from store.manager import StorageManager
@@ -586,10 +587,11 @@ class CreateUploadSessionService:
             )
             return await self._to_read(record)
         except Exception as exc:
+            logging.getLogger("cloudrave.store.upload").exception("Upload completion failed for session %s", session_id)
             await self.session.rollback()
             failed = await self.uploads.get_session(session_id)
             if failed is not None and failed.state not in (UploadState.COMPLETED, UploadState.ABORTED, UploadState.EXPIRED):
-                await self.uploads.set_state(session_id, UploadState.FAILED, reason=str(exc))
+                await self.uploads.set_state(session_id, UploadState.FAILED, reason=upload_error_reason(exc))
                 await self.session.commit()
             raise
 

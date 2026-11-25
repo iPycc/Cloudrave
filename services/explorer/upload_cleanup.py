@@ -9,7 +9,7 @@ from models.enums import UploadState
 from repositories.mounts import BucketMountRepository
 from repositories.policies import StoragePolicyRepository
 from repositories.uploads import UPLOAD_LIFETIME, UploadRepository
-from services.explorer.up_abort import cleanup_upload
+from services.explorer.up_abort import cleanup_upload, upload_error_reason
 from services.explorer.up_check import build_upload_state
 from store.manager import StorageManager
 from drives.remote_drive.common import RemoteAuthenticationError
@@ -51,10 +51,10 @@ class UploadCleanup:
                     cleaned += 1
             except RemoteAuthenticationError as exc:
                 # Keep provider remnants for retry after reauthorization.
-                await self.uploads.set_state(record.id, UploadState.FAILED, reason=str(exc))
+                await self.uploads.set_state(record.id, UploadState.FAILED, reason=upload_error_reason(exc))
                 self.log.warning("Upload cleanup deferred for session %s: storage reauthorization required", record.id)
             except Exception as exc:
-                await self.uploads.set_state(record.id, UploadState.FAILED, reason=str(exc))
+                await self.uploads.set_state(record.id, UploadState.FAILED, reason=upload_error_reason(exc))
                 self.log.exception("Upload remnant cleanup failed for session %s", record.id)
         return cleaned
 
