@@ -582,6 +582,8 @@ class FileExplorerService:
                     if payload.on_conflict == "replace":
                         raise HTTPException(status_code=409, detail="当前存储的路径映射不支持覆盖移动")
                 new_name = _unique_name(node.name, set(names)) if existing is not None else node.name
+                if len(new_name) > 255:
+                    raise HTTPException(status_code=422, detail="移动后的文件名过长，请缩短原文件名后重试")
                 names[new_name] = node
                 task = await queue_path_operation(self.session, mount, policy, node, template,
                                                   rename_to=new_name if new_name != node.name else None,

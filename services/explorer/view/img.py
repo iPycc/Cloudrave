@@ -17,6 +17,7 @@ from drives.ids import ALIYUN_OSS, TENCENT_COS
 from models.tables import BucketMount, Node, StoragePolicy, User
 from services.explorer.view.base import (
     IMAGE_VARIANTS,
+    SEEKABLE_MAX_BYTES,
     derivative_semaphore as _derivative_semaphore,
     lock_for as _lock_for,
     preview_kind,
@@ -105,7 +106,7 @@ class ImageMixin:
         node, mount, policy = await self.resolver.resolve(actor, node_id)
         metadata = await self._cached_json(
             node,
-            "image-metadata",
+            "image-metadata-v2",
             lambda: self._probe_image(node, mount, policy),
         )
         return (
@@ -146,6 +147,8 @@ class ImageMixin:
                     header = stream.read(_IMAGE_HEADER_BYTES)
                 try:
                     with Image.open(BytesIO(header), formats=[image_format]) as image:
+                        if image.format == "PNG" and "exif" not in image.info and node.size <= SEEKABLE_MAX_BYTES:
+                            raise ValueError("PNG orientation requires a full probe")
                         return _image_metadata(image, header_only=True)
                 except (OSError, SyntaxError, ValueError):
                     # ICC and other metadata chunks can put the image header beyond the first range.

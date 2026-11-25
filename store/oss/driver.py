@@ -145,15 +145,15 @@ class AliyunOssAdapter(StorageAdapterBase):
         # The user can verify DNS, TLS and actual data access in the browser.
         if binding is None or binding["status"] != "Enabled":
             return result
-        sample = self.list_objects(policy, mount, max_keys=1)
-        if sample.objects and not sample.objects[0].object_key.endswith("/"):
+        sample = next((item for item in self.iter_objects(policy, mount) if not item.object_key.endswith("/")), None)
+        if sample is not None:
             preview_policy = SimpleNamespace(
                 **{name: getattr(policy, name, None) for name in (
                     "bucket_name", "region", "endpoint", "base_prefix", "credentials", "presign_ttl_seconds",
                 )},
                 extra={**(policy.extra or {}), "download_domain_type": "origin", "download_domain": normalized},
             )
-            result["test_url"] = self.build_download_url(preview_policy, mount, sample.objects[0].object_key, expires_in=300).url
+            result["test_url"] = self.build_download_url(preview_policy, mount, sample.object_key, expires_in=300).url
         return result
 
     def physical_id(self, policy: Any, mount: Any, object_key: str) -> str:
@@ -204,7 +204,7 @@ class AliyunOssAdapter(StorageAdapterBase):
                 metadata={
                     "last_modified": str(getattr(item, "last_modified", "") or ""),
                     "storage_class": str(getattr(item, "storage_class", "") or ""),
-                    "is_directory_marker": item.key.endswith("/"),
+                    "is_directory_marker": item.key.endswith("/") and getattr(item, "size", None) == 0,
                 },
             )
             for item in (getattr(result, "contents", None) or [])
@@ -415,7 +415,7 @@ class AliyunOssAdapter(StorageAdapterBase):
         ))
 
     def mount_has_objects(self, policy: Any, mount: Any) -> bool:
-        return bool(self.list_objects(policy, mount, max_keys=1).objects)
+        return next(self.iter_objects(policy, mount, max_keys=1), None) is not None
 
     def purge_mount(self, policy: Any, mount: Any) -> int:
         client = self._client_for(policy)

@@ -335,7 +335,7 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
 
         try:
             image_metadata = await self._cached_json(
-                node, "image-metadata", lambda: self._probe_image(node, mount, policy),
+                node, "image-metadata-v2", lambda: self._probe_image(node, mount, policy),
             )
         except (OSError, UnidentifiedImageError, Image.DecompressionBombError) as exc:
             manifest.metadata["probe_error"] = "Image metadata unavailable"
@@ -343,6 +343,8 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
             return
 
         manifest.metadata.update(image_metadata)
+        if node.size > SEEKABLE_MAX_BYTES:
+            return
         for variant, width in IMAGE_VARIANTS.items():
             url = request.url_for("preview_image_asset", node_id=node.id, variant=variant)
             manifest.assets[variant] = PreviewAssetRead(

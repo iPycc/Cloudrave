@@ -81,7 +81,7 @@ def page_from_response(adapter: Any, policy: Any, mount: Any, response: dict[str
                 metadata={
                     "last_modified": str(item.get("LastModified", "")),
                     "storage_class": str(item.get("StorageClass", "")),
-                    "is_directory_marker": physical.endswith("/"),
+                    "is_directory_marker": physical.endswith("/") and int(item.get("Size", 0)) == 0,
                 },
             )
         )

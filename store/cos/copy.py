@@ -47,8 +47,25 @@ class CopySnapshot:
     def tagging_header(self) -> str | None:
         return urlencode(self.tags, quote_via=quote, safe="") if self.tags else None
 
-    def initial_acl(self) -> str:
-        return "default" if self.acl_mode == "default" else "private"
+    def acl_args(self) -> dict[str, str]:
+        owner_grant = ("CanonicalUser", self.acl_owner, "", "FULL_CONTROL")
+        canned = {owner_grant}
+        if self.acl_mode == "public-read":
+            canned.add(("Group", "", "http://cam.qcloud.com/groups/global/AllUsers", "READ"))
+        if self.acl_mode == "default" or set(self.acl_grants) == canned:
+            return {"ACL": self.acl_mode}
+        result = {}
+        for kind, identity, _uri, permission in self.acl_grants:
+            if kind != "CanonicalUser" or permission not in {"READ", "WRITE", "FULL_CONTROL"} or any(
+                char in identity for char in '\r\n"'
+            ):
+                raise ValueError("COS object ACL cannot be installed atomically during a protected copy")
+            name = {"READ": "GrantRead", "WRITE": "GrantWrite", "FULL_CONTROL": "GrantFullControl"}[permission]
+            grant = f'id="{identity}"'
+            result[name] = f"{result[name]},{grant}" if name in result else grant
+        if not result:
+            raise ValueError("COS object ACL is unavailable for a protected copy")
+        return result
 
     def write_args(self) -> dict[str, str]:
         names = {
@@ -60,14 +77,6 @@ class CopySnapshot:
             "x-cos-server-side-encryption-context": "SSEKMSContext",
         }
         return {names[name]: value for name, value in self.attributes}
-
-    def acl_policy(self) -> dict[str, Any]:
-        grants = []
-        for kind, identity, uri, permission in self.acl_grants:
-            grantee = {"Type": kind}
-            grantee["ID" if kind == "CanonicalUser" else "URI"] = identity if kind == "CanonicalUser" else uri
-            grants.append({"Grantee": grantee, "Permission": permission})
-        return {"Owner": {"ID": self.acl_owner}, "AccessControlList": {"Grant": grants}}
 
     def preserved_attributes(self) -> tuple[Any, ...]:
         return self.size, self.attributes, self.metadata, self.acl_mode, self.acl_owner, self.acl_grants, self.tags

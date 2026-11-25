@@ -415,7 +415,7 @@ class CosObjectMixin:
             client.copy_object(
                 Bucket=bucket, Key=target, CopySource=copy_source,
                 CopySourceIfMatch=source.etag,
-                ACL=source.initial_acl(),
+                **source.acl_args(),
                 Metadata={"x-cos-forbid-overwrite": "true"},
                 **attributes,
             )
@@ -456,6 +456,7 @@ class CosObjectMixin:
 
     def inspect_copy_source(self, policy: Any, mount: Any, source_key: str) -> CopySnapshot:
         source = read_copy_snapshot(self._client_for(policy), self._bucket(policy), self._key(policy, mount, source_key))
+        source.acl_args()
         if source.size > 5 * 1024 * 1024 * 1024:
             if source.content_md5:
                 raise ValueError("COS multipart copy cannot preserve the source Content-MD5")
@@ -472,8 +473,6 @@ class CosObjectMixin:
 
     @staticmethod
     def _finish_protected_copy(client: Any, bucket: str, source_path: str, target: str, source: CopySnapshot) -> None:
-        if source.acl_mode != "default":
-            client.put_object_acl(Bucket=bucket, Key=target, AccessControlPolicy=source.acl_policy())
         copied = read_copy_snapshot(client, bucket, target)
         if copied.preserved_attributes() != source.preserved_attributes():
             raise RuntimeError("COS copied object attributes differ from the source")

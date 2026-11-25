@@ -53,7 +53,10 @@ def metadata_headers(values: dict[str, str] | None) -> dict[str, str]:
         if name == "file-name" and not value.isascii():
             name = FILE_NAME_UTF8_METADATA
             value = b64encode(value.encode("utf-8")).decode("ascii")
-        result[f"x-cos-meta-{name}"] = value
+        header = f"x-cos-meta-{name}"
+        if header in result:
+            raise ValueError("COS metadata names collide after normalization")
+        result[header] = value
     return result
 
 

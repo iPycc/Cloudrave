@@ -97,7 +97,7 @@ class CosUploadMixin:
                 kwargs["Metadata"] = metadata_headers(metadata)
         else:
             kwargs = _copy_snapshot.write_args()
-            kwargs["ACL"] = _copy_snapshot.initial_acl()
+            kwargs.update(_copy_snapshot.acl_args())
             kwargs["Metadata"] = {f"x-cos-meta-{key}": value for key, value in _copy_snapshot.metadata}
             if _copy_snapshot.tags:
                 kwargs["Tagging"] = _copy_snapshot.tagging_header()

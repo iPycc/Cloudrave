@@ -126,8 +126,8 @@ class TencentCosAdapter(CosObjectMixin, CosUploadMixin, StorageAdapterBase):
                 "Tencent Cloud COS SDK is not installed; install cos-python-sdk-v5"
             )
         target = self._target(policy)
-        mode, domain, auth = download_settings(getattr(policy, "extra", None) or {})
-        route = (mode, domain, auth) if download else ("default", "", "cos")
+        route = download_settings(getattr(policy, "extra", None) or {}) if download else ("default", "", "cos")
+        mode, domain, auth = route
         cache_key = (*target.cache_key, *route)
         with self._clients_lock:
             client = self._clients.get(cache_key)

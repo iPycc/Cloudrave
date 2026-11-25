@@ -18,7 +18,6 @@ def validate_download_extra(value):
 
 
 class _PolicySettings(CloudraveSchema):
-    _validate_download = field_validator("extra")(validate_download_extra)
     bucket_name: str = Field(min_length=1, max_length=255)
     region: str | None = Field(default=None, max_length=64)
     endpoint: str | None = Field(default=None, max_length=255)
@@ -39,6 +38,7 @@ class _PolicySettings(CloudraveSchema):
 
 
 class StoragePolicyCreate(_PolicySettings):
+    _validate_download = field_validator("extra")(validate_download_extra)
     name: str = Field(min_length=1, max_length=128)
     provider: str = Field(min_length=1, max_length=64)
     credentials: dict[str, str] | None = Field(default=None, exclude=True, repr=False)

@@ -20,7 +20,7 @@ def download_settings(extra: dict) -> tuple[str, str, str]:
         raise ValueError("下载域名格式无效") from exc
     if (parsed.scheme not in {"https", "http"} or not parsed.hostname
             or parsed.username or parsed.password or parsed.path
-            or parsed.query or parsed.fragment or port
+            or parsed.query or parsed.fragment or port is not None
             or any(char.isspace() for char in raw)
             or any(char in raw for char in "\\?#")):
         raise ValueError("下载域名仅支持 HTTP/HTTPS 域名，不能包含路径、端口或参数")
@@ -30,4 +30,7 @@ def download_settings(extra: dict) -> tuple[str, str, str]:
         raise ValueError("下载域名格式无效") from exc
     if not all(part and all(c.isalnum() or c == "-" for c in part) for part in host.split(".")):
         raise ValueError("下载域名格式无效")
+    encrypted = str(extra.get("server_side_encryption", "none")).strip().lower() not in {"", "none"}
+    if parsed.scheme != "https" and (encrypted or not (mode == "cdn" and auth == "public")):
+        raise ValueError("签名下载域名必须使用 HTTPS")
     return mode, f"{parsed.scheme}://{host}", auth

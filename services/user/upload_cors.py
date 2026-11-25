@@ -10,6 +10,7 @@ import httpx
 from fastapi import HTTPException
 
 from schemas.user_mount import UploadCorsStatus
+from security.public_http import PublicHTTPTransport
 from services.explorer.path_write import object_path_template
 from services.explorer.up_plan import sign_put
 from store.key import format_object_key, managed_key
@@ -37,7 +38,8 @@ async def check_direct_upload_cors(adapter, policy, mount, origin: str) -> Uploa
                 return "same_origin"
             url = endpoint._replace(query="", fragment="").geturl()
             single_headers = {name.lower() for name in signed.headers} - _BROWSER_MANAGED_HEADERS
-            async with httpx.AsyncClient(timeout=5, follow_redirects=False) as client:
+            async with httpx.AsyncClient(timeout=5, follow_redirects=False, trust_env=False,
+                                         transport=PublicHTTPTransport()) as client:
                 multipart = await _check_put(client, url, origin, set(), require_etag=True)
                 if multipart != "ready" or not single_headers:
                     return multipart
