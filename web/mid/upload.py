@@ -20,7 +20,8 @@ class AvatarBodyLimitMiddleware:
             declared = int(headers.get(b"content-length", b"0"))
         except ValueError:
             declared = 0
-        rejection = JSONResponse({"detail": "Avatar request is too large"}, status_code=413)
+        rejection = JSONResponse({"detail": "Avatar request is too large", "message": "Avatar request is too large",
+                                  "code": "request_too_large"}, status_code=413)
         if declared > self.max_bytes:
             return await rejection(scope, receive, send)
         received = 0

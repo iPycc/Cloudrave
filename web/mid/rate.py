@@ -60,7 +60,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if len(window) >= request_limit:
             request.state.failure_reason = f"Rate limit exceeded ({bucket})"
             return JSONResponse(
-                {"detail": "Rate limit exceeded"},
+                {"detail": "Rate limit exceeded", "message": "Rate limit exceeded", "code": "rate_limited"},
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 headers={"Retry-After": str(int(self.window_seconds))},
             )

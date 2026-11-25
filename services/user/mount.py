@@ -39,6 +39,7 @@ from services.explorer.upload_cleanup import UploadCleanup
 from services.explorer.path_write import validate_import_permissions, validate_mount_path
 from services.user.upload_cors import check_direct_upload_cors
 from store.call import call_adapter
+from store.errors import storage_error_details
 from store.manager import StorageManager
 from drives.ids import provider_id
 from drives.remote_drive.common import RemoteAuthenticationError
@@ -245,7 +246,7 @@ class UserMountService:
                 except Exception as exc:
                     raise HTTPException(
                         status_code=status.HTTP_502_BAD_GATEWAY,
-                        detail=f"Failed to delete storage objects: {exc}",
+                        detail=storage_error_details(exc),
                     ) from exc
         owned_policy = self._is_owned_policy(actor, policy)
         await self.mounts.delete(mount)
@@ -318,24 +319,31 @@ class UserMountService:
             ),
         }
         if self.storage_manager.remote_auth.status(policy):
-            result = MountHealthRead(status="reauthorization_required", detail="存储授权已失效", checked_at=datetime.now(UTC),
+            result = MountHealthRead(status="reauthorization_required", detail="存储授权已失效", message="存储授权已失效",
+                                     code="storage_reauthorization_required", checked_at=datetime.now(UTC),
                                      capabilities={name: False for name in capabilities})
         elif not mount.is_enabled or policy.status != "active":
-            result = MountHealthRead(status="failed", detail="挂载或存储策略已停用", checked_at=datetime.now(UTC),
+            result = MountHealthRead(status="failed", detail="挂载或存储策略已停用", message="挂载或存储策略已停用",
+                                     code="storage_disabled", checked_at=datetime.now(UTC),
                                      capabilities={name: False for name in capabilities})
         else:
             try:
                 await self._validate_storage(policy, mount)
             except HTTPException as exc:
                 auth_failed = isinstance(exc.__cause__, RemoteAuthenticationError) or bool(self.storage_manager.remote_auth.status(policy))
+                error = storage_error_details(exc.__cause__) if exc.__cause__ else {
+                    "message": str(exc.detail), "code": str(exc.status_code),
+                }
+                if auth_failed:
+                    error["code"] = "storage_reauthorization_required"
                 result = MountHealthRead(status="reauthorization_required" if auth_failed else "failed",
-                                         detail=str(exc.__cause__ or exc.detail), checked_at=datetime.now(UTC),
+                                         detail=error["message"], **error, checked_at=datetime.now(UTC),
                                          capabilities={name: False for name in capabilities})
             else:
                 try:
                     probe_error = await self._probe_transfer(adapter, policy, mount, capabilities)
                 except Exception as exc:
-                    probe_error = f"存储能力探测失败：{exc}"
+                    probe_error = storage_error_details(exc)
                     capabilities = {name: False for name in capabilities}
                 if provider_id(policy.provider) in {"tencent_cos", "aliyun_oss"} and capabilities["direct_upload"]:
                     try:
@@ -343,19 +351,21 @@ class UserMountService:
                         capabilities["direct_upload"] = cors in {"ready", "same_origin"}
                     except Exception as exc:
                         capabilities["direct_upload"] = False
-                        probe_error = probe_error or f"CORS 检查失败：{exc}"
+                        probe_error = probe_error or storage_error_details(exc)
                 health_status = (
                     "reauthorization_required" if probe_error and self.storage_manager.remote_auth.status(policy)
                     else "failed" if probe_error else "healthy"
                 )
                 result = MountHealthRead(status=health_status,
-                                         detail=probe_error or "存储连接正常", checked_at=datetime.now(UTC),
+                                         detail=probe_error["message"] if probe_error else "存储连接正常",
+                                         message=probe_error["message"] if probe_error else "存储连接正常",
+                                         code=probe_error["code"] if probe_error else None, checked_at=datetime.now(UTC),
                                          capabilities=capabilities)
         mount.extra = {**(mount.extra or {}), "_health": result.model_dump(mode="json")}
         await self.session.flush()
         return result
 
-    async def _probe_transfer(self, adapter, policy, mount, capabilities: dict[str, bool]) -> str | None:
+    async def _probe_transfer(self, adapter, policy, mount, capabilities: dict[str, bool]) -> dict[str, str] | None:
         if not capabilities["upload"] or provider_id(policy.provider) not in {"local_fs", "tencent_cos", "aliyun_oss"}:
             return await self._probe_existing_download(adapter, policy, mount, capabilities)
 
@@ -371,7 +381,7 @@ class UserMountService:
             if await self._read_probe(adapter, policy, mount, key) != b"ok":
                 raise OSError("读回内容与写入内容不一致")
         except Exception as exc:
-            error = f"上传或下载探测失败：{exc}"
+            error = storage_error_details(exc)
             if not written:
                 capabilities["upload"] = False
                 capabilities["multipart"] = capabilities["direct_upload"] = capabilities["batch"] = False
@@ -390,12 +400,12 @@ class UserMountService:
                                                             blob_path=key, physical_id=physical_id,
                                                             source_identity={"version_id": version_id} if version_id
                                                             else {"managed_blob": True})
-                    error = f"健康探测对象清理失败：{exc}"
+                    error = storage_error_details(exc)
         if not capabilities["upload"]:
             capabilities["multipart"] = capabilities["direct_upload"] = capabilities["batch"] = False
         return error
 
-    async def _probe_existing_download(self, adapter, policy, mount, capabilities: dict[str, bool]) -> str | None:
+    async def _probe_existing_download(self, adapter, policy, mount, capabilities: dict[str, bool]) -> dict[str, str] | None:
         try:
             page = await call_adapter(adapter, "list_objects", policy, mount, max_keys=1)
             if page.objects:
@@ -406,7 +416,7 @@ class UserMountService:
                     await self._read_probe(adapter, policy, mount, page.objects[0].object_key)
         except Exception as exc:
             capabilities["download"] = False
-            return f"下载探测失败：{exc}"
+            return storage_error_details(exc)
         return None
 
     @staticmethod
@@ -581,7 +591,7 @@ class UserMountService:
         except Exception as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Storage drive validation failed: {exc}",
+                detail=storage_error_details(exc),
             ) from exc
 
     async def _mount_is_busy(self, mount_id: int) -> bool:

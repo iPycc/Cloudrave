@@ -68,6 +68,8 @@ class UploadCorsRead(CloudraveSchema):
 class MountHealthRead(CloudraveSchema):
     status: Literal["healthy", "reauthorization_required", "failed"]
     detail: str
+    message: str
+    code: str | None = None
     checked_at: datetime
     capabilities: dict[str, bool] = Field(default_factory=dict)
 

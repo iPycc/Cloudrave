@@ -98,7 +98,7 @@ async def complete_upload(
             return UploadSessionRead.model_validate(result)
         except RemoteUploadUnconfirmedError as exc:
             request.state.failure_reason = str(exc)
-            return JSONResponse(status_code=409, content={"code": "wo_upload_unconfirmed", "detail": str(exc),
+            return JSONResponse(status_code=409, content={"code": "wo_upload_unconfirmed", "message": str(exc), "detail": str(exc),
                                                      "request_id": request.state.request_id})
 
 
