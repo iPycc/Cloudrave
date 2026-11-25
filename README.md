@@ -82,6 +82,16 @@ python main.py
 
 生产环境下 `/api/docs` 会自动禁用。
 
+### Docker Compose
+
+在同时包含 `Cloudrave/` 和 `Frontend/` 的工作区根目录运行：
+
+```bash
+docker compose up -d --build
+```
+
+访问 `http://localhost:1309`。默认启动 Cloudrave 和 MySQL 两个容器；`ffprobe` 和用于视频缩略图、转码的 `ffmpeg` 安装在 Cloudrave 容器内，由后端直接调用。MySQL 仅在 Compose 网络内开放。数据库、上传文件、预览缓存和 `config.ini` 保存在 Docker 数据卷中。对外部署前，请同步修改工作区根目录 `docker-compose.yml` 中的 MySQL 密码和 `CLOUDRAVE_DATABASE_URL`。
+
 ## ⚙️ 配置
 
 首次启动时会自动在项目目录下创建 `config.ini`，主要配置项如下：
