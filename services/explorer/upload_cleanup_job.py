@@ -10,6 +10,7 @@ from db.base import session_scope
 from repositories.mounts import BucketMountRepository
 from repositories.policies import StoragePolicyRepository
 from repositories.uploads import UploadRepository
+from security.request_limits import cleanup_share_attempts
 from services.explorer.upload_cleanup import UploadCleanup
 from store.manager import StorageManager
 
@@ -38,6 +39,7 @@ class UploadCleanupWorker:
     async def _loop(self) -> None:
         while True:
             try:
+                await cleanup_share_attempts(self.session_factory)
                 await self.storage_manager.remote_auth.persist(self.session_factory)
                 async with session_scope(self.session_factory) as session:
                     cleaned = await UploadCleanup(

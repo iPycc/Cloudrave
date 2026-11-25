@@ -101,11 +101,13 @@ async def login_rate_limit(request: Request) -> None:
 
 
 async def share_password_rate_limit(request: Request, share_id: str) -> None:
+    from repositories.shares import ShareRepository
     from security.request_limits import consume_share_attempt
 
     async with request.app.state.dep.session_scope() as session:
+        share = await ShareRepository(session).get_by_id(share_id)
         allowed = await consume_share_attempt(session,
-            request.client.host if request.client else "unknown", share_id)
+            request.client.host if request.client else "unknown", share.id if share is not None else None)
     if not allowed:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                             detail="Too many share password attempts", headers={"Retry-After": "60"})
