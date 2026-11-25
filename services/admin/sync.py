@@ -5,29 +5,67 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import hashlib
+import json
 from uuid import uuid4
 
 from fastapi import HTTPException, Request, status
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.enums import NodeStatus, NodeType
-from models.tables import BucketMount, Node, StoragePolicy, User
+from models.blob import BlobRef
+from models.tables import BucketMount, MountSyncConflict, MountSyncTask, Node, ObjectRecord, StoragePolicy, User
 from repositories.audit_logs import AuditLogRepository
 from repositories.blobs import BlobUnavailable
+from repositories.gc import GcRepository
 from repositories.mounts import BucketMountRepository
 from repositories.nodes import NodeRepository
 from repositories.objects import ObjectRepository
 from repositories.policies import StoragePolicyRepository
+from repositories.uploads import UploadRepository
 from schemas.sync import MountSyncRead, MountSyncRequest
 from services.admin.scan import BucketItem, BucketPage, BucketScanner
+from store.copy_guard import source_identity
 
 
 @dataclass
 class _PageCache:
-    policy: StoragePolicy | None = None
     root: Node | None = None
     folders: dict[tuple[int, str], Node | None] = field(default_factory=dict)
+    revivals: dict[str, tuple[int, bool]] = field(default_factory=dict)
+    managed_markers: set[str] = field(default_factory=set)
+    retained_deletions: dict[str, list[dict]] = field(default_factory=dict)
+
+
+def _marker_identity(item: BucketItem) -> str:
+    return hashlib.sha256((item.physical_key.rstrip("/") + "/").encode("utf-8")).hexdigest()
+
+
+def _matches_retained_deletion(item: BucketItem, candidates: list[dict]) -> bool:
+    for candidate in candidates:
+        if candidate["size"] != item.size:
+            continue
+        if item.is_directory:
+            if candidate.get("directory_marker"):
+                return True
+            continue
+        version_id = candidate.get("version_id")
+        if version_id and item.version_id:
+            if version_id == item.version_id:
+                return True
+            continue
+        etag = candidate.get("etag")
+        if not etag or etag != item.etag:
+            continue
+        if modified := candidate.get("modified"):
+            try:
+                if source_identity(item.size, etag, modified) != source_identity(item.size, item.etag, item.last_modified):
+                    continue
+            except (ValueError, TypeError, OverflowError):
+                continue
+        return True
+    return False
 
 
 class MountSyncService:
@@ -60,8 +98,14 @@ class MountSyncService:
         actor: User,
         mount_id: int,
         payload: MountSyncRequest,
+        *,
+        generation: str | None = None,
+        lease: tuple[str, str] | None = None,
     ) -> MountSyncRead:
-        mount, policy, expected = await self._claim_page(mount_id, payload)
+        mount, policy, expected = await self._claim_page(mount_id, payload, generation=generation)
+
+        if expected.get("phase") == "finalizing":
+            return await self._finalize_page(request, actor, mount_id, expected, lease=lease)
 
         try:
             page = await self.scanner.list_page(
@@ -70,16 +114,50 @@ class MountSyncService:
                 cursor=expected.get("cursor"),
                 page_size=payload.page_size,
             )
+            revivals = await self._probe_revivals(policy, mount, page)
         except Exception as exc:
-            await self._record_error(mount_id, expected, exc)
+            await self.session.rollback()
+            await self._record_error(mount_id, expected, exc, lease=lease)
             raise self._sync_error(exc) from exc
 
-        return await self._apply_page(request, actor, mount_id, expected, policy, page)
+        return await self._apply_page(request, actor, mount_id, expected, policy, page, lease=lease, revivals=revivals)
+
+    @staticmethod
+    def _physical_id(mount: BucketMount, item: BucketItem) -> str:
+        return item.physical_id or hashlib.sha256(f"{mount.policy_id}\0{item.physical_key}".encode()).hexdigest()
+
+    @staticmethod
+    def _path_parts(item: BucketItem) -> list[str] | None:
+        if item.key.startswith("/") or "\\" in item.key or "\x00" in item.key:
+            return None
+        key = item.key[:-1] if item.is_directory and item.key.endswith("/") else item.key
+        parts = key.split("/")
+        return None if any(not part or part in {".", ".."} or len(part) > 255 for part in parts) else parts
+
+    async def _probe_revivals(self, policy: StoragePolicy, mount: BucketMount, page: BucketPage) -> dict[str, tuple[int, bool]]:
+        """Check deleted identities without holding the mount or blob write locks."""
+        keys = {self._physical_id(mount, item): item.key for item in page.items
+                if not item.is_directory and self._path_parts(item) is not None}
+        states: list[tuple[str, int]] = []
+        identities = list(keys)
+        for offset in range(0, len(identities), 400):
+            rows = await self.session.execute(select(BlobRef.physical_id, BlobRef.revision).where(
+                BlobRef.physical_id.in_(identities[offset:offset + 400]), BlobRef.state == "deleted",
+            ))
+            states.extend(rows.tuples())
+        # Release the read transaction and its connection before provider I/O.
+        await self.session.commit()
+        results = {}
+        for identity, revision in states:
+            results[identity] = (revision, await self.scanner.exists(policy, mount, keys[identity]))
+        return results
 
     async def _claim_page(
         self,
         mount_id: int,
         payload: MountSyncRequest,
+        *,
+        generation: str | None = None,
     ) -> tuple[BucketMount, StoragePolicy, dict]:
         mount = await self.mounts.get_by_id_for_update(mount_id)
         if mount is None:
@@ -102,8 +180,16 @@ class MountSyncService:
             )
 
         state = self._state(mount)
+        if generation is not None and (
+            state.get("generation") != generation or state.get("status") != "running"
+        ):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Synchronization task is no longer active")
         if payload.restart or state.get("status") != "running":
             state = self._new_state()
+            state["mapping"] = self.mapping_signature(policy, mount)
+            await self.mounts.save_sync_state(mount, state)
+        elif not state.get("mapping"):
+            state["mapping"] = self.mapping_signature(policy, mount)
             await self.mounts.save_sync_state(mount, state)
 
         # Release the row lock before the remote provider request. The generation and
@@ -119,6 +205,9 @@ class MountSyncService:
         expected: dict,
         policy: StoragePolicy,
         page: BucketPage,
+        *,
+        lease: tuple[str, str] | None = None,
+        revivals: dict[str, tuple[int, bool]] | None = None,
     ) -> MountSyncRead:
         page_error: Exception | None = None
         result: MountSyncRead
@@ -127,9 +216,12 @@ class MountSyncService:
             mount = await self.mounts.get_by_id_for_update(mount_id)
             if mount is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bucket mount not found")
+            await self._require_lease(mount_id, lease)
             await self.session.refresh(mount)
             current = self._state(mount)
             current_policy = await self.policies.get_by_id(mount.policy_id)
+            if current_policy is not None:
+                await self.session.refresh(current_policy)
 
             invalid_reason: str | None = None
             if not mount.is_enabled:
@@ -141,45 +233,76 @@ class MountSyncService:
                 or current_policy is None
                 or current_policy.status != "active"
                 or not self.scanner.storage_manager.get_adapter(current_policy).capabilities.supports_mirror
+                or current.get("mapping") != self.mapping_signature(current_policy, mount)
             ):
                 invalid_reason = "Storage policy changed while the sync page was in flight"
 
-            if invalid_reason is not None:
+            if not self._same_page(current, expected):
+                result = self._read(mount, current)
+            elif invalid_reason is not None:
                 failed = dict(current)
                 failed["status"] = "error"
                 failed["error"] = invalid_reason
                 await self.mounts.save_sync_state(mount, failed)
                 result = self._read(mount, failed)
-            elif not self._same_page(current, expected):
-                # Another request already applied this cursor (or restarted the
-                # generation). Discard the stale provider response without replaying it.
-                result = self._read(mount, current)
             else:
                 next_state = dict(current)
-                cache = _PageCache(policy=policy)
+                cache = _PageCache(revivals=revivals or {})
                 try:
                     async with self.session.begin_nested():
+                        cache.managed_markers = await self.nodes.directory_marker_keys(
+                            mount.id, {item.key.removesuffix("/") for item in page.items if item.is_directory},
+                        )
+                        cache.retained_deletions = await GcRepository(self.session).retained_sources(mount.id, {
+                            _marker_identity(item) if item.is_directory else self._physical_id(mount, item)
+                            for item in page.items
+                        })
+                        active_uploads = await UploadRepository(self.session).active_paths(
+                            mount.id, {item.key for item in page.items if not item.is_directory},
+                        )
+                        conflicts: dict[str, tuple[str, str]] = {}
                         for item in page.items:
                             next_state["scanned"] += 1
-                            outcome = await self._upsert_item(
+                            if not item.is_directory and item.key in active_uploads:
+                                next_state["skipped"] += 1
+                                continue
+                            outcome, reason = await self._upsert_item(
                                 mount,
                                 item,
                                 next_state["generation"],
                                 cache,
                             )
-                            next_state[outcome] += 1
+                            if outcome == "conflicts":
+                                encoded = json.dumps(item.key, ensure_ascii=True)
+                                identity = hashlib.sha256(encoded.encode("ascii")).hexdigest()
+                                conflicts[identity] = (encoded, reason or "name_conflict")
+                            else:
+                                next_state[outcome] = next_state.get(outcome, 0) + 1
+
+                        if conflicts:
+                            existing: set[str] = set()
+                            identities = list(conflicts)
+                            for offset in range(0, len(identities), 400):
+                                existing.update(await self.session.scalars(
+                                    select(MountSyncConflict.key_hash).where(
+                                        MountSyncConflict.mount_id == mount.id,
+                                        MountSyncConflict.generation == next_state["generation"],
+                                        MountSyncConflict.key_hash.in_(identities[offset:offset + 400]),
+                                    )
+                                ))
+                            for identity, (encoded, reason) in conflicts.items():
+                                if identity not in existing:
+                                    self.session.add(MountSyncConflict(
+                                        mount_id=mount.id, generation=next_state["generation"],
+                                        key_hash=identity, key_json=encoded, reason=reason,
+                                    ))
+                                    next_state["conflicts"] = next_state.get("conflicts", 0) + 1
 
                         next_state["cursor"] = page.next_cursor
                         if page.complete:
-                            missing, synced = await self._finish_generation(
-                                mount,
-                                next_state["generation"],
-                            )
-                            next_state["missing"] = missing
-                            next_state["synced_objects"] = synced
-                            next_state["status"] = "complete"
-                            next_state["completed_at"] = _now()
                             next_state["cursor"] = None
+                            next_state["phase"] = "finalizing"
+                            next_state["finalize_after_id"] = 0
                 except Exception as exc:
                     page_error = exc
                     failed = dict(current)
@@ -189,6 +312,7 @@ class MountSyncService:
                     result = self._read(mount, failed)
                 else:
                     next_state["error"] = None
+                    next_state["retry_count"] = 0
                     await self.mounts.save_sync_state(mount, next_state)
                     await self._audit(request, actor, mount, next_state)
                     result = self._read(mount, next_state)
@@ -197,11 +321,14 @@ class MountSyncService:
             raise self._sync_error(page_error) from page_error
         return result
 
-    async def _record_error(self, mount_id: int, expected: dict, exc: Exception) -> None:
+    async def _record_error(
+        self, mount_id: int, expected: dict, exc: Exception, *, lease: tuple[str, str] | None = None,
+    ) -> None:
         async with self.session.begin():
             mount = await self.mounts.get_by_id_for_update(mount_id)
             if mount is None:
                 return
+            await self._require_lease(mount_id, lease)
             await self.session.refresh(mount)
             current = self._state(mount)
             if not self._same_page(current, expected):
@@ -227,23 +354,63 @@ class MountSyncService:
         item: BucketItem,
         generation: str,
         cache: _PageCache,
-    ) -> str:
-        key = item.key.strip("/")
-        if not key:
-            return "conflicts"
-        parts = key.split("/")
-        if any(not part or part in {".", ".."} or len(part) > 255 for part in parts):
-            return "conflicts"
+    ) -> tuple[str, str | None]:
+        parts = self._path_parts(item)
+        if parts is None:
+            return "conflicts", "invalid_path"
+        key = item.key[:-1] if item.is_directory and item.key.endswith("/") else item.key
 
-        physical_id = item.physical_id or hashlib.sha256(
-            f"{mount.policy_id}\0{item.physical_key}".encode()
-        ).hexdigest()
+        if item.is_directory:
+            marker_hash = _marker_identity(item)
+            if (key in cache.managed_markers
+                or _matches_retained_deletion(item, cache.retained_deletions.get(marker_hash, []))
+                or await self.objects.has_migration_marker(mount.id, marker_hash)):
+                return "skipped", None
+            if cache.root is None:
+                cache.root = await self.nodes.ensure_mount_root(
+                    owner_id=mount.owner_id, mount_id=mount.id, name=mount.name,
+                )
+            parent_id = cache.root.id
+            created = False
+            for name in parts:
+                existing = await self.nodes.get_child_any(mount.id, parent_id, name)
+                try:
+                    folder = await self.nodes.ensure_folder(
+                        owner_id=mount.owner_id, mount_id=mount.id, parent_id=parent_id, name=name,
+                    )
+                except (IntegrityError, ValueError):
+                    return "conflicts", "folder_conflict"
+                created = created or existing is None
+                parent_id = folder.id
+            return ("created" if created else "unchanged"), None
+
+        physical_id = self._physical_id(mount, item)
+        references = await self.objects.list_physical_in_mount(mount.id, mount.policy_id, physical_id, key)
+        for record in references:
+            if (record.extra or {}).get("origin") == "bucket_import":
+                record.extra = {**record.extra, "sync_generation": generation}
+        if any((record.extra or {}).get("origin") != "bucket_import" for record in references):
+            return "skipped", None
+        if not references and _matches_retained_deletion(item, cache.retained_deletions.get(physical_id, [])):
+            return "skipped", None
         try:
             await self.objects.blobs.ensure(physical_id)
         except BlobUnavailable:
-            if cache.policy is None or not await self.scanner.exists(cache.policy, mount, key):
-                return "conflicts"
+            # The blob lock is held here. Accept only the exact deleted state
+            # checked outside the transaction; a concurrent GC invalidates it.
+            probe = cache.revivals.get(physical_id)
+            blob = await self.objects.blobs.lock(physical_id)
+            if probe is None or not probe[1] or blob.state != "deleted" or blob.revision != probe[0]:
+                return "conflicts", "source_unavailable"
             await self.objects.blobs.ensure(physical_id, revive=True)
+
+        if await self.objects.has_migration_reservation(physical_id):
+            return "skipped", None
+        retained = await self.objects.retained_migration_source(physical_id, mount.id)
+        if retained is not None:
+            identity = json.loads(retained.source_identity_json)
+            if item.etag == identity["etag"] and item.size == identity["size"]:
+                return "skipped", None
 
         if cache.root is None:
             cache.root = await self.nodes.ensure_mount_root(
@@ -265,14 +432,21 @@ class MountSyncService:
                         name=folder_name,
                     )
                 except (IntegrityError, ValueError):
-                    return "conflicts"
+                    return "conflicts", "folder_conflict"
                 cache.folders[cache_key] = folder
             if folder is None or folder.type != NodeType.FOLDER or folder.deleted_at is not None:
-                return "conflicts"
+                return "conflicts", "folder_conflict"
             parent_id = folder.id
 
         file_name = parts[-1]
         node = await self.nodes.get_child_any(mount.id, parent_id, file_name)
+        if references and all(node is None or record.node_id != node.id for record in references):
+            indexed = await self.nodes.list_by_ids([ref.node_id for ref in references])
+            indexed_nodes = {node.id: node for node in indexed}
+            for record in references:
+                if indexed_node := indexed_nodes.get(record.node_id):
+                    await self._refresh_imported_file(indexed_node, record, mount, item, generation, physical_id)
+            return "conflicts", "indexed_elsewhere"
         if node is None:
             node = await self.nodes.create_file(
                 owner_id=mount.owner_id,
@@ -289,60 +463,143 @@ class MountSyncService:
                 physical_id=physical_id,
                 extra=self._object_extra(item, generation),
             )
-            return "created"
+            return "created", None
         if node.type != NodeType.FILE:
-            return "conflicts"
+            return "conflicts", "folder_conflict"
 
         record = await self.objects.get_by_node_id(node.id)
         if record is None or (record.extra or {}).get("origin") != "bucket_import":
-            return "conflicts"
+            return "conflicts", "name_conflict"
+        if (record.physical_id and record.physical_id != physical_id) or (
+            not record.physical_id and record.blob_path != key
+        ):
+            # A virtual rename or move can leave a different imported object
+            # at this name. Never replace its identity during a rescan.
+            return "conflicts", "name_conflict"
 
+        changed = await self._refresh_imported_file(node, record, mount, item, generation, physical_id)
+        return ("updated" if changed else "unchanged"), None
+
+    async def _refresh_imported_file(
+        self, node: Node, record: ObjectRecord, mount: BucketMount, item: BucketItem, generation: str, physical_id: str,
+    ) -> bool:
+        key = item.key
         old_extra = dict(record.extra or {})
-        changed = (
+        content_changed = (
             node.size != item.size
             or node.blob_path != key
             or old_extra.get("etag") != item.etag
             or old_extra.get("last_modified") != item.last_modified
-            or bool(old_extra.get("external_missing"))
+            or old_extra.get("version_id") != item.version_id
         )
-        await self.nodes.reactivate_file(node, blob_path=key, size=item.size)
+        changed = content_changed or bool(old_extra.get("external_missing"))
+        in_recycle_bin = node.deleted_at is not None and (
+            not old_extra.get("external_missing") or old_extra.get("missing_while_recycled") is True
+        )
+        if in_recycle_bin and content_changed:
+            node.blob_path = key
+            node.size = item.size
+            node.updated_at = datetime.now(UTC)
+        elif not in_recycle_bin and (changed or node.status != NodeStatus.ACTIVE or node.deleted_at is not None):
+            await self.nodes.reactivate_file(node, blob_path=key, size=item.size)
+        # An imported object's checksum describes its previous contents. If the
+        # provider cannot supply a version signal, it cannot be safely reused.
+        checksum = record.checksum
+        if changed or not (item.version_id or item.etag or item.last_modified):
+            checksum = None
         await self.objects.create_or_update(
             node_id=node.id,
             policy_id=mount.policy_id,
             blob_path=key,
             physical_id=physical_id,
-            checksum=record.checksum,
+            checksum=checksum,
             content_type=record.content_type,
             extra=self._object_extra(item, generation),
         )
-        return "updated" if changed else "unchanged"
+        return changed
 
-    async def _finish_generation(self, mount: BucketMount, generation: str) -> tuple[int, int]:
-        missing = 0
-        synced = 0
-        now = datetime.now(UTC)
-        after_id = 0
-        while True:
-            records = await self.objects.list_for_mount_page(mount.id, after_id=after_id, limit=500)
-            if not records:
-                break
+    async def _finalize_page(
+        self, request: Request, actor: User, mount_id: int, expected: dict,
+        *, lease: tuple[str, str] | None = None,
+    ) -> MountSyncRead:
+        async with self.session.begin():
+            mount = await self.mounts.get_by_id_for_update(mount_id)
+            if mount is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bucket mount not found")
+            await self._require_lease(mount_id, lease)
+            current = self._state(mount)
+            if not self._same_page(current, expected):
+                return self._read(mount, current)
+            policy = await self.policies.get_by_id(mount.policy_id)
+            if policy is not None:
+                await self.session.refresh(policy)
+            if (
+                not mount.is_enabled or mount.mode != "mirror" or policy is None or policy.status != "active"
+                or current.get("mapping") != self.mapping_signature(policy, mount)
+            ):
+                current["status"] = "error"
+                current["error"] = "Storage mount changed during synchronization"
+                await self.mounts.save_sync_state(mount, current)
+                return self._read(mount, current)
+
+            records = await self.objects.list_for_mount_page(
+                mount.id, after_id=int(current.get("finalize_after_id", 0)), limit=500,
+            )
+            now = datetime.now(UTC)
+            started_at = datetime.fromisoformat(current["started_at"])
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=UTC)
             for record, node in records:
-                after_id = record.id
+                current["finalize_after_id"] = record.id
                 extra = dict(record.extra or {})
                 if extra.get("origin") != "bucket_import":
                     continue
-                if extra.get("sync_generation") == generation:
-                    synced += 1
+                if extra.get("sync_generation") == current["generation"]:
+                    current["synced_objects"] += 1
+                    continue
+                updated = record.updated_at
+                if updated.tzinfo is None:
+                    updated = updated.replace(tzinfo=UTC)
+                node_updated = node.updated_at
+                if node_updated.tzinfo is None:
+                    node_updated = node_updated.replace(tzinfo=UTC)
+                if updated > started_at or node_updated > started_at:
                     continue
                 if not extra.get("external_missing"):
-                    missing += 1
+                    current["missing"] += 1
+                    extra["missing_while_recycled"] = node.deleted_at is not None
+                elif node.deleted_at is None:
+                    extra["missing_while_recycled"] = False
                 extra["external_missing"] = True
                 extra["missing_at"] = now.isoformat()
                 record.extra = extra
-                node.status = NodeStatus.DELETED
-                node.deleted_at = now
-            await self.session.flush()
-        return missing, synced
+                if not extra.get("missing_while_recycled") or node.deleted_at is None:
+                    node.status = NodeStatus.DELETED
+                    node.deleted_at = now
+            if len(records) < 500:
+                current["status"] = "complete"
+                current["completed_at"] = _now()
+                current["phase"] = "complete"
+            current["retry_count"] = 0
+            await self.mounts.save_sync_state(mount, current)
+            await self._audit(request, actor, mount, current)
+            return self._read(mount, current)
+
+    async def _require_lease(self, mount_id: int, lease: tuple[str, str] | None) -> None:
+        if lease is None:
+            return
+        task_id, token = lease
+        task = await self.session.scalar(
+            select(MountSyncTask.id).where(
+                MountSyncTask.id == task_id,
+                MountSyncTask.mount_id == mount_id,
+                MountSyncTask.status == "running",
+                MountSyncTask.lease_token == token,
+                MountSyncTask.lease_expires_at > datetime.now(UTC),
+            ).with_for_update()
+        )
+        if task is None:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Synchronization task lease expired")
 
     async def _require_mount(self, mount_id: int) -> BucketMount:
         mount = await self.mounts.get_by_id(mount_id)
@@ -356,6 +613,8 @@ class MountSyncService:
             current.get("status") == "running"
             and current.get("generation") == expected.get("generation")
             and current.get("cursor") == expected.get("cursor")
+            and current.get("phase") == expected.get("phase")
+            and current.get("finalize_after_id") == expected.get("finalize_after_id")
         )
 
     @staticmethod
@@ -372,6 +631,7 @@ class MountSyncService:
             "origin": "bucket_import",
             "physical_key": item.physical_key,
             "etag": item.etag,
+            "version_id": item.version_id,
             "last_modified": item.last_modified,
             "storage_class": item.storage_class,
             "sync_generation": generation,
@@ -379,11 +639,22 @@ class MountSyncService:
         }
 
     @staticmethod
+    def mapping_signature(policy: StoragePolicy, mount: BucketMount) -> str:
+        values = [
+            policy.id, policy.provider, policy.bucket_name, policy.region, policy.endpoint, policy.base_prefix,
+            mount.root_path, (mount.extra or {}).get("legacy_prefixed_keys", False),
+            (mount.extra or {}).get("storage_root"), (policy.extra or {}).get("root_id"),
+            (mount.extra or {}).get("root_id"),
+        ]
+        return hashlib.sha256(json.dumps(values, ensure_ascii=False, default=str).encode()).hexdigest()
+
+    @staticmethod
     def _new_state() -> dict:
         return {
             "status": "running",
             "generation": uuid4().hex,
             "cursor": None,
+            "phase": "scanning",
             "started_at": _now(),
             "completed_at": None,
             "scanned": 0,
@@ -391,6 +662,7 @@ class MountSyncService:
             "updated": 0,
             "unchanged": 0,
             "conflicts": 0,
+            "skipped": 0,
             "missing": 0,
             "synced_objects": 0,
             "error": None,
@@ -411,6 +683,7 @@ class MountSyncService:
                 "updated": 0,
                 "unchanged": 0,
                 "conflicts": 0,
+                "skipped": 0,
                 "missing": 0,
                 "synced_objects": 0,
                 "error": None,

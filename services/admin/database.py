@@ -131,7 +131,7 @@ class DatabaseMigrationManager:
         return self.state.active_backend
 
     def begin_business_write(self) -> bool:
-        if self.maintenance:
+        if self.maintenance or self.state.status == "activation_pending":
             return False
         self._active_write_requests += 1
         self._writes_drained.clear()
@@ -526,11 +526,12 @@ class DatabaseMigrationManager:
             target_engine: AsyncEngine | None = None
             workers_stopped = False
             try:
+                workers_stopped = True
+                await dep.mount_health_worker.stop()
+                await dep.upload_cleanup_worker.stop()
+                await dep.gc_worker.stop()
+                await dep.derived_worker.stop()
                 await self.wait_for_business_writes()
-                if job.data_choice == "source":
-                    await dep.upload_cleanup_worker.stop()
-                    await dep.gc_worker.stop()
-                    workers_stopped = True
                 self._set(job, phase="connecting", progress=5, detail="正在连接目标数据库")
                 target_config = self.config_for(job.target_backend)
                 target_engine = make_async_engine(target_config)
@@ -595,9 +596,11 @@ class DatabaseMigrationManager:
                 save_switch_state(self.root_dir, self.state)
             finally:
                 self.maintenance = False
-                if workers_stopped:
+                if workers_stopped and self.state.status != "activation_pending":
                     dep.gc_worker.start()
+                    dep.derived_worker.start()
                     dep.upload_cleanup_worker.start()
+                    dep.mount_health_worker.start()
                 if target_engine is not None:
                     await target_engine.dispose()
 
@@ -940,6 +943,8 @@ def _application_tables():
 
 
 async def _data_summary(connection: AsyncConnection) -> DatabaseDataSummary:
+    from models.tables import SYNC_CLAIM_GATE_KEY
+
     table_names = set(await connection.run_sync(lambda sync: inspect(sync).get_table_names()))
     tables: list[DatabaseTableSummary] = []
     total = 0
@@ -955,7 +960,7 @@ async def _data_summary(connection: AsyncConnection) -> DatabaseDataSummary:
         internal_rows = int(await connection.scalar(
             select(func.count()).select_from(meta).where(
                 ((meta.c.key == "auth.first_admin_user_id") & (meta.c.value == ""))
-                | meta.c.key.in_(["database.instance_id", "database.migration_id"])
+                | meta.c.key.in_(["database.instance_id", "database.migration_id", SYNC_CLAIM_GATE_KEY])
             )
         ) or 0)
         meaningful_rows = max(0, meaningful_rows - internal_rows)

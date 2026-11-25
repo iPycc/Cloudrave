@@ -22,7 +22,7 @@ def choose_part_size(size: int, requested: int | None, policy_size_mb: int, capa
     if requested is not None and requested > capability.max_part_size:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="Upload part size cannot exceed 5 GiB",
+            detail=f"Upload part size cannot exceed {capability.max_part_size} bytes for this storage drive",
         )
     part_size = requested or policy_size_mb * MIB
     result = max(part_size, capability.min_part_size, ceil(max(size, 1) / capability.max_parts))

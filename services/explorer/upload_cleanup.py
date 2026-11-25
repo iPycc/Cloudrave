@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from models.enums import UploadState
 from repositories.mounts import BucketMountRepository
 from repositories.policies import StoragePolicyRepository
-from repositories.uploads import UploadRepository
-from services.explorer.up_abort import cleanup_upload
+from repositories.uploads import UPLOAD_LIFETIME, UploadRepository
+from services.explorer.up_abort import cleanup_upload, upload_error_reason
 from services.explorer.up_check import build_upload_state
 from store.manager import StorageManager
 from drives.remote_drive.common import RemoteAuthenticationError
@@ -18,7 +18,7 @@ from drives.remote_drive.common import RemoteAuthenticationError
 # Paused browser uploads must outlive a tab refresh or a return on another day.
 # Fresh presigned URLs are issued when the client resumes, so retaining the
 # multipart session does not retain expired credentials.
-UPLOAD_INACTIVITY_TIMEOUT = timedelta(days=7)
+UPLOAD_INACTIVITY_TIMEOUT = UPLOAD_LIFETIME
 
 
 class UploadCleanup:
@@ -49,12 +49,12 @@ class UploadCleanup:
             try:
                 if await self._cleanup_record(record):
                     cleaned += 1
-            except RemoteAuthenticationError:
+            except RemoteAuthenticationError as exc:
                 # Keep provider remnants for retry after reauthorization.
-                await self.uploads.set_state(record.id, UploadState.FAILED)
+                await self.uploads.set_state(record.id, UploadState.FAILED, reason=upload_error_reason(exc))
                 self.log.warning("Upload cleanup deferred for session %s: storage reauthorization required", record.id)
-            except Exception:
-                await self.uploads.set_state(record.id, UploadState.FAILED)
+            except Exception as exc:
+                await self.uploads.set_state(record.id, UploadState.FAILED, reason=upload_error_reason(exc))
                 self.log.exception("Upload remnant cleanup failed for session %s", record.id)
         return cleaned
 
@@ -93,6 +93,6 @@ class UploadCleanup:
 
         adapter = self.storage_manager.get_adapter(policy)
         upload = build_upload_state(record, policy, mount, self.storage_manager)
-        await cleanup_upload(adapter, policy, mount, upload, record.mode)
+        await cleanup_upload(adapter, policy, mount, upload, record.mode, protected=record.path_token is not None)
         await self.uploads.set_state(record.id, UploadState.EXPIRED)
         return True

@@ -1,0 +1,35 @@
+# OSS 自定义下载域名
+
+在存储设置中选择“自定义 OSS 域名”，填写 `https://files.example.com` 并保存。
+下载、预览及分享文件的源链接通过 OSS Python SDK V2 的 CNAME 模式签名，保留私有 Bucket 权限。
+上传和管理操作继续使用连接配置中的 Endpoint。需要服务端走内网时，浏览器直传仍须使用可访问的公网 Endpoint。
+
+## 域名绑定
+
+保存挂载后，编辑页面中的“Bucket 域名”支持以下操作：
+
+1. 查询已有绑定；选择“用于下载”后须保存配置。
+2. 获取验证记录，在 DNS 服务商处添加返回的 TXT 记录。记录名为完整域名，部分服务商需要填写相对于主域名的主机记录。
+3. TXT 生效后提交绑定，在 DNS 服务商处添加页面给出的 CNAME 目标。
+4. 在阿里云控制台配置 HTTPS 证书。
+5. 检查域名，打开有效期约 5 分钟的测试文件链接，验证 DNS、TLS 和文件访问。无文件时仅检查绑定。该检查不会自动验证 DNS、证书或 CORS。
+
+绑定管理作用于整个 Bucket，使用已保存的连接凭据。接口同时检查挂载与存储策略归属，访客禁止管理。
+解绑后需单独删除 DNS 解析，并为仍使用此域名的挂载选择其他下载域名。
+Cloudrave 不接收或保存证书私钥，也不自动修改 DNS。
+
+额外 RAM 权限按操作授予：`oss:ListCname`、`oss:CreateCnameToken`、`oss:PutCname`、`oss:DeleteCname`。
+检查文件链接还需要列举挂载前缀以及读取对应文件的权限。未授予域名管理权限不影响使用已绑定的域名签名下载。
+
+## 配置与验证
+
+存储策略 `extra.download_domain_type` 支持 `default` / `origin`，`extra.download_domain` 为域名地址。
+省略协议时使用 HTTPS；拒绝带路径、端口、查询参数、用户信息或 IP 地址的输入。
+此版本接入 OSS 直连自定义域名；CDN 自身鉴权需要单独实现。
+
+自动化测试覆盖真实 SDK 离线签名、STS、中文路径、下载文件名、客户端缓存切换、上传隔离、绑定操作及归属检查。
+上线前需使用真实 Bucket 完成私有文件下载、预览、分享、域名绑定和 DNS/TLS 联调。
+
+## 分片上传签名错误
+
+如果 OSS 返回 `SignatureDoesNotMatch`，先核对存储设置里的地域和访问密钥。比如广州 Bucket 的地域是 `cn-guangzhou`，公网 Endpoint 可留空让 SDK 自动生成，也可填 `https://oss-cn-guangzhou.aliyuncs.com`。自定义下载域名填写在下载域名一栏。详见[阿里云 OSS 签名错误排查](https://www.alibabacloud.com/help/en/oss/user-guide/0002-00000201)。

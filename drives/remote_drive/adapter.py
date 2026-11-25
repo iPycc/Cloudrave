@@ -153,6 +153,12 @@ class RemoteMirrorAdapter(StorageAdapterBase):
         item = self._find(policy, mount, object_key)
         return physical_hash(self.provider_type, item.entry.remote_id)
 
+    def listed_physical_id(self, policy, mount, item: StorageObject) -> str:
+        remote_id = str(item.metadata.get("remote_id") or "")
+        if not remote_id:
+            return self.physical_id(policy, mount, item.object_key)
+        return physical_hash(self.provider_type, remote_id)
+
     def list_objects(self, policy, mount, *, prefix: str = "", marker: str | None = None, max_keys: int = 1000, delimiter: str | None = None) -> StorageObjectPage:
         normalized_prefix = prefix.replace("\\", "/").lstrip("/")
         items = [item for item in self._snapshot(policy, mount) if item.key.startswith(normalized_prefix) and (not marker or item.key > marker)]

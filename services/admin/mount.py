@@ -25,6 +25,7 @@ from schemas.mount import (
 from drives.ids import provider_id
 from services.explorer.upload_cleanup import UploadCleanup
 from store.manager import StorageManager
+from services.explorer.path_write import validate_import_permissions, validate_mount_path
 from store.call import call_adapter
 from core.log import LogOperation, LogOutcome
 
@@ -73,6 +74,8 @@ class MountAdminService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Storage policy not found")
 
         mount = await self.mounts.create(owner_id, payload)
+        validate_import_permissions(actor, policy, mount)
+        await validate_mount_path(self.storage_manager, policy, mount)
         await self.nodes.ensure_mount_root(owner_id=owner_id, mount_id=mount.id, name=mount.name)
         adapter = self.storage_manager.get_adapter(policy)
         if adapter.capabilities.upload_transport == "cloudrave":
@@ -118,6 +121,7 @@ class MountAdminService:
         mount = await self.mounts.get_by_id_for_update(mount_id)
         if mount is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bucket mount not found")
+        previous_template = (mount.extra or {}).get("object_key_template")
         changed_mapping = []
         if "root_path" in payload.model_fields_set and payload.root_path != mount.root_path:
             changed_mapping.append("root_path")
@@ -163,6 +167,11 @@ class MountAdminService:
                 detail=f"Mount contains data, active uploads, or pending cleanup; cannot change {fields}",
             )
         updated = await self.mounts.update(mount, payload)
+        policy = await self.policies.get_by_id(updated.policy_id)
+        if policy is not None:
+            validate_import_permissions(actor, policy, updated)
+            if changed_mapping or legacy_changed or (updated.extra or {}).get("object_key_template") != previous_template:
+                await validate_mount_path(self.storage_manager, policy, updated)
         await self.audits.create(
             actor_id=actor.id,
             action="mount.update",
@@ -172,7 +181,7 @@ class MountAdminService:
             user_agent=request.headers.get("user-agent"),
             request_id=getattr(request.state, "request_id", None),
         )
-        return mount_read(updated, await self.policies.get_by_id(updated.policy_id), self.storage_manager)
+        return mount_read(updated, policy, self.storage_manager)
 
     async def delete_preview(self, mount_id: int) -> BucketMountDeletePreview:
         mount = await self.mounts.get_by_id(mount_id)
@@ -305,7 +314,7 @@ class MountAdminService:
             result = await call_adapter(self.storage_manager.get_adapter(policy), "configure_cors", policy, mount)
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-        policy.cors_auto_configured = True
+        policy.cors_auto_configured = result.get("status") == "configured"
         await self.session.flush()
         await self.audits.create(
             actor_id=actor.id,

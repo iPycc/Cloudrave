@@ -13,15 +13,19 @@ from fastapi.staticfiles import StaticFiles
 from core.ver import __version__
 from api.v1 import router as v1_router
 from core.dep import Dep
-from web.err import install_exception_handlers
+from web.err import UnexpectedErrorMiddleware, install_exception_handlers
 from web.mid.log import LoggingMiddleware
 from web.mid.database import DatabaseMaintenanceMiddleware
 from web.mid.rid import RequestIdMiddleware
 from web.mid.sec import SecurityHeadersMiddleware
+from web.mid.upload import AvatarBodyLimitMiddleware
 from web.mid.spa import SpaFallbackMiddleware
 from core.cfg import CloudraveConfig
 from core.log import LogOperation, LogOutcome, configure_logging, get_logger
 from services.admin.database import DatabaseMigrationManager
+from services.admin.sync_task import MountSyncWorker
+from services.admin.path_plan import PathPlanWorker
+from services.admin.path_migration import PathMigrationWorker
 
 
 LOGGER = get_logger("cloudrave.lifecycle")
@@ -91,10 +95,19 @@ async def lifespan(app: FastAPI):
             "outcome": LogOutcome.SUCCESS,
         },
     )
+    sync_worker = MountSyncWorker(dep, database_manager)
+    sync_worker.start()
+    path_plan_worker = PathPlanWorker(dep, database_manager)
+    path_plan_worker.start()
+    path_migration_worker = PathMigrationWorker(dep, database_manager)
+    path_migration_worker.start()
     try:
         yield
     finally:
         LOGGER.info("Closing application services.")
+        await path_migration_worker.stop()
+        await path_plan_worker.stop()
+        await sync_worker.stop()
         await dep.disconnect()
         LOGGER.info(
             "Application services stopped cleanly.",
@@ -128,6 +141,12 @@ def create_app(
 
     # Added from inner to outer. Authentication endpoints retain their focused
     # anti-brute-force dependency; ordinary API traffic is not globally capped.
+    request_id_header = config.app.request_id_header.strip() or "X-Request-ID"
+    app.add_middleware(AvatarBodyLimitMiddleware)
+    app.add_middleware(DatabaseMaintenanceMiddleware)
+    app.add_middleware(LoggingMiddleware)
+    app.add_middleware(UnexpectedErrorMiddleware)
+    app.add_middleware(RequestIdMiddleware, header_name=request_id_header)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(config.app.cors_origins),
@@ -136,7 +155,8 @@ def create_app(
         allow_headers=[
             "Authorization",
             "Content-Type",
-            "X-Request-ID",
+            request_id_header,
+            "Idempotency-Key",
             "X-Device-Fingerprint",
             "X-Cloudrave-Local-Write",
             "X-Cloudrave-Local-Part",
@@ -145,12 +165,11 @@ def create_app(
             "If-Range",
             "Range",
         ],
-        expose_headers=["Accept-Ranges", "Content-Length", "Content-Range", "ETag", "Last-Modified"],
+        expose_headers=[
+            "Accept-Ranges", "Content-Length", "Content-Range", "ETag", "Last-Modified", request_id_header, "X-Upload-Retryable",
+        ],
     )
     app.add_middleware(SecurityHeadersMiddleware)
-    app.add_middleware(DatabaseMaintenanceMiddleware)
-    app.add_middleware(LoggingMiddleware)
-    app.add_middleware(RequestIdMiddleware, header_name=config.app.request_id_header)
 
     install_exception_handlers(app)
 

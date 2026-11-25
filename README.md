@@ -27,7 +27,7 @@
 
 ## 📖 简介
 
-Cloudrave 是基于 Python + FastAPI 的多用户文件管理服务，提供身份认证、文件管理、分享、回收站和在线预览 API。当前版本为 **v1.0.0-beta.4**。
+Cloudrave 是基于 Python + FastAPI 的多用户文件管理服务，提供身份认证、文件管理、分享、回收站和在线预览 API。当前开发版本为 **v1.0.0-beta.5**。
 
 后端采用异步 SQLAlchemy ORM，支持 SQLite、PostgreSQL 和 MySQL。存储策略可连接本地文件系统、腾讯云 COS、阿里云 OSS，以及 139 移动云盘、189 天翼云盘和联通云盘。
 
@@ -82,6 +82,16 @@ python main.py
 
 生产环境下 `/api/docs` 会自动禁用。
 
+### Docker Compose
+
+在同时包含 `Cloudrave/` 和 `Frontend/` 的工作区根目录运行：
+
+```bash
+docker compose up -d --build
+```
+
+访问 `http://localhost:1309`。默认启动 Cloudrave 和 MySQL 两个容器；`ffprobe` 和用于视频缩略图、转码的 `ffmpeg` 安装在 Cloudrave 容器内，由后端直接调用。MySQL 仅在 Compose 网络内开放。数据库、上传文件、预览缓存和 `config.ini` 保存在 Docker 数据卷中。对外部署前，请同步修改工作区根目录 `docker-compose.yml` 中的 MySQL 密码和 `CLOUDRAVE_DATABASE_URL`。
+
 ## ⚙️ 配置
 
 首次启动时会自动在项目目录下创建 `config.ini`，主要配置项如下：
@@ -133,11 +143,28 @@ use_color = true
 
 `CLOUDRAVE_DATABASE_URL` 或非空的 `[database].url` 仍具有最高优先级。使用这两种覆盖方式时，管理页面只显示连接来源，不允许通过分字段向导切换数据库。
 
-### GitHub OAuth 登录
+### OAuth 登录
 
-管理员可在“设置 → 账号与安全”中配置 GitHub OAuth App 的 Client ID 与 Client Secret。配置前先在“站点设置”保存站点的 HTTPS 网站链接，再将页面生成的 `Authorization callback URL` 原样填写到 GitHub OAuth App。
+管理员先在「设置 → 站点设置」保存用户实际访问的 HTTPS 网站链接，然后到「设置 → 账号与安全」展开对应的 OAuth 配置，复制显示的回调地址。站点域名变更后，也要更新第三方平台登记的回调地址。应用密钥加密保存在数据库中，配置页只显示是否已配置。
 
-GitHub 登录只用于已有 Cloudrave 账号：首次登录会使用 GitHub 返回的已验证邮箱匹配本地账号并建立身份关联，不会自动创建新用户。Client Secret 加密保存在数据库中，管理接口只返回是否已配置。
+#### GitHub
+
+1. 在 [GitHub OAuth Apps](https://github.com/settings/developers) 选择 **New OAuth App**，将 **Homepage URL** 填为 Cloudrave 网站链接。
+2. 将 Cloudrave 显示的完整回调地址填入 **Authorization callback URL**，注册应用并生成 Client Secret。
+3. 回到 Cloudrave，填入 **Client ID** 和 **Client Secret**，保存并开启。
+
+#### Google
+
+1. 在 [Google Auth Platform](https://console.cloud.google.com/auth/overview) 选择项目，配置应用的同意屏幕和受众。如果测试状态限制了授权账号，在 **Audience** 中添加测试用户。
+2. 到 **Clients** 创建 **Web application**，将 Cloudrave 显示的完整回调地址填入 **Authorized redirect URIs**。
+3. 回到 Cloudrave，填入 **Client ID** 和 **Client Secret**，点击「保存配置」，再点击「测试登录」。测试通过后点击「开启 Google OAuth」。更换凭据或回调地址后需重新测试。
+
+#### QQ
+
+1. 在 [QQ 互联管理中心](https://connect.qq.com/manage.html#/) 创建**网站应用**，按页面要求填写站点资料和 Cloudrave 显示的回调地址，提交审核。
+2. 审核通过后，在 Cloudrave 的 QQ OAuth 配置中填入 **App ID** 和 **App Key**，保存并开启。
+
+启用后，用已有 Cloudrave 账号登录，在「账号与安全」点击对应的「关联 GitHub」「关联 Google」或「关联 QQ」。关联完成后，就能在登录页使用对应的第三方账号。
 
 ## 📦 构建与部署
 

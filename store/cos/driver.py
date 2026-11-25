@@ -15,9 +15,10 @@ from urllib.parse import urlsplit
 from store.port import StorageAdapterBase
 from store.cos.cors import RULE_ID, configured_origins, merge_rule
 from store.identity import physical_hash
-from store.key import mount_prefix, physical_key, physical_list_prefix
+from store.key import mount_prefix, physical_key, physical_list_prefix, validate_physical_key
 from store.cos.obj import CosObjectMixin
 from store.cos.upload import CosUploadMixin
+from store.cos.download import download_settings
 from store.types import StorageCapability
 from core.cfg import TencentCosConfig
 
@@ -119,14 +120,17 @@ class TencentCosAdapter(CosObjectMixin, CosUploadMixin, StorageAdapterBase):
             pool_size=self._positive_int(extra.get("pool_max_size", 50), "pool_max_size"),
         )
 
-    def _client_for(self, policy: Any) -> Any:
+    def _client_for(self, policy: Any, *, download: bool = False) -> Any:
         if not _COS_SDK_AVAILABLE:
             raise RuntimeError(
                 "Tencent Cloud COS SDK is not installed; install cos-python-sdk-v5"
             )
         target = self._target(policy)
+        route = download_settings(getattr(policy, "extra", None) or {}) if download else ("default", "", "cos")
+        mode, domain, auth = route
+        cache_key = (*target.cache_key, *route)
         with self._clients_lock:
-            client = self._clients.get(target.cache_key)
+            client = self._clients.get(cache_key)
             if client is None:
                 config_kwargs: dict[str, Any] = {
                     "Region": target.region,
@@ -141,12 +145,17 @@ class TencentCosAdapter(CosObjectMixin, CosUploadMixin, StorageAdapterBase):
                 }
                 if target.endpoint:
                     config_kwargs["Endpoint"] = target.endpoint
+                if download and mode != "default":
+                    parsed = urlsplit(domain)
+                    config_kwargs.pop("Endpoint", None)
+                    config_kwargs["Domain"] = parsed.netloc
+                    config_kwargs["Scheme"] = parsed.scheme
                 client = CosS3Client(CosConfig(**config_kwargs), retry=target.retries)
-                self._clients[target.cache_key] = client
+                self._clients[cache_key] = client
                 if len(self._clients) > CLIENT_CACHE_SIZE:
                     self._clients.popitem(last=False)
             else:
-                self._clients.move_to_end(target.cache_key)
+                self._clients.move_to_end(cache_key)
         return client
 
     def clear_client_cache(self) -> None:
@@ -164,10 +173,24 @@ class TencentCosAdapter(CosObjectMixin, CosUploadMixin, StorageAdapterBase):
         return self._target(policy).region
 
     def _key(self, policy: Any, mount: Any, object_key: str) -> str:
-        return physical_key(policy, mount, object_key)
+        return self._validate_physical_key(physical_key(policy, mount, object_key))
+
+    @staticmethod
+    def _validate_physical_key(key: str) -> str:
+        key = validate_physical_key(key, max_bytes=850, provider="COS")
+        if any(character in key for character in "\x18\x19\x1a\x1b"):
+            raise ValueError("COS object key contains an unsupported control character")
+        return key
 
     def _list_prefix(self, policy: Any, mount: Any, prefix: str = "") -> str:
         return physical_list_prefix(policy, mount, prefix)
+
+    def _require_unversioned(self, policy: Any) -> None:
+        result = self._client_for(policy).get_bucket_versioning(Bucket=self._bucket(policy))
+        if not isinstance(result, dict) or ("Status" not in result and result not in ({}, {"VersioningConfiguration": None})):
+            raise ValueError("Could not verify COS bucket versioning")
+        if str(result.get("Status") or "").strip():
+            raise ValueError("COS bucket versioning must be disabled for overwrite-protected writes")
 
     def _mount_prefix(self, policy: Any, mount: Any) -> str:
         return mount_prefix(policy, mount)

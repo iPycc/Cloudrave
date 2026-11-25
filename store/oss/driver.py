@@ -4,16 +4,21 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Iterator
+from contextlib import suppress
 from datetime import timedelta
 from hashlib import sha256
 from io import BytesIO
+from math import ceil
 from pathlib import Path
 from threading import Lock
 from typing import Any, BinaryIO
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
-from store.key import logical_key, mount_prefix, physical_key, physical_list_prefix
+from store.key import logical_key, mount_prefix, physical_key, physical_list_prefix, validate_physical_key
 from store.oss.stream import OssStream
+from store.oss.download import download_settings
+from store.oss.copy import CopySnapshot, read_copy_snapshot
+from store.copy_guard import exact_key_exists, require_source_identity
 from store.identity import physical_hash
 from store.errors import storage_error_code
 from store.port import StorageAdapterBase
@@ -86,15 +91,17 @@ class AliyunOssAdapter(StorageAdapterBase):
             "security_token": security_token,
         }
 
-    def _client_for(self, policy: Any) -> Any:
+    def _client_for(self, policy: Any, *, download: bool = False) -> Any:
         if not _OSS_SDK_AVAILABLE:
             raise RuntimeError("Aliyun OSS SDK V2 is not installed; install alibabacloud-oss-v2")
         target = self._target(policy)
+        mode, domain = download_settings(getattr(policy, "extra", None) or {}) if download else ("default", "")
+        endpoint = domain if mode == "origin" else target["endpoint"]
         credential_hash = sha256(
             f"{target['access_key_id']}\0{target['access_key_secret']}\0{target['security_token'] or ''}".encode()
         ).hexdigest()
         cache_key = (
-            str(target["region"]), str(target["endpoint"] or ""), credential_hash
+            str(target["region"]), str(endpoint or ""), mode, credential_hash
         )
         with self._clients_lock:
             client = self._clients.get(cache_key)
@@ -106,8 +113,9 @@ class AliyunOssAdapter(StorageAdapterBase):
                     target["security_token"],
                 )
                 config.region = str(target["region"])
-                if target["endpoint"]:
-                    config.endpoint = str(target["endpoint"])
+                if endpoint:
+                    config.endpoint = str(endpoint)
+                config.use_cname = mode == "origin"
                 client = oss.Client(config)
                 self._clients[cache_key] = client
                 if len(self._clients) > CLIENT_CACHE_SIZE:
@@ -118,6 +126,35 @@ class AliyunOssAdapter(StorageAdapterBase):
 
     def prepare_mount_root(self, mount: Any) -> Path:
         return Path(str(getattr(mount, "root_path", "")).strip("/\\"))
+
+    def manage_domains(self, policy: Any, mount: Any, action: str, domain: str = "") -> dict:
+        from store.oss.domains import manage_domains
+
+        client = self._client_for(policy)
+        if action != "check":
+            return manage_domains(client, self._bucket(policy), self._region(policy), action, domain)
+        from types import SimpleNamespace
+        from store.oss.download import domain_url
+
+        normalized = domain_url(domain)
+        result = manage_domains(client, self._bucket(policy), self._region(policy), "list")
+        host = urlsplit(normalized).hostname
+        binding = next((item for item in result["domains"] if item["domain"].lower() == host), None)
+        result.update(domain=host, bound=binding is not None, status=binding["status"] if binding else "Unbound")
+        # Sign a browser test URL without sending server requests to the custom host.
+        # The user can verify DNS, TLS and actual data access in the browser.
+        if binding is None or binding["status"] != "Enabled":
+            return result
+        sample = next((item for item in self.iter_objects(policy, mount) if not item.object_key.endswith("/")), None)
+        if sample is not None:
+            preview_policy = SimpleNamespace(
+                **{name: getattr(policy, name, None) for name in (
+                    "bucket_name", "region", "endpoint", "base_prefix", "credentials", "presign_ttl_seconds",
+                )},
+                extra={**(policy.extra or {}), "download_domain_type": "origin", "download_domain": normalized},
+            )
+            result["test_url"] = self.build_download_url(preview_policy, mount, sample.object_key, expires_in=300).url
+        return result
 
     def physical_id(self, policy: Any, mount: Any, object_key: str) -> str:
         return physical_hash(
@@ -167,9 +204,11 @@ class AliyunOssAdapter(StorageAdapterBase):
                 metadata={
                     "last_modified": str(getattr(item, "last_modified", "") or ""),
                     "storage_class": str(getattr(item, "storage_class", "") or ""),
+                    "is_directory_marker": item.key.endswith("/") and getattr(item, "size", None) == 0,
                 },
             )
             for item in (getattr(result, "contents", None) or [])
+            if logical_key(policy, mount, item.key)
         ]
         prefixes = [
             logical_key(policy, mount, item.prefix.rstrip("/")) + "/"
@@ -208,18 +247,36 @@ class AliyunOssAdapter(StorageAdapterBase):
         *,
         mime_type: str | None = None,
         metadata: dict[str, str] | None = None,
+        no_overwrite: bool = False,
     ) -> StorageObject:
+        if no_overwrite:
+            self._require_unversioned(policy)
         result = self._client_for(policy).put_object(oss.PutObjectRequest(
             bucket=self._bucket(policy),
             key=self._key(policy, mount, object_key),
             body=body,
             content_type=mime_type,
             metadata=metadata or None,
+            forbid_overwrite=True if no_overwrite else None,
             **self._encryption_args(policy),
         ))
         stored = self.head_object(policy, mount, object_key)
         stored.etag = stored.etag or self._clean_etag(getattr(result, "etag", None))
         return stored
+
+    def put_directory_marker(self, policy: Any, mount: Any, directory: str) -> None:
+        self._require_unversioned(policy)
+        key = self._validate_physical_key(self._key(policy, mount, directory).rstrip("/") + "/")
+        self._client_for(policy).put_object(oss.PutObjectRequest(
+            bucket=self._bucket(policy), key=key, body=BytesIO(b""),
+            forbid_overwrite=True, **self._encryption_args(policy),
+        ))
+
+    def delete_directory_marker(self, policy: Any, mount: Any, directory: str) -> None:
+        key = self._validate_physical_key(self._key(policy, mount, directory).rstrip("/") + "/")
+        self._client_for(policy).delete_object(oss.DeleteObjectRequest(
+            bucket=self._bucket(policy), key=key,
+        ))
 
     def open_object(
         self,
@@ -236,15 +293,106 @@ class AliyunOssAdapter(StorageAdapterBase):
         ))
         return OssStream(result.body)
 
-    def copy_object(self, policy: Any, mount: Any, source_key: str, destination_key: str) -> StorageObject:
+    def copy_object(
+        self, policy: Any, mount: Any, source_key: str, destination_key: str, *,
+        no_overwrite: bool = False,
+        expected_source_identity: dict[str, str | int] | None = None,
+    ) -> StorageObject:
+        if expected_source_identity is not None and not no_overwrite:
+            raise ValueError("Source identity requires an overwrite-protected copy")
+        if no_overwrite:
+            self._require_unversioned(policy)
+            if self._key(policy, mount, source_key) == self._key(policy, mount, destination_key):
+                raise ValueError("OSS protected copy requires a different destination")
+            source = self.inspect_copy_source(policy, mount, source_key)
+            require_source_identity(source, expected_source_identity)
+            if source.size > 1024 * 1024 * 1024:
+                return self._copy_multipart_without_overwrite(policy, mount, source_key, source, destination_key)
+        else:
+            source = None
         self._client_for(policy).copy_object(oss.CopyObjectRequest(
             bucket=self._bucket(policy),
             key=self._key(policy, mount, destination_key),
             source_bucket=self._bucket(policy),
             source_key=self._key(policy, mount, source_key),
-            **self._encryption_args(policy),
+            forbid_overwrite=True if no_overwrite else None,
+            if_match=source.etag if source is not None else None,
+            object_acl=source.acl if source is not None else None,
+            storage_class=source.storage_class if source is not None else None,
+            **(source.encryption_args() if source is not None else self._encryption_args(policy)),
         ))
+        if source is not None:
+            self._verify_protected_copy(policy, mount, source_key, destination_key, source)
         return self.head_object(policy, mount, destination_key)
+
+    def inspect_copy_source(self, policy: Any, mount: Any, source_key: str) -> CopySnapshot:
+        source = read_copy_snapshot(self._client_for(policy), oss, self._bucket(policy), self._key(policy, mount, source_key))
+        if source.size > 1024 * 1024 * 1024:
+            if source.content_md5:
+                raise ValueError("OSS multipart copy cannot preserve the source Content-MD5")
+            if max(16 * 1024 * 1024, ceil(source.size / self.capabilities.max_parts)) > self.capabilities.max_part_size:
+                raise ValueError("OSS source is too large for multipart copy")
+        return source
+
+    def object_key_exists(self, policy: Any, mount: Any, object_key: str, *, directory_marker: bool = False) -> bool:
+        key = self._key(policy, mount, object_key)
+        if directory_marker:
+            key = self._validate_physical_key(key.rstrip("/") + "/")
+        return exact_key_exists(lambda: self._client_for(policy).get_symlink(
+            oss.GetSymlinkRequest(bucket=self._bucket(policy), key=key)))
+
+    def _copy_multipart_without_overwrite(
+        self, policy: Any, mount: Any, source_key: str, source: CopySnapshot, destination_key: str,
+    ) -> StorageObject:
+        part_size = max(16 * 1024 * 1024, ceil(source.size / self.capabilities.max_parts))
+        if part_size > self.capabilities.max_part_size:
+            raise ValueError("OSS source is too large for multipart copy")
+        upload = self.create_multipart_upload(
+            policy, mount, destination_key, total_size=source.size,
+            mime_type=source.content_type, metadata=dict(source.metadata), _copy_snapshot=source,
+        )
+        parts: list[MultipartPart] = []
+        client = self._client_for(policy)
+        bucket = self._bucket(policy)
+        try:
+            for index, start in enumerate(range(0, source.size, part_size), start=1):
+                end = min(start + part_size, source.size) - 1
+                result = client.upload_part_copy(oss.UploadPartCopyRequest(
+                    bucket=bucket, key=self._key(policy, mount, destination_key),
+                    upload_id=upload.upload_id, part_number=index,
+                    source_bucket=bucket, source_key=self._key(policy, mount, source_key),
+                    source_range=f"bytes={start}-{end}", if_match=source.etag,
+                ))
+                etag = self._clean_etag(getattr(result, "etag", None))
+                if not etag:
+                    raise RuntimeError("OSS did not return a copied part ETag")
+                parts.append(MultipartPart(part_number=index, etag=etag, size=end - start + 1))
+            if read_copy_snapshot(client, oss, bucket, self._key(policy, mount, source_key)) != source:
+                raise RuntimeError("OSS source changed during the protected copy")
+            result = self.complete_multipart_upload(
+                policy, mount, upload, parts, no_overwrite=True, object_acl=source.acl,
+            )
+            self._verify_protected_copy(policy, mount, source_key, destination_key, source)
+            return result
+        except BaseException:
+            with suppress(Exception):
+                self.abort_multipart_upload(policy, mount, upload)
+            raise
+
+    def _verify_protected_copy(
+        self, policy: Any, mount: Any, source_key: str, destination_key: str, source: CopySnapshot,
+    ) -> None:
+        client = self._client_for(policy)
+        bucket = self._bucket(policy)
+        target = read_copy_snapshot(client, oss, bucket, self._key(policy, mount, destination_key))
+        if target.preserved_attributes() != source.preserved_attributes():
+            raise RuntimeError("OSS copied object attributes differ from the source")
+        if source.crc64 and source.crc64 != target.crc64:
+            raise RuntimeError("OSS copied object checksum differs from the source")
+        if source.content_md5 and source.content_md5 != target.content_md5:
+            raise RuntimeError("OSS copied object Content-MD5 differs from the source")
+        if read_copy_snapshot(client, oss, bucket, self._key(policy, mount, source_key)) != source:
+            raise RuntimeError("OSS source changed during the protected copy")
 
     def delete_object(self, policy: Any, mount: Any, object_key: str, *, hard_delete: bool = False) -> bool:
         client = self._client_for(policy)
@@ -261,8 +409,13 @@ class AliyunOssAdapter(StorageAdapterBase):
                         ))
         return True
 
+    def delete_object_version(self, policy: Any, mount: Any, object_key: str, version_id: str) -> None:
+        self._client_for(policy).delete_object(oss.DeleteObjectRequest(
+            bucket=self._bucket(policy), key=self._key(policy, mount, object_key), version_id=version_id,
+        ))
+
     def mount_has_objects(self, policy: Any, mount: Any) -> bool:
-        return bool(self.list_objects(policy, mount, max_keys=1).objects)
+        return next(self.iter_objects(policy, mount, max_keys=1), None) is not None
 
     def purge_mount(self, policy: Any, mount: Any) -> int:
         client = self._client_for(policy)
@@ -292,13 +445,17 @@ class AliyunOssAdapter(StorageAdapterBase):
         *,
         mime_type: str | None = None,
         metadata: dict[str, str] | None = None,
+        no_overwrite: bool = False,
     ) -> PresignedURL:
+        if no_overwrite:
+            self._require_unversioned(policy)
         ttl = self._ttl(policy)
         result = self._client_for(policy).presign(oss.PutObjectRequest(
             bucket=self._bucket(policy),
             key=self._key(policy, mount, object_key),
             content_type=mime_type,
             metadata=metadata or None,
+            forbid_overwrite=True if no_overwrite else None,
             **self._encryption_args(policy),
         ), expires=timedelta(seconds=ttl))
         return self._presigned(result, ttl)
@@ -312,15 +469,36 @@ class AliyunOssAdapter(StorageAdapterBase):
         total_size: int | None = None,
         mime_type: str | None = None,
         metadata: dict[str, str] | None = None,
+        no_overwrite: bool = False,
+        _copy_snapshot: CopySnapshot | None = None,
     ) -> MultipartUploadState:
+        if no_overwrite:
+            self._require_unversioned(policy)
+        # OSS signs these as x-oss-meta-* headers and does not allow underscores in their names.
+        oss_metadata = (dict(_copy_snapshot.metadata) if _copy_snapshot is not None else
+                        {key.replace("_", "-"): value for key, value in (metadata or {}).items() if value})
+        file_name = oss_metadata.get("file-name")
+        if _copy_snapshot is None and file_name and not file_name.isascii():
+            # The SDK sends custom metadata as HTTP headers, which cannot carry raw Unicode.
+            oss_metadata["cloudrave-file-name-utf8"] = quote(oss_metadata.pop("file-name"), safe="")
+        copy_args = {} if _copy_snapshot is None else {
+            "cache_control": _copy_snapshot.cache_control,
+            "content_disposition": _copy_snapshot.content_disposition,
+            "content_encoding": _copy_snapshot.content_encoding,
+            "expires": _copy_snapshot.expires,
+            "storage_class": _copy_snapshot.storage_class,
+            "tagging": _copy_snapshot.tagging_header(),
+        }
         result = self._client_for(policy).initiate_multipart_upload(oss.InitiateMultipartUploadRequest(
             bucket=self._bucket(policy),
             key=self._key(policy, mount, object_key),
             content_type=mime_type,
-            metadata=metadata or None,
-            **self._encryption_args(policy),
+            metadata=oss_metadata or None,
+            forbid_overwrite=True if no_overwrite or _copy_snapshot is not None else None,
+            **copy_args,
+            **(_copy_snapshot.encryption_args() if _copy_snapshot is not None else self._encryption_args(policy)),
         ))
-        upload_id = str(getattr(result, "upload_id", ""))
+        upload_id = str(getattr(result, "upload_id", None) or "")
         if not upload_id:
             raise RuntimeError("Aliyun OSS did not return an upload ID")
         ttl = self._ttl(policy)
@@ -405,6 +583,8 @@ class AliyunOssAdapter(StorageAdapterBase):
         mount: Any,
         upload: MultipartUploadState,
         parts: list[MultipartPart],
+        no_overwrite: bool = False,
+        object_acl: str | None = None,
         **_: Any,
     ) -> StorageObject:
         if not parts:
@@ -412,10 +592,14 @@ class AliyunOssAdapter(StorageAdapterBase):
         ordered = sorted(parts, key=lambda item: item.part_number)
         if len({item.part_number for item in ordered}) != len(ordered):
             raise ValueError("Multipart part numbers must be unique")
+        if no_overwrite:
+            self._require_unversioned(policy)
         self._client_for(policy).complete_multipart_upload(oss.CompleteMultipartUploadRequest(
             bucket=self._bucket(policy),
             key=self._key(policy, mount, upload.object_key),
             upload_id=upload.upload_id,
+            forbid_overwrite=True if no_overwrite else None,
+            object_acl=object_acl,
             complete_multipart_upload=oss.CompleteMultipartUpload(parts=[
                 oss.UploadPart(part_number=item.part_number, etag=item.etag) for item in ordered
             ]),
@@ -446,11 +630,13 @@ class AliyunOssAdapter(StorageAdapterBase):
         inline: bool = False,
     ) -> PresignedURL:
         ttl = self._ttl(policy) if expires_in is None else int(expires_in)
-        disposition = None
+        if ttl <= 0:
+            raise ValueError("expires_in must be positive")
+        disposition = "inline" if inline else None
         if download_name:
             kind = "inline" if inline else "attachment"
             disposition = f"{kind}; filename*=UTF-8''{quote(download_name)}"
-        result = self._client_for(policy).presign(oss.GetObjectRequest(
+        result = self._client_for(policy, download=True).presign(oss.GetObjectRequest(
             bucket=self._bucket(policy),
             key=self._key(policy, mount, object_key),
             response_content_disposition=disposition,
@@ -507,6 +693,8 @@ class AliyunOssAdapter(StorageAdapterBase):
 
     def _object_from_result(self, policy: Any, mount: Any, object_key: str, result: Any) -> StorageObject:
         metadata = {str(key): str(value) for key, value in (getattr(result, "metadata", None) or {}).items()}
+        if file_name := metadata.get("cloudrave-file-name-utf8"):
+            metadata["file-name"] = unquote(file_name)
         if getattr(result, "server_side_encryption", None):
             metadata["server_side_encryption"] = str(result.server_side_encryption)
         if getattr(result, "server_side_encryption_key_id", None):
@@ -521,6 +709,7 @@ class AliyunOssAdapter(StorageAdapterBase):
             version_id=getattr(result, "version_id", None),
             mime_type=getattr(result, "content_type", None),
             metadata=metadata,
+            last_modified=getattr(result, "last_modified", None),
         )
 
     def _encryption_args(self, policy: Any) -> dict[str, str]:
@@ -541,11 +730,24 @@ class AliyunOssAdapter(StorageAdapterBase):
     def _bucket(self, policy: Any) -> str:
         return str(self._target(policy)["bucket"])
 
+    def _require_unversioned(self, policy: Any) -> None:
+        result = self._client_for(policy).get_bucket_versioning(
+            oss.GetBucketVersioningRequest(bucket=self._bucket(policy))
+        )
+        if not hasattr(result, "version_status"):
+            raise ValueError("Could not verify OSS bucket versioning")
+        if str(getattr(result, "version_status", "") or "").strip():
+            raise ValueError("OSS bucket versioning must be disabled for overwrite-protected writes")
+
     def _region(self, policy: Any) -> str:
         return str(self._target(policy)["region"])
 
     def _key(self, policy: Any, mount: Any, object_key: str) -> str:
-        return physical_key(policy, mount, object_key)
+        return self._validate_physical_key(physical_key(policy, mount, object_key))
+
+    @staticmethod
+    def _validate_physical_key(key: str) -> str:
+        return validate_physical_key(key, max_bytes=1023, provider="OSS")
 
     def _list_prefix(self, policy: Any, mount: Any, prefix: str = "") -> str:
         return physical_list_prefix(policy, mount, prefix)

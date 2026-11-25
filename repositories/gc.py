@@ -14,16 +14,36 @@ class GcRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
-    async def create(self, *, policy_id: int, mount_id: int, blob_path: str, physical_id: str) -> GcTask:
+    async def create(
+        self, *, policy_id: int, mount_id: int, blob_path: str, physical_id: str,
+        source_identity: dict | None = None, retain_source: bool = False,
+    ) -> GcTask:
+        retained = retain_source or (
+            source_identity is not None and not (source_identity.get("version_id") or source_identity.get("managed_blob"))
+        )
         task = GcTask(
             policy_id=policy_id,
             mount_id=mount_id,
             blob_path=blob_path,
             physical_id=physical_id,
+            source_identity=source_identity,
+            state="retained" if retained else "pending",
         )
         self.session.add(task)
         await self.session.flush()
         return task
+
+    async def retained_sources(self, mount_id: int, physical_ids: set[str]) -> dict[str, list[dict]]:
+        if not physical_ids:
+            return {}
+        rows = await self.session.execute(select(GcTask.physical_id, GcTask.source_identity).where(
+            GcTask.mount_id == mount_id, GcTask.physical_id.in_(physical_ids), GcTask.source_identity.is_not(None),
+            GcTask.state.in_(("pending", "processing", "retained")),
+        ))
+        retained: dict[str, list[dict]] = {}
+        for physical_id, identity in rows:
+            retained.setdefault(physical_id, []).append(identity)
+        return retained
 
     async def claim_by_ids(self, task_ids: list[int]) -> list[GcTask]:
         if not task_ids:
@@ -57,8 +77,8 @@ class GcRepository:
         task.next_attempt_at = None
         await self.session.flush()
 
-    async def skipped(self, task: GcTask) -> None:
-        task.state = "skipped"
+    async def skipped(self, task: GcTask, *, retain_source: bool = False) -> None:
+        task.state = "retained" if retain_source else "skipped"
         task.error = None
         task.attempts += 1
         task.next_attempt_at = None

@@ -8,6 +8,13 @@ from pydantic import Field, field_validator
 
 from drives.ids import provider_id
 from schemas.common import CloudraveSchema
+from store.cos.download import download_settings
+
+
+def validate_download_extra(value):
+    if value is not None and any(key.startswith("download_") for key in value):
+        download_settings(value)
+    return value
 
 
 class _PolicySettings(CloudraveSchema):
@@ -31,6 +38,7 @@ class _PolicySettings(CloudraveSchema):
 
 
 class StoragePolicyCreate(_PolicySettings):
+    _validate_download = field_validator("extra")(validate_download_extra)
     name: str = Field(min_length=1, max_length=128)
     provider: str = Field(min_length=1, max_length=64)
     credentials: dict[str, str] | None = Field(default=None, exclude=True, repr=False)
@@ -47,6 +55,7 @@ class StoragePolicyCreate(_PolicySettings):
 
 
 class StoragePolicyUpdate(CloudraveSchema):
+    _validate_download = field_validator("extra")(validate_download_extra)
     name: str | None = Field(default=None, min_length=1, max_length=128)
     bucket_name: str | None = Field(default=None, min_length=1, max_length=255)
     region: str | None = Field(default=None, max_length=64)

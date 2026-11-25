@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from urllib.parse import urlencode
 from typing import Any, BinaryIO
 
 from store.types import MultipartPart, MultipartUploadState, PresignedURL, StorageObject, utcnow
+from store.cos.download import download_settings
+from store.cos.copy import CopySnapshot
 from store.cos.sec import (
     assert_encryption,
     encryption_args,
@@ -25,9 +28,14 @@ class CosUploadMixin:
         *,
         mime_type: str | None = None,
         metadata: dict[str, str] | None = None,
+        no_overwrite: bool = False,
     ) -> PresignedURL:
+        if no_overwrite:
+            self._require_unversioned(policy)
         ttl = self._ttl(policy)
         headers = signed_encryption_headers(policy)
+        if no_overwrite:
+            headers["x-cos-forbid-overwrite"] = "true"
         if mime_type:
             headers["Content-Type"] = mime_type
         headers.update(metadata_headers(metadata))
@@ -55,6 +63,7 @@ class CosUploadMixin:
         *,
         mime_type: str | None = None,
         metadata: dict[str, str] | None = None,
+        no_overwrite: bool = False,
     ) -> PresignedURL:
         return await asyncio.to_thread(
             self.presign_put,
@@ -63,6 +72,7 @@ class CosUploadMixin:
             object_key,
             mime_type=mime_type,
             metadata=metadata,
+            no_overwrite=no_overwrite,
         )
 
     def create_multipart_upload(
@@ -74,12 +84,23 @@ class CosUploadMixin:
         total_size: int | None = None,
         mime_type: str | None = None,
         metadata: dict[str, str] | None = None,
+        no_overwrite: bool = False,
+        _copy_snapshot: CopySnapshot | None = None,
     ) -> MultipartUploadState:
-        kwargs: dict[str, Any] = encryption_args(policy)
-        if mime_type:
-            kwargs["ContentType"] = mime_type
-        if metadata:
-            kwargs["Metadata"] = metadata_headers(metadata)
+        if no_overwrite:
+            self._require_unversioned(policy)
+        if _copy_snapshot is None:
+            kwargs: dict[str, Any] = encryption_args(policy)
+            if mime_type:
+                kwargs["ContentType"] = mime_type
+            if metadata:
+                kwargs["Metadata"] = metadata_headers(metadata)
+        else:
+            kwargs = _copy_snapshot.write_args()
+            kwargs.update(_copy_snapshot.acl_args())
+            kwargs["Metadata"] = {f"x-cos-meta-{key}": value for key, value in _copy_snapshot.metadata}
+            if _copy_snapshot.tags:
+                kwargs["Tagging"] = _copy_snapshot.tagging_header()
         response = self._client_for(policy).create_multipart_upload(
             Bucket=self._bucket(policy),
             Key=self._key(policy, mount, object_key),
@@ -201,6 +222,8 @@ class CosUploadMixin:
         *,
         mime_type: str | None = None,
         metadata: dict[str, str] | None = None,
+        no_overwrite: bool = False,
+        _verify_encryption: bool = True,
     ) -> StorageObject:
         if not parts:
             raise ValueError("at least one multipart part is required")
@@ -213,6 +236,9 @@ class CosUploadMixin:
             if not part.etag:
                 raise ValueError("every multipart part requires an ETag")
             seen.add(part.part_number)
+        if no_overwrite:
+            self._require_unversioned(policy)
+        headers = {"Metadata": {"x-cos-forbid-overwrite": "true"}} if no_overwrite else {}
         self._client_for(policy).complete_multipart_upload(
             Bucket=self._bucket(policy),
             Key=self._key(policy, mount, upload.object_key),
@@ -223,8 +249,9 @@ class CosUploadMixin:
                     for part in ordered
                 ]
             },
+            **headers,
         )
-        completed = self.head_object(policy, mount, upload.object_key, verify_encryption=True)
+        completed = self.head_object(policy, mount, upload.object_key, verify_encryption=_verify_encryption)
         if upload.total_size is not None and completed.size != upload.total_size:
             raise RuntimeError(
                 f"COS multipart size mismatch: expected {upload.total_size}, received {completed.size}"
@@ -260,12 +287,23 @@ class CosUploadMixin:
         ttl = self._ttl(policy) if expires_in is None else expires_in
         if ttl <= 0:
             raise ValueError("expires_in must be positive")
-        url = self._client_for(policy).get_presigned_url(
+        mode, _, auth = download_settings(getattr(policy, "extra", None) or {})
+        client = self._client_for(policy, download=True)
+        params = response_params(download_name, inline)
+        if mode == "cdn" and auth == "public":
+            url = client.get_object_url(Bucket=self._bucket(policy), Key=self._key(policy, mount, object_key))
+            if params:
+                url += "?" + urlencode(params)
+            return PresignedURL(method="GET", url=url, expires_at=None)
+        if token := self._target(policy).token:
+            params["x-cos-security-token"] = token
+        url = client.get_presigned_url(
             Method="GET",
             Bucket=self._bucket(policy),
             Key=self._key(policy, mount, object_key),
             Expired=ttl,
-            Params=response_params(download_name, inline),
+            Params=params,
+            SignHost=mode != "cdn",
         )
         return PresignedURL(method="GET", url=url, expires_at=utcnow() + self._seconds(ttl))
 

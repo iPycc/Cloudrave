@@ -42,17 +42,21 @@ class BlobRepository:
             if not revive:
                 raise BlobUnavailable("Physical object is being deleted or is no longer available")
             blob.state = "active"
+            blob.revision += 1
             await self.session.flush()
         return blob
 
     async def deleting(self, blob: BlobRef) -> None:
         blob.state = "deleting"
+        blob.revision += 1
         await self.session.flush()
 
     async def active(self, blob: BlobRef) -> None:
         blob.state = "active"
+        blob.revision += 1
         await self.session.flush()
 
     async def deleted(self, blob: BlobRef) -> None:
         blob.state = "deleted"
+        blob.revision += 1
         await self.session.flush()

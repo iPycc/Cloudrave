@@ -34,6 +34,8 @@ from schemas.preview import (
 from security.jwt import AuthError, TokenService
 from security.capabilities import Capability, has_capability, require_capability
 from services.explorer.download import DownloadFileService
+from services.explorer.path_write import new_file_path, put_new_file
+from services.explorer.write_policy import StorageWritePolicy
 from services.explorer.view.arc import ARCHIVE_READ_ERRORS, ArcMixin
 from services.explorer.view.base import (
     DERIVED_CACHE_CONTROL,
@@ -100,6 +102,8 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
     async def manifest(self, request: Request, actor: User, node_id: int) -> PreviewManifestRead:
         node, mount, policy = await self.resolver.resolve(actor, node_id)
         manifest = await self._build_manifest(request, node, mount, policy)
+        if manifest.kind == "image":
+            await self._add_image_assets(request, node, mount, policy, manifest)
         if Path(node.name).suffix.lower() in {".zip", ".7z"} and manifest.status == "ready":
             manifest.capabilities.append("extract")
         if manifest.kind == "pdf" and manifest.status == "ready":
@@ -182,32 +186,6 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
 
         if kind == "image":
             capabilities.extend(["zoom", "pan", "rotate", "actual-size", "edit"])
-            try:
-                image_metadata = await self._cached_json(
-                    node,
-                    "image-metadata",
-                    lambda: self._probe_image(node, mount, policy),
-                )
-                metadata.update(image_metadata)
-                for variant, width in IMAGE_VARIANTS.items():
-                    assets[variant] = PreviewAssetRead(
-                        url=relative_preview_url(
-                            request.url_for("preview_image_asset", node_id=node.id, variant=variant).include_query_params(v=version)
-                        ),
-                        mime_type="image/webp",
-                        width=min(width, int(image_metadata["width"])),
-                    )
-                if max(int(image_metadata["width"]), int(image_metadata["height"])) > 4096:
-                    assets["dzi"] = PreviewAssetRead(
-                        url=relative_preview_url(request.url_for("preview_dzi", node_id=node.id).include_query_params(v=version)),
-                        mime_type="application/xml",
-                    )
-                    metadata["tiled"] = True
-            except (OSError, UnidentifiedImageError, Image.DecompressionBombError) as exc:
-                metadata["probe_error"] = "Image metadata unavailable"
-                error = str(exc)
-                if metadata["extension"] == "svg":
-                    error = None
         elif kind in {"video", "audio"}:
             capabilities.extend(["play", "seek"])
             media_dir = self._media_dir(node, version)
@@ -301,10 +279,13 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
             metadata["public_source_ready"] = office_source.startswith("https://")
         elif kind == "text":
             capabilities.append("syntax")
-            editable = node.size <= self.text_max_bytes
+            imported = record is not None and (record.extra or {}).get("origin") == "bucket_import"
+            editable = node.size <= self.text_max_bytes and not imported
             if editable:
                 capabilities.append("edit")
             metadata["editable"] = editable
+            if imported:
+                metadata["read_only_reason"] = "导入的源文件暂不支持在线编辑"
             metadata["max_bytes"] = self.text_max_bytes
         elif kind == "archive":
             capabilities.append("list-entries")
@@ -340,6 +321,44 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
             preparation_available=preparation_available,
             error=error,
         )
+
+    async def _add_image_assets(
+        self,
+        request: Request,
+        node: Node,
+        mount: BucketMount,
+        policy: StoragePolicy,
+        manifest: PreviewManifestRead,
+    ) -> None:
+        if manifest.metadata["extension"] == "svg":
+            return
+
+        try:
+            image_metadata = await self._cached_json(
+                node, "image-metadata-v2", lambda: self._probe_image(node, mount, policy),
+            )
+        except (OSError, UnidentifiedImageError, Image.DecompressionBombError) as exc:
+            manifest.metadata["probe_error"] = "Image metadata unavailable"
+            manifest.error = str(exc)
+            return
+
+        manifest.metadata.update(image_metadata)
+        if node.size > SEEKABLE_MAX_BYTES:
+            return
+        for variant, width in IMAGE_VARIANTS.items():
+            url = request.url_for("preview_image_asset", node_id=node.id, variant=variant)
+            manifest.assets[variant] = PreviewAssetRead(
+                url=relative_preview_url(url.include_query_params(v=manifest.version)),
+                mime_type="image/webp",
+                width=min(width, int(image_metadata["width"])),
+            )
+        if max(int(image_metadata["width"]), int(image_metadata["height"])) > 4096:
+            url = request.url_for("preview_dzi", node_id=node.id)
+            manifest.assets["dzi"] = PreviewAssetRead(
+                url=relative_preview_url(url.include_query_params(v=manifest.version)),
+                mime_type="application/xml",
+            )
+            manifest.metadata["tiled"] = True
 
     async def get_pdf_annotations(self, actor: User, node_id: int) -> PdfAnnotationDocument:
         node, _mount, _policy = await self.resolver.resolve(actor, node_id)
@@ -490,8 +509,8 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
     ) -> TextContentUpdateRead:
         require_capability(actor, Capability.FILE_EDIT)
         node, mount, policy = await self.resolver.resolve(actor, node_id)
-        if mount.read_only:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bucket mount is read-only")
+        writes = StorageWritePolicy(self.nodes.session)
+        mount, policy = await writes.check(actor, mount.id)
         if preview_kind(node.name) != "text":
             raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="File is not editable text")
         locked_node = await self.nodes.get_by_id_for_update(node.id)
@@ -506,13 +525,21 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
         payload = content.encode("utf-8")
         if len(payload) > self.text_max_bytes:
             raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail="Text file exceeds the online editing limit")
+        await writes.check(actor, mount.id, max(0, len(payload) - node.size))
         record = await self.objects.get_by_node_id(node.id)
+        if record is not None and (record.extra or {}).get("origin") == "bucket_import":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="导入的文件暂不支持在线编辑，以免修改存储桶中的源文件",
+            )
         content_type = (record.content_type if record else None) or "text/plain; charset=utf-8"
         adapter = self.storage_manager.get_adapter(policy)
         if not node.blob_path:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="File has no storage object")
         current_blob = node.blob_path
-        current_physical = (record.physical_id if record else None) or adapter.physical_id(
+        current_physical = (record.physical_id if record else None) or await call_adapter(
+            adapter,
+            "physical_id",
             policy,
             mount,
             current_blob,
@@ -532,10 +559,15 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
             if references > 1
             else current_blob
         )
-        extra = dict(record.extra if record else {})
+        extra = dict((record.extra or {}) if record else {})
+        # These fields identify the previous object, not the bytes being saved.
+        # Do not send them back as custom object metadata or retain them if the
+        # provider omits the corresponding fields in its response.
+        for key in ("etag", "version_id", "last_modified"):
+            extra.pop(key, None)
         if target_blob != current_blob:
             extra["origin"] = "managed_edit"
-        await call_adapter(
+        stored = await call_adapter(
             adapter,
             "put_object",
             policy,
@@ -545,6 +577,12 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
             mime_type=content_type,
             metadata=extra,
         )
+        if getattr(stored, "etag", None):
+            extra["etag"] = stored.etag
+        if getattr(stored, "version_id", None):
+            extra["version_id"] = stored.version_id
+        if getattr(stored, "last_modified", None):
+            extra["last_modified"] = str(stored.last_modified)
         checksum = hashlib.sha256(payload).hexdigest()
         node.blob_path = target_blob
         await self.nodes.update_file_metadata(node, size=len(payload))
@@ -552,7 +590,7 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
             node_id=node.id,
             policy_id=policy.id,
             blob_path=target_blob,
-            physical_id=adapter.physical_id(policy, mount, target_blob),
+            physical_id=await call_adapter(adapter, "physical_id", policy, mount, target_blob),
             revive_physical=True,
             checksum=checksum,
             content_type=content_type,
@@ -580,8 +618,7 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
     ) -> Node:
         require_capability(actor, Capability.FILE_EDIT)
         source, mount, policy = await self.resolver.resolve(actor, node_id)
-        if mount.read_only:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bucket mount is read-only")
+        mount, policy = await StorageWritePolicy(self.nodes.session).check(actor, mount.id, len(payload))
         if preview_kind(source.name) != "image":
             raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="File is not an image")
         if len(payload) > 64 * 1024 * 1024:
@@ -610,17 +647,13 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
         existing = await self.nodes.get_child_names(source.mount_id, source.parent_id)
         target_name = _unique_name(safe_name, existing)
         adapter = self.storage_manager.get_adapter(policy)
-        object_key = managed_key(
-            actor.id,
-            target_name,
-            style=str((mount.extra or {}).get("object_key_style", "readable")),
-        )
-        stored = await call_adapter(
+        file_path = await new_file_path(self.nodes, self.objects, adapter, policy, mount, source.parent_id, target_name)
+        object_key = file_path.key
+        stored = await put_new_file(
             adapter,
-            "put_object",
             policy,
             mount,
-            object_key,
+            file_path,
             payload,
             mime_type=mime_type,
             metadata={"origin": "preview_image_edit", "source_node_id": str(source.id)},
@@ -633,19 +666,18 @@ class PreviewService(ImageMixin, DocMixin, MediaMixin, ArcMixin):
             blob_path=object_key,
             size=len(payload),
         )
+        extra = {"origin": "preview_image_edit", "source_node_id": source.id, "etag": getattr(stored, "etag", None)}
+        if file_path.blob_id is not None:
+            extra["path_blob_id"] = file_path.blob_id
         await self.objects.create_or_update(
             node_id=created.id,
             policy_id=policy.id,
             blob_path=object_key,
-            physical_id=adapter.physical_id(policy, mount, object_key),
+            physical_id=file_path.physical_id or await call_adapter(adapter, "physical_id", policy, mount, object_key),
             revive_physical=True,
             checksum=hashlib.sha256(payload).hexdigest(),
             content_type=mime_type,
-            extra={
-                "origin": "preview_image_edit",
-                "source_node_id": source.id,
-                "etag": getattr(stored, "etag", None),
-            },
+            extra=extra,
         )
         await self.audits.create(
             actor_id=actor.id,

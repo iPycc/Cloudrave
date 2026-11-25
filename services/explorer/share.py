@@ -15,8 +15,16 @@ from models.tables import Node, ShareRecord, User
 from repositories.audit_logs import AuditLogRepository
 from repositories.nodes import NodeRepository
 from repositories.shares import ShareRepository
-from schemas.share import ShareCreateRequest, ShareRead, ShareVerifyRequest
+from schemas.share import ShareCreateRequest, ShareRead, ShareUpdateRequest, ShareVerifyRequest
 from security.capabilities import Capability, require_capability
+
+
+def require_share_preview(share: ShareRecord) -> None:
+    # Original previews, manifests and archive entries can all expose file bytes
+    # or signed URLs. Limited shares authorize those bytes through downloads only.
+    if share.max_downloads is not None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail="Preview is unavailable for download-limited shares; use download")
 
 
 class ShareService:
@@ -95,6 +103,36 @@ class ShareService:
             self._serialize_share(share, share.node).model_copy(update={"item_count": len(share.items) or 1})
             for share in shares
         ]
+
+    async def update_share(self, request: Request, actor: User, share_id: str, payload: ShareUpdateRequest) -> ShareRead:
+        require_capability(actor, Capability.SHARE_MANAGE)
+        matches = await self.shares.list_by_ids([share_id])
+        share = matches[0] if matches else None
+        if share is None or share.owner_id != actor.id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Share not found")
+        if "expires_in_hours" in payload.model_fields_set:
+            share.expires_at = (
+                datetime.now(UTC) + timedelta(hours=payload.expires_in_hours)
+                if payload.expires_in_hours is not None
+                else None
+            )
+        if "max_downloads" in payload.model_fields_set:
+            if payload.max_downloads is not None and payload.max_downloads < share.download_count:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="下载次数不能小于已使用次数")
+            share.max_downloads = payload.max_downloads
+            if payload.max_downloads is not None and share.download_count >= payload.max_downloads:
+                share.is_active = False
+        await self.session.flush()
+        await self.audits.create(
+            actor_id=actor.id,
+            action="share.update",
+            target=f"share:{share_id}",
+            detail=f"expires={share.expires_at}; max_downloads={share.max_downloads}",
+            ip=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            request_id=getattr(request.state, "request_id", None),
+        )
+        return self._serialize_share(share, share.node).model_copy(update={"item_count": len(share.items) or 1})
 
     async def revoke_share(self, request: Request, actor: User, share_id: str) -> None:
         require_capability(actor, Capability.SHARE_MANAGE)

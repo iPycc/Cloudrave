@@ -13,7 +13,7 @@ def utcnow() -> datetime:
 
 
 def normalize_object_key(value: str) -> str:
-    candidate = value.replace("\\", "/").strip()
+    candidate = value.replace("\\", "/")
     candidate = candidate.lstrip("/")
     if not candidate:
         raise ValueError("object key is required")
@@ -80,6 +80,7 @@ class StorageObject:
     version_id: str | None = None
     mime_type: str | None = None
     metadata: dict[str, str] = field(default_factory=dict)
+    last_modified: datetime | str | None = None
 
 
 @dataclass(slots=True)

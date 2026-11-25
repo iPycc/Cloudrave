@@ -60,7 +60,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if len(window) >= request_limit:
             request.state.failure_reason = f"Rate limit exceeded ({bucket})"
             return JSONResponse(
-                {"detail": "Rate limit exceeded"},
+                {"detail": "Rate limit exceeded", "message": "Rate limit exceeded", "code": "rate_limited"},
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 headers={"Retry-After": str(int(self.window_seconds))},
             )
@@ -98,3 +98,16 @@ async def login_rate_limit(request: Request) -> None:
     """FastAPI dependency for sensitive authentication endpoints."""
     client_ip = request.client.host if request.client else "unknown"
     _check_login_window(client_ip)
+
+
+async def share_password_rate_limit(request: Request, share_id: str) -> None:
+    from repositories.shares import ShareRepository
+    from security.request_limits import consume_share_attempt
+
+    async with request.app.state.dep.session_scope() as session:
+        share = await ShareRepository(session).get_by_id(share_id)
+        allowed = await consume_share_attempt(session,
+            request.client.host if request.client else "unknown", share.id if share is not None else None)
+    if not allowed:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            detail="Too many share password attempts", headers={"Retry-After": "60"})

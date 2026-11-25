@@ -12,6 +12,7 @@ from models.tables import OAuthIdentity, SystemMeta, utcnow
 
 GITHUB_OAUTH_SETTINGS_KEY = "oauth.github.settings"
 GOOGLE_OAUTH_SETTINGS_KEY = "oauth.google.settings"
+GOOGLE_OAUTH_VERIFIED_KEY = "oauth.google.verified"
 QQ_OAUTH_SETTINGS_KEY = "oauth.qq.settings"
 
 
@@ -71,6 +72,18 @@ class GoogleOAuthSettingsRepository:
             row.value = serialized
         await self.session.flush()
         return value
+
+    async def get_verified_config(self) -> str:
+        value = await self.session.scalar(select(SystemMeta.value).where(SystemMeta.key == GOOGLE_OAUTH_VERIFIED_KEY))
+        return value or ""
+
+    async def set_verified_config(self, fingerprint: str) -> None:
+        row = await self.session.get(SystemMeta, GOOGLE_OAUTH_VERIFIED_KEY)
+        if row is None:
+            self.session.add(SystemMeta(key=GOOGLE_OAUTH_VERIFIED_KEY, value=fingerprint))
+        else:
+            row.value = fingerprint
+        await self.session.flush()
 
 
 class QQOAuthSettingsRepository:

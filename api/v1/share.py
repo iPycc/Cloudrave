@@ -8,7 +8,10 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, sta
 from fastapi.responses import Response
 
 from web.mid.auth import get_current_user
+from web.mid.rate import share_password_rate_limit
+from models.enums import NodeType
 from models.tables import Node, ShareRecord, User
+from services.explorer.idempotency import execute_once
 from schemas.common import MessageResponse
 from schemas.preview import PreviewManifestRead
 from schemas.share import (
@@ -16,6 +19,7 @@ from schemas.share import (
     ShareCreateRequest,
     ShareNodeInfo,
     ShareRead,
+    ShareUpdateRequest,
     ShareVerifyRequest,
     SharedNodeRead,
 )
@@ -27,8 +31,9 @@ from services.explorer.preview import (
     relative_preview_url,
 )
 from services.explorer.proxy import remote_response
-from services.explorer.share import ShareService
-from services.explorer.source import content_disposition
+from services.explorer.share import ShareService, require_share_preview
+from services.explorer.source import content_disposition, download_probe_response
+from services.explorer.view.base import preview_version
 from services.user.response import build_avatar_url
 
 
@@ -103,6 +108,7 @@ def _shared_node_read(node: Node) -> SharedNodeRead:
         name=node.name,
         type=node.type.value,
         size=node.size,
+        preview_version=preview_version(node) if node.type == NodeType.FILE else None,
     )
 
 
@@ -114,7 +120,10 @@ async def create_share(
 ) -> ShareRead:
     dep = request.app.state.dep
     async with dep.session_scope() as session:
-        return await _build_share_service(request, session).create_share(request, current_user, payload)
+        service = _build_share_service(request, session)
+        result = await execute_once(session, request, current_user, "share.create", payload,
+                                    lambda: service.create_share(request, current_user, payload))
+        return ShareRead.model_validate(result)
 
 
 @router.get("/my", response_model=list[ShareRead])
@@ -125,6 +134,18 @@ async def list_my_shares(
     dep = request.app.state.dep
     async with dep.session_scope() as session:
         return await _build_share_service(request, session).list_shares(current_user)
+
+
+@router.patch("/{share_id}", response_model=ShareRead)
+async def update_share(
+    share_id: str,
+    request: Request,
+    payload: ShareUpdateRequest = Body(...),
+    current_user: User = Depends(get_current_user),
+) -> ShareRead:
+    dep = request.app.state.dep
+    async with dep.session_scope() as session:
+        return await _build_share_service(request, session).update_share(request, current_user, share_id, payload)
 
 
 @router.delete("/{share_id}", response_model=MessageResponse)
@@ -196,6 +217,7 @@ async def verify_share_password(
     share_id: str,
     request: Request,
     payload: ShareVerifyRequest = Body(default=ShareVerifyRequest()),
+    _rate_limit: None = Depends(share_password_rate_limit),
 ) -> ShareAccessTokenResponse:
     dep = request.app.state.dep
     async with dep.session_scope() as session:
@@ -258,8 +280,11 @@ async def download_shared_file(
         if len(nodes) == 1 and nodes[0].type.value == "file":
             node, mount, policy = await download_service.resolve_shared(nodes[0].id)
             if request.method == "HEAD":
+                if share.max_downloads is not None:
+                    return download_probe_response(node.name, "cloudrave")
                 return await download_service.probe_response(node, mount, policy)
-            response = await download_service.response(node, mount, policy, request=request)
+            response = await download_service.response(node, mount, policy, request=request,
+                                                       relay=share.max_downloads is not None)
         else:
             archive_service = ArchiveDownloadService(
                 mounts=dep.get_mount_repository(session),
@@ -292,6 +317,7 @@ async def preview_shared_file(
         service = _build_share_service(request, session)
         share, _ = await service.get_share_info(share_id)
         _require_share_access(service, share, access_token)
+        require_share_preview(share)
         node = await service.resolve_shared_node(share, node_id)
         if node.type.value == "folder":
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Folders cannot be previewed")
@@ -336,6 +362,7 @@ async def preview_shared_manifest(
         service = _build_share_service(request, session)
         share, _ = await service.get_share_info(share_id)
         _require_share_access(service, share, access_token)
+        require_share_preview(share)
         node = await service.resolve_shared_node(share, node_id)
         if node.type.value == "folder":
             raise HTTPException(
@@ -382,6 +409,7 @@ async def preview_shared_archive_entry(
         service = _build_share_service(request, session)
         share, _ = await service.get_share_info(share_id)
         _require_share_access(service, share, access_token)
+        require_share_preview(share)
         node = await service.resolve_shared_node(share, node_id)
         if node.type.value == "folder":
             raise HTTPException(
@@ -418,6 +446,7 @@ async def shared_audio_cover(
         service = _build_share_service(request, session)
         share, _ = await service.get_share_info(share_id)
         _require_share_access(service, share, access_token)
+        require_share_preview(share)
         node = await service.resolve_shared_node(share, node_id)
         if node.type.value == "folder":
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Folders cannot have cover art")

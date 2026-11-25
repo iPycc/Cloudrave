@@ -27,6 +27,9 @@ def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+SYNC_CLAIM_GATE_KEY = "sync.claim_gate"
+
+
 class TimestampMixin:
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
@@ -199,6 +202,10 @@ class BucketMount(Base, TimestampMixin):
         return bool((self.extra or {}).get("read_only", False))
 
     @property
+    def legacy_prefixed_keys(self) -> bool:
+        return bool((self.extra or {}).get("legacy_prefixed_keys", False))
+
+    @property
     def sync_status(self) -> str:
         return str(((self.extra or {}).get("_sync") or {}).get("status", "never"))
 
@@ -219,6 +226,138 @@ class BucketMount(Base, TimestampMixin):
             return int(value)
         except (TypeError, ValueError):
             return 0
+
+
+class MountSyncTask(Base, TimestampMixin):
+    __tablename__ = "mount_sync_tasks"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    mount_id: Mapped[int] = mapped_column(ForeignKey("bucket_mounts.id", ondelete="CASCADE"), unique=True, index=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    generation: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    lease_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class MountSyncConflict(Base):
+    __tablename__ = "mount_sync_conflicts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    mount_id: Mapped[int] = mapped_column(ForeignKey("bucket_mounts.id", ondelete="CASCADE"))
+    generation: Mapped[str] = mapped_column(String(32))
+    key_hash: Mapped[str] = mapped_column(String(64))
+    key_json: Mapped[str] = mapped_column(Text)
+    reason: Mapped[str] = mapped_column(String(40))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("mount_id", "generation", "key_hash", name="uq_sync_conflict_identity"),
+        Index("ix_sync_conflict_page", "mount_id", "generation", "id"),
+    )
+
+
+class PathPlanTask(Base, TimestampMixin):
+    __tablename__ = "path_plan_tasks"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    mount_id: Mapped[int] = mapped_column(ForeignKey("bucket_mounts.id", ondelete="CASCADE"), index=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    template: Mapped[str] = mapped_column(Text)
+    rename_to: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    move_to: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    copy_to: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    copy_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    root_node_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    is_restore: Mapped[bool] = mapped_column(Boolean, default=False)
+    mapping: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    cursor: Mapped[int] = mapped_column(Integer, default=0)
+    max_node_id: Mapped[int] = mapped_column(Integer, default=0)
+    scanned: Mapped[int] = mapped_column(Integer, default=0)
+    ready: Mapped[int] = mapped_column(Integer, default=0)
+    unchanged: Mapped[int] = mapped_column(Integer, default=0)
+    conflicts: Mapped[int] = mapped_column(Integer, default=0)
+    bytes_to_copy: Mapped[int] = mapped_column(BigInteger, default=0)
+    lease_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+    @property
+    def target_parent_id(self) -> int | None:
+        return self.copy_to if self.copy_to is not None else self.move_to
+
+    @property
+    def is_path_operation(self) -> bool:
+        return self.is_restore or self.rename_to is not None or self.target_parent_id is not None
+
+
+class PathPlanEntry(Base):
+    __tablename__ = "path_plan_entries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("path_plan_tasks.id", ondelete="CASCADE"))
+    node_id: Mapped[int] = mapped_column(Integer)
+    kind: Mapped[str] = mapped_column(String(16))
+    source_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    target_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    target_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    path_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_physical_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_identity_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    size: Mapped[int] = mapped_column(BigInteger, default=0)
+    status: Mapped[str] = mapped_column(String(16))
+    reason: Mapped[str | None] = mapped_column(String(40), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("task_id", "node_id", name="uq_path_plan_node"),
+        Index("ix_path_plan_target", "task_id", "target_hash"),
+        Index("ix_path_plan_page", "task_id", "id"),
+    )
+
+
+class PathMigrationJob(Base, TimestampMixin):
+    """Durable execution state for a completed path precheck."""
+
+    __tablename__ = "path_migration_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    plan_id: Mapped[str] = mapped_column(ForeignKey("path_plan_tasks.id", ondelete="CASCADE"), unique=True)
+    mount_id: Mapped[int] = mapped_column(ForeignKey("bucket_mounts.id", ondelete="CASCADE"), index=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    cursor: Mapped[int] = mapped_column(Integer, default=0)
+    migrated: Mapped[int] = mapped_column(Integer, default=0)
+    prepared: Mapped[int] = mapped_column(Integer, default=0)
+    conflicts: Mapped[int] = mapped_column(Integer, default=0)
+    lease_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class PathMigrationRecord(Base, TimestampMixin):
+    """Write-ahead record for one copy and its protected destination."""
+
+    __tablename__ = "path_migration_records"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_id: Mapped[str] = mapped_column(ForeignKey("path_migration_jobs.id", ondelete="CASCADE"))
+    plan_entry_id: Mapped[int] = mapped_column(ForeignKey("path_plan_entries.id", ondelete="CASCADE"))
+    source_physical_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    target_physical_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="reserved")
+    copy_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    target_etag: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    target_version_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("job_id", "plan_entry_id", name="uq_path_migration_entry"),
+        Index("ix_path_migration_reservation", "target_physical_id", "status"),
+        Index("ix_path_migration_source", "source_physical_id", "status"),
+    )
 
 
 class Node(Base, TimestampMixin):
@@ -319,12 +458,18 @@ class ShareItem(Base):
 
 class UploadSessionRecord(Base, TimestampMixin):
     __tablename__ = "upload_sessions"
+    __table_args__ = (
+        Index("ix_upload_sessions_owner_idempotency", "owner_id", "idempotency_key", unique=True),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    request_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     mount_id: Mapped[int] = mapped_column(ForeignKey("bucket_mounts.id", ondelete="CASCADE"), index=True)
     node_id: Mapped[int | None] = mapped_column(ForeignKey("nodes.id", ondelete="SET NULL"), nullable=True)
     path: Mapped[str] = mapped_column(String(1024))
+    path_token: Mapped[str | None] = mapped_column(String(32), nullable=True)
     mode: Mapped[UploadMode] = mapped_column(Enum(UploadMode, native_enum=False))
     state: Mapped[UploadState] = mapped_column(Enum(UploadState, native_enum=False), default=UploadState.CREATED)
     upload_id: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -334,6 +479,9 @@ class UploadSessionRecord(Base, TimestampMixin):
     provider_checksum: Mapped[str | None] = mapped_column(String(128), nullable=True)
     size: Mapped[int] = mapped_column(BigInteger, default=0)
     part_size: Mapped[int] = mapped_column(BigInteger, default=0)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
 
 class UploadPartRecord(Base):
@@ -365,3 +513,34 @@ class AuditLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     __table_args__ = (Index("ix_audit_logs_actor_created", "actor_id", "created_at"),)
+
+
+class IdempotencyRecord(Base):
+    __tablename__ = "idempotency_records"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    operation: Mapped[str] = mapped_column(String(40))
+    key: Mapped[str] = mapped_column(String(128))
+    request_hash: Mapped[str] = mapped_column(String(64))
+    response: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (UniqueConstraint("owner_id", "operation", "key", name="uq_idempotency_owner_operation_key"),)
+
+
+class DerivedTask(Base):
+    __tablename__ = "derived_tasks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(20))
+    version: Mapped[str] = mapped_column(String(20))
+    state: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (UniqueConstraint("node_id", "kind", "version", name="uq_derived_node_kind_version"),)

@@ -8,29 +8,40 @@ import inspect
 import logging
 import mimetypes
 import tempfile
+import time
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
+from threading import Event
 from uuid import uuid4
 
 from fastapi import HTTPException, status
 import py7zr
 
-from models.enums import NodeType
+from models.enums import NodeType, UserStatus
+from security.capabilities import Capability, require_capability
+from services.explorer.path_write import new_file_path, put_new_file, put_new_folder
+from services.explorer.write_policy import StorageWritePolicy
+from services.explorer.archive_limits import BoundedArchiveFactory
 from repositories.nodes import _unique_name
 from schemas.task import BackgroundTaskRead
 from store.call import call_adapter
-from store.key import managed_key
 
 
 MAX_ENTRIES = 10_000
-MAX_TOTAL_BYTES = 20 * 1024 * 1024 * 1024
-MAX_ENTRY_BYTES = 4 * 1024 * 1024 * 1024
+MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
+MAX_TOTAL_BYTES = 512 * 1024 * 1024
+MAX_ENTRY_BYTES = 128 * 1024 * 1024
 MAX_COMPRESSION_RATIO = 200
 CHUNK_SIZE = 1024 * 1024
+MAX_RUNNING_TASKS = 4
+MAX_USER_TASKS = 1
+MAX_TASK_HISTORY = 200
+MAX_USER_HISTORY = 50
+TASK_TIMEOUT_SECONDS = 300
 
 LOGGER = logging.getLogger(__name__)
 
@@ -46,6 +57,7 @@ class _Task:
     result_node_id: int | None
     created_at: datetime
     updated_at: datetime
+    deadline: float = 0.0
 
 
 @dataclass(slots=True, frozen=True)
@@ -77,6 +89,7 @@ def _read(task: _Task) -> BackgroundTaskRead:
 
 
 def list_tasks(owner_id: int) -> list[BackgroundTaskRead]:
+    _trim_history()
     return [
         _read(task)
         for task in sorted(_tasks.values(), key=lambda item: item.created_at, reverse=True)
@@ -92,6 +105,8 @@ async def start_extract(
     selected_paths: list[str] | None = None,
 ) -> BackgroundTaskRead:
     async with dep.session_scope() as session:
+        actor = await dep.get_user_repository(session).get_by_id(actor_id)
+        _require_actor(actor)
         node = await dep.get_node_repository(session).get_by_id(node_id)
         if (
             node is None
@@ -101,6 +116,7 @@ async def start_extract(
             or Path(node.name).suffix.lower() not in {".zip", ".7z"}
         ):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Archive file not found")
+        await StorageWritePolicy(session).check(actor, node.mount_id)
         if target_parent_id is not None:
             parent = await dep.get_node_repository(session).get_by_id(target_parent_id)
             if (
@@ -108,6 +124,7 @@ async def start_extract(
                 or parent.owner_id != actor_id
                 or parent.mount_id != node.mount_id
                 or parent.type != NodeType.FOLDER
+                or parent.deleted_at is not None
             ):
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target folder not found")
         if selected_paths:
@@ -116,6 +133,10 @@ async def start_extract(
             selected_paths = list(dict.fromkeys(path.replace("\\", "/").strip("/") for path in selected_paths))
 
     now = datetime.now(UTC)
+    active = [task for task in _tasks.values() if task.status in {"pending", "running"}]
+    if len(active) >= MAX_RUNNING_TASKS or sum(task.owner_id == actor_id for task in active) >= MAX_USER_TASKS:
+        raise HTTPException(status_code=429, detail="Archive extraction limit reached", headers={"Retry-After": "30"})
+    _trim_history()
     task = _Task(
         id=str(uuid4()),
         owner_id=actor_id,
@@ -126,6 +147,7 @@ async def start_extract(
         result_node_id=None,
         created_at=now,
         updated_at=now,
+        deadline=time.monotonic() + TASK_TIMEOUT_SECONDS,
     )
     _tasks[task.id] = task
     runner = asyncio.create_task(
@@ -133,7 +155,12 @@ async def start_extract(
         name=f"archive-extract-{task.id}",
     )
     _running.add(runner)
-    runner.add_done_callback(_running.discard)
+    def finished(runner):
+        _running.discard(runner)
+        if task.status in {"pending", "running"}:
+            _update(task, status="failed", detail="任务已取消")
+        _trim_history()
+    runner.add_done_callback(finished)
     return _read(task)
 
 
@@ -141,6 +168,41 @@ def _update(task: _Task, **values) -> None:
     for key, value in values.items():
         setattr(task, key, value)
     task.updated_at = datetime.now(UTC)
+
+
+def _trim_history() -> None:
+    completed = sorted((task for task in _tasks.values() if task.status in {"completed", "failed"}),
+                       key=lambda task: task.updated_at, reverse=True)
+    counts: dict[int, int] = {}
+    retained = 0
+    for task in completed:
+        counts[task.owner_id] = counts.get(task.owner_id, 0) + 1
+        if counts[task.owner_id] > MAX_USER_HISTORY or retained >= MAX_TASK_HISTORY:
+            _tasks.pop(task.id, None)
+        else:
+            retained += 1
+
+
+def _check_deadline(task) -> None:
+    if getattr(task, "deadline", 0) and time.monotonic() > task.deadline:
+        raise TimeoutError("Archive extraction timed out")
+
+
+def _require_actor(actor) -> None:
+    if actor is None or actor.status != UserStatus.ACTIVE:
+        raise HTTPException(status_code=403, detail="Account is unavailable")
+    require_capability(actor, Capability.TASK_MANAGE)
+
+
+async def _write_context(dep, session, owner_id: int, mount_id: int, size: int = 0):
+    actor = await dep.get_user_repository(session).get_by_id(owner_id)
+    _require_actor(actor)
+    return await StorageWritePolicy(session).check(actor, mount_id, size)
+
+
+async def _check_archive_budget(dep, task: _Task, source: _ExtractSource, size: int) -> None:
+    async with dep.session_scope() as session:
+        await _write_context(dep, session, task.owner_id, source.mount.id, size)
 
 
 def _safe_parts(filename: str) -> tuple[str, ...] | None:
@@ -165,8 +227,14 @@ async def _call_stream_method(method: Callable[..., Any], *args: Any) -> Any:
     return await result if inspect.isawaitable(result) else result
 
 
-async def _copy_stream(source: Any, target: BinaryIO) -> None:
+async def _copy_stream(source: Any, target: BinaryIO, task=None) -> None:
+    copied = 0
     while chunk := await _call_stream_method(source.read, CHUNK_SIZE):
+        if task is not None:
+            _check_deadline(task)
+        copied += len(chunk)
+        if copied > MAX_ARCHIVE_BYTES:
+            raise ValueError("Archive source is too large")
         await asyncio.to_thread(target.write, chunk)
 
 
@@ -179,18 +247,22 @@ async def _close_stream(source: Any) -> None:
 async def _load_extract_source(dep, task: _Task, node_id: int, target_parent_id: int | None) -> _ExtractSource:
     """Load archive metadata without keeping a transaction over storage I/O."""
 
+    _check_deadline(task)
     async with dep.session_scope() as session:
         nodes = dep.get_node_repository(session)
-        mounts = dep.get_mount_repository(session)
-        policies = dep.get_policy_repository(session)
         node = await nodes.get_by_id(node_id)
-        if node is None or not node.blob_path:
+        if (node is None or node.type != NodeType.FILE or node.owner_id != task.owner_id
+                or node.deleted_at is not None or not node.blob_path):
             raise RuntimeError("ZIP source no longer exists")
-        mount = await mounts.get_by_id(node.mount_id)
-        policy = await policies.get_by_id(mount.policy_id) if mount else None
-        if mount is None or policy is None:
-            raise RuntimeError("ZIP storage mount is unavailable")
+        if node.size > MAX_ARCHIVE_BYTES:
+            raise HTTPException(status_code=413, detail="Archive source exceeds 512 MB")
+        mount, policy = await _write_context(dep, session, task.owner_id, node.mount_id)
         parent_id = target_parent_id if target_parent_id is not None else node.parent_id
+        if parent_id is not None:
+            parent = await nodes.get_by_id(parent_id)
+            if (parent is None or parent.owner_id != task.owner_id or parent.mount_id != mount.id
+                    or parent.type != NodeType.FOLDER or parent.deleted_at is not None):
+                raise HTTPException(status_code=404, detail="Target folder not found")
         if parent_id is None:
             parent = await nodes.ensure_mount_root(owner_id=task.owner_id, mount_id=mount.id, name=mount.name)
             parent_id = parent.id
@@ -204,7 +276,9 @@ async def _load_extract_source(dep, task: _Task, node_id: int, target_parent_id:
 
 
 async def _create_extract_root(dep, task: _Task, source: _ExtractSource) -> int:
+    _check_deadline(task)
     async with dep.session_scope() as session:
+        mount, policy = await _write_context(dep, session, task.owner_id, source.mount.id)
         nodes = dep.get_node_repository(session)
         existing = await nodes.get_child_names(source.mount.id, source.parent_id)
         root = await nodes.create_folder(
@@ -213,6 +287,7 @@ async def _create_extract_root(dep, task: _Task, source: _ExtractSource) -> int:
             parent_id=source.parent_id,
             name=_unique_name(Path(source.node_name).stem, existing),
         )
+        await put_new_folder(nodes, dep.storage_manager, policy, mount, root)
         return root.id
 
 
@@ -226,9 +301,11 @@ async def _ensure_folder_path(
 ) -> int:
     cursor: tuple[str, ...] = ()
     for segment in parts:
+        _check_deadline(task)
         next_cursor = (*cursor, segment)
         if next_cursor not in folder_ids:
             async with dep.session_scope() as session:
+                mount, policy = await _write_context(dep, session, task.owner_id, mount_id)
                 nodes = dep.get_node_repository(session)
                 parent_id = folder_ids[cursor]
                 siblings = await nodes.get_child_names(mount_id, parent_id)
@@ -238,6 +315,7 @@ async def _ensure_folder_path(
                     parent_id=parent_id,
                     name=_unique_name(segment, siblings),
                 )
+                await put_new_folder(nodes, dep.storage_manager, policy, mount, folder)
                 folder_ids[next_cursor] = folder.id
         cursor = next_cursor
     return folder_ids[cursor]
@@ -250,39 +328,46 @@ async def _persist_uploaded_file(
     source: _ExtractSource,
     parent_id: int,
     filename: str,
-    object_key: str,
     size: int,
     checksum: str,
     content_type: str,
-    physical_id: str | None,
-    etag: str | None,
+    payload: BinaryIO,
 ) -> str:
-    """Persist one uploaded object in a short transaction."""
-
-    async with dep.session_scope() as session:
-        nodes = dep.get_node_repository(session)
-        objects = dep.get_object_repository(session)
-        siblings = await nodes.get_child_names(source.mount.id, parent_id)
-        target_name = _unique_name(filename, siblings)
-        created = await nodes.create_file(
-            owner_id=task.owner_id,
-            mount_id=source.mount.id,
-            parent_id=parent_id,
-            name=target_name,
-            blob_path=object_key,
-            size=size,
-        )
-        await objects.create_or_update(
-            node_id=created.id,
-            policy_id=source.policy.id,
-            blob_path=object_key,
-            physical_id=physical_id,
-            revive_physical=True,
-            checksum=checksum,
-            content_type=content_type,
-            extra={"origin": "archive_extract", "etag": etag},
-        )
+    """Check quota and store bytes/metadata while holding the same mount lock."""
+    object_written = False
+    adapter = None
+    _check_deadline(task)
+    try:
+        async with dep.session_scope() as session:
+            mount, policy = await _write_context(dep, session, task.owner_id, source.mount.id, size)
+            nodes = dep.get_node_repository(session)
+            parent = await nodes.get_by_id(parent_id)
+            if (parent is None or parent.owner_id != task.owner_id or parent.mount_id != mount.id
+                    or parent.type != NodeType.FOLDER or parent.deleted_at is not None):
+                raise HTTPException(status_code=404, detail="Target folder not found")
+            siblings = await nodes.get_child_names(mount.id, parent_id)
+            target_name = _unique_name(filename, siblings)
+            adapter = dep.storage_manager.get_adapter(policy)
+            objects = dep.get_object_repository(session)
+            file_path = await new_file_path(nodes, objects, adapter, policy, mount, parent_id, target_name)
+            object_key = file_path.key
+            stored = await put_new_file(adapter, policy, mount, file_path, payload,
+                mime_type=content_type, metadata={"origin": "archive_extract"})
+            object_written = True
+            created = await nodes.create_file(owner_id=task.owner_id, mount_id=mount.id,
+                parent_id=parent_id, name=target_name, blob_path=object_key, size=size)
+            extra = {"origin": "archive_extract", "etag": getattr(stored, "etag", None)}
+            if file_path.blob_id is not None:
+                extra["path_blob_id"] = file_path.blob_id
+            await objects.create_or_update(
+                node_id=created.id, policy_id=policy.id, blob_path=object_key,
+                physical_id=file_path.physical_id or await call_adapter(adapter, "physical_id", policy, mount, object_key),
+                revive_physical=True, checksum=checksum, content_type=content_type, extra=extra)
         return target_name
+    except BaseException:
+        if object_written and file_path.blob_id is None:
+            await _cleanup_uploaded_object(adapter, source, object_key)
+        raise
 
 
 async def _cleanup_uploaded_object(adapter, source: _ExtractSource, object_key: str) -> None:
@@ -351,6 +436,7 @@ async def _run_extract_7z(
             if compressed and size / compressed > MAX_COMPRESSION_RATIO:
                 raise ValueError(f"{info.filename} 压缩率异常")
 
+        await _check_archive_budget(dep, task, source_info, total_bytes)
         root_id = await _create_extract_root(dep, task, source_info)
         task.result_node_id = root_id
         folder_ids: dict[tuple[str, ...], int] = {(): root_id}
@@ -375,8 +461,25 @@ async def _run_extract_7z(
 
         written = 0
         with tempfile.TemporaryDirectory(prefix="cloudrave-7z-extract-") as target_dir:
-            archive.extract(path=target_dir, targets=[info.filename for info in file_infos])
             extraction_root = Path(target_dir).resolve()
+            cancelled = Event()
+            def check_output():
+                if cancelled.is_set():
+                    raise TimeoutError("Archive extraction cancelled")
+                _check_deadline(task)
+            factory = BoundedArchiveFactory(extraction_root, max_total=MAX_TOTAL_BYTES,
+                max_entry=MAX_ENTRY_BYTES, max_entries=MAX_ENTRIES, check_deadline=check_output)
+            worker = asyncio.create_task(asyncio.to_thread(archive.extract,
+                targets=[info.filename for info in file_infos], factory=factory))
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled.set()
+                try:
+                    await asyncio.shield(worker)
+                except Exception:
+                    pass
+                raise
             for index, info in enumerate(file_infos):
                 parts = _safe_parts(info.filename)
                 if not parts:
@@ -392,48 +495,17 @@ async def _run_extract_7z(
                     folder_ids=folder_ids,
                     parts=folder_parts,
                 )
-                object_key = managed_key(
-                    task.owner_id,
-                    filename,
-                    style=str((source_info.mount.extra or {}).get("object_key_style", "readable")),
-                )
                 content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
                 digest = hashlib.sha256()
-                object_written = False
                 with payload_path.open("rb") as entry, tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024) as payload:
                     while chunk := await asyncio.to_thread(entry.read, CHUNK_SIZE):
+                        _check_deadline(task)
                         digest.update(chunk)
                         payload.write(chunk)
                     payload.seek(0)
-                    try:
-                        stored = await call_adapter(
-                            adapter,
-                            "put_object",
-                            source_info.policy,
-                            source_info.mount,
-                            object_key,
-                            payload,
-                            mime_type=content_type,
-                            metadata={"origin": "archive_extract"},
-                        )
-                        object_written = True
-                        await _persist_uploaded_file(
-                            dep,
-                            task,
-                            source=source_info,
-                            parent_id=parent_id,
-                            filename=filename,
-                            object_key=object_key,
-                            size=int(info.uncompressed or payload_path.stat().st_size),
-                            checksum=digest.hexdigest(),
-                            content_type=content_type,
-                            physical_id=adapter.physical_id(source_info.policy, source_info.mount, object_key),
-                            etag=getattr(stored, "etag", None),
-                        )
-                    except Exception:
-                        if object_written:
-                            await _cleanup_uploaded_object(adapter, source_info, object_key)
-                        raise
+                    await _persist_uploaded_file(dep, task, source=source_info, parent_id=parent_id,
+                        filename=filename, size=payload_path.stat().st_size,
+                        checksum=digest.hexdigest(), content_type=content_type, payload=payload)
                 written += int(info.uncompressed or payload_path.stat().st_size)
                 _update(
                     task,
@@ -465,7 +537,7 @@ async def _run_extract(
                 source_info.blob_path,
             )
             try:
-                await _copy_stream(source_stream, spool)
+                await _copy_stream(source_stream, spool, task)
             finally:
                 await _close_stream(source_stream)
             spool.seek(0)
@@ -499,6 +571,7 @@ async def _run_extract(
                     if info.compress_size and info.file_size / info.compress_size > MAX_COMPRESSION_RATIO:
                         raise ValueError(f"{info.filename} 压缩率异常")
 
+                await _check_archive_budget(dep, task, source_info, total_bytes)
                 root_id = await _create_extract_root(dep, task, source_info)
                 task.result_node_id = root_id
                 folder_ids: dict[tuple[str, ...], int] = {(): root_id}
@@ -536,53 +609,21 @@ async def _run_extract(
                         folder_ids=folder_ids,
                         parts=folder_parts,
                     )
-                    object_key = managed_key(
-                        task.owner_id,
-                        filename,
-                        style=str((source_info.mount.extra or {}).get("object_key_style", "readable")),
-                    )
                     content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
                     digest = hashlib.sha256()
-                    object_written = False
                     with archive.open(info) as entry, tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024) as payload:
+                        actual_size = 0
                         while chunk := await asyncio.to_thread(entry.read, CHUNK_SIZE):
+                            _check_deadline(task)
+                            actual_size += len(chunk)
+                            if actual_size > MAX_ENTRY_BYTES or written + actual_size > MAX_TOTAL_BYTES:
+                                raise ValueError("Archive output exceeds extraction limits")
                             digest.update(chunk)
                             payload.write(chunk)
                         payload.seek(0)
-                        try:
-                            stored = await call_adapter(
-                                adapter,
-                                "put_object",
-                                source_info.policy,
-                                source_info.mount,
-                                object_key,
-                                payload,
-                                mime_type=content_type,
-                                metadata={"origin": "archive_extract"},
-                            )
-                            object_written = True
-                            physical_id = adapter.physical_id(
-                                source_info.policy,
-                                source_info.mount,
-                                object_key,
-                            )
-                            await _persist_uploaded_file(
-                                dep,
-                                task,
-                                source=source_info,
-                                parent_id=parent_id,
-                                filename=filename,
-                                object_key=object_key,
-                                size=info.file_size,
-                                checksum=digest.hexdigest(),
-                                content_type=content_type,
-                                physical_id=physical_id,
-                                etag=getattr(stored, "etag", None),
-                            )
-                        except Exception:
-                            if object_written:
-                                await _cleanup_uploaded_object(adapter, source_info, object_key)
-                            raise
+                        await _persist_uploaded_file(dep, task, source=source_info, parent_id=parent_id,
+                            filename=filename, size=actual_size,
+                            checksum=digest.hexdigest(), content_type=content_type, payload=payload)
                     written += info.file_size
                     _update(
                         task,

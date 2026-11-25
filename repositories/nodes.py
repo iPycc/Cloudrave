@@ -50,7 +50,8 @@ class NodeRepository:
         return await self.session.get(Node, node_id)
 
     async def get_by_id_for_update(self, node_id: int) -> Node | None:
-        return await self.session.scalar(select(Node).where(Node.id == node_id).with_for_update())
+        return await self.session.scalar(select(Node).where(Node.id == node_id).with_for_update()
+                                         .execution_options(populate_existing=True))
 
     async def list_by_ids(self, node_ids: list[int]) -> list[Node]:
         if not node_ids:
@@ -291,6 +292,14 @@ class NodeRepository:
         await self.session.flush()
         return node
 
+    async def directory_marker_keys(self, mount_id: int, keys: set[str]) -> set[str]:
+        if not keys:
+            return set()
+        matches = await self.session.scalars(select(Node.blob_path).where(
+            Node.mount_id == mount_id, Node.type == NodeType.FOLDER, Node.blob_path.in_(keys),
+        ))
+        return keys.intersection(matches)
+
     async def create_file(
         self,
         *,
@@ -403,7 +412,7 @@ class NodeRepository:
         if not nodes:
             return []
         mount_id = nodes[0].mount_id
-        existing = await self.get_child_names(mount_id, target_parent_id)
+        existing = {child.name for child in await self.list_children(mount_id, target_parent_id, include_deleted=True)}
         for node in nodes:
             node.parent_id = target_parent_id
             node.name = _unique_name(node.name, existing)
@@ -428,7 +437,7 @@ class NodeRepository:
             type=source_node.type,
             status=NodeStatus.ACTIVE,
             name=new_name,
-            blob_path=source_node.blob_path,
+            blob_path=source_node.blob_path if source_node.type == NodeType.FILE else None,
             size=source_node.size,
         )
         self.session.add(new_node)

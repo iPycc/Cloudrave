@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Body, Depends, File, Form, Query, Request, Response, UploadFile
+from fastapi.responses import JSONResponse
 
+from drives.remote_drive.common import RemoteUploadUnconfirmedError
 from web.mid.auth import get_current_user
 from models.tables import User
+from services.explorer.idempotency import execute_once
 from schemas.upload import (
     UploadPartRead,
     UploadPartPlan,
@@ -84,11 +87,19 @@ async def complete_upload(
     request: Request,
     payload: UploadSessionCompleteRequest = Body(...),
     current_user: User = Depends(get_current_user),
-) -> UploadSessionRead:
+) -> UploadSessionRead | JSONResponse:
     dep = request.app.state.dep
     async with dep.session_scope() as session:
         service = upload_service(dep, session)
-        return await service.complete(request, current_user, session_id, payload)
+        try:
+            result = await execute_once(session, request, current_user, "upload.complete",
+                                        {"session_id": session_id},
+                                        lambda: service.complete(request, current_user, session_id, payload))
+            return UploadSessionRead.model_validate(result)
+        except RemoteUploadUnconfirmedError as exc:
+            request.state.failure_reason = str(exc)
+            return JSONResponse(status_code=409, content={"code": "wo_upload_unconfirmed", "message": str(exc), "detail": str(exc),
+                                                     "request_id": request.state.request_id})
 
 
 @router.post("/upload/{session_id}/heartbeat", response_model=MessageResponse)

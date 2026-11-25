@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from base64 import b64decode
 from pathlib import Path
 from typing import Any
 
+from store.cos.sec import FILE_NAME_UTF8_METADATA
 from store.types import StorageObject, StorageObjectPage
 from store.key import logical_key
 
@@ -37,6 +39,12 @@ def metadata(response: dict[str, Any]) -> dict[str, str]:
 def object_from_head(adapter: Any, policy: Any, mount: Any, object_key: str, response: dict[str, Any]) -> StorageObject:
     key = adapter._key(policy, mount, object_key)
     size_value = header(response, "content-length")
+    values = metadata(response)
+    if encoded := values.get(FILE_NAME_UTF8_METADATA):
+        try:
+            values["file-name"] = b64decode(encoded, validate=True).decode("utf-8")
+        except ValueError:
+            pass
     return StorageObject(
         provider_type=adapter.provider_type,
         mount_id=str(mount.id),
@@ -46,7 +54,8 @@ def object_from_head(adapter: Any, policy: Any, mount: Any, object_key: str, res
         etag=header(response, "etag"),
         version_id=header(response, "x-cos-version-id"),
         mime_type=header(response, "content-type"),
-        metadata=metadata(response),
+        metadata=values,
+        last_modified=header(response, "last-modified"),
     )
 
 
@@ -56,7 +65,7 @@ def page_from_response(adapter: Any, policy: Any, mount: Any, response: dict[str
     for item in one_or_many(response.get("Contents")):
         physical = str(item.get("Key", ""))
         last_physical = physical or last_physical
-        if not physical or physical.endswith("/"):
+        if not physical:
             continue
         relative = logical_key(policy, mount, physical)
         if not relative:  # Ignore a directory-marker object at the mount root.
@@ -72,6 +81,7 @@ def page_from_response(adapter: Any, policy: Any, mount: Any, response: dict[str
                 metadata={
                     "last_modified": str(item.get("LastModified", "")),
                     "storage_class": str(item.get("StorageClass", "")),
+                    "is_directory_marker": physical.endswith("/") and int(item.get("Size", 0)) == 0,
                 },
             )
         )

@@ -161,7 +161,7 @@ class RemoteDirectAdapter(RemoteMirrorAdapter):
             "provider_type": self.provider_type,
             "mount_id": mount.id,
             "status": "provider-managed",
-            "message": "运营商上传域名的 CORS 由运营商控制，Cloudrave 不会改写或中转请求",
+            "message": "运营商负责上传域名的跨域设置。浏览器直传受限时，支持中转的分片可经 Cloudrave 上传。",
         }
 
     def put_object(

@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Iterator
+from contextlib import suppress
+from math import ceil
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from store.types import StorageObject, StorageObjectPage
+from store.types import MultipartPart, StorageObject, StorageObjectPage
 from store.cos.parse import object_from_head, page_from_response
+from store.cos.copy import CopySnapshot, read_copy_snapshot
+from store.copy_guard import exact_key_exists, require_source_identity
 from store.cos.sec import assert_encryption, encryption_args, metadata_headers
 from store.cos.stream import AsyncCosStream, CosStream
 
@@ -260,12 +264,17 @@ class CosObjectMixin:
         *,
         mime_type: str | None = None,
         metadata: dict[str, str] | None = None,
+        no_overwrite: bool = False,
     ) -> StorageObject:
+        if no_overwrite:
+            self._require_unversioned(policy)
         kwargs: dict[str, Any] = encryption_args(policy)
         if mime_type:
             kwargs["ContentType"] = mime_type
         if metadata:
             kwargs["Metadata"] = metadata_headers(metadata)
+        if no_overwrite:
+            kwargs.setdefault("Metadata", {})["x-cos-forbid-overwrite"] = "true"
         response = self._client_for(policy).put_object(
             Bucket=self._bucket(policy),
             Key=self._key(policy, mount, object_key),
@@ -287,6 +296,18 @@ class CosObjectMixin:
 
     async def aput_object(self, policy: Any, mount: Any, object_key: str, body: bytes | BinaryIO, **kwargs: Any) -> StorageObject:
         return await asyncio.to_thread(self.put_object, policy, mount, object_key, body, **kwargs)
+
+    def put_directory_marker(self, policy: Any, mount: Any, directory: str) -> None:
+        self._require_unversioned(policy)
+        key = self._validate_physical_key(self._key(policy, mount, directory).rstrip("/") + "/")
+        self._client_for(policy).put_object(
+            Bucket=self._bucket(policy), Key=key, Body=b"",
+            Metadata={"x-cos-forbid-overwrite": "true"}, **encryption_args(policy),
+        )
+
+    def delete_directory_marker(self, policy: Any, mount: Any, directory: str) -> None:
+        key = self._validate_physical_key(self._key(policy, mount, directory).rstrip("/") + "/")
+        self._client_for(policy).delete_object(Bucket=self._bucket(policy), Key=key)
 
     def _get_object_response(
         self,
@@ -344,7 +365,20 @@ class CosObjectMixin:
     async def adelete_object(self, policy: Any, mount: Any, object_key: str, *, hard_delete: bool = False) -> bool:
         return await asyncio.to_thread(self.delete_object, policy, mount, object_key, hard_delete=hard_delete)
 
-    def copy_object(self, policy: Any, mount: Any, source_key: str, destination_key: str) -> StorageObject:
+    def delete_object_version(self, policy: Any, mount: Any, object_key: str, version_id: str) -> None:
+        self._client_for(policy).delete_object(
+            Bucket=self._bucket(policy), Key=self._key(policy, mount, object_key), VersionId=version_id,
+        )
+
+    def copy_object(
+        self, policy: Any, mount: Any, source_key: str, destination_key: str, *,
+        no_overwrite: bool = False,
+        expected_source_identity: dict[str, str | int] | None = None,
+    ) -> StorageObject:
+        if expected_source_identity is not None and not no_overwrite:
+            raise ValueError("Source identity requires an overwrite-protected copy")
+        if no_overwrite:
+            return self._copy_without_overwrite(policy, mount, source_key, destination_key, expected_source_identity)
         extra = getattr(policy, "extra", None) or {}
         self._client_for(policy).copy(
             Bucket=self._bucket(policy),
@@ -360,5 +394,101 @@ class CosObjectMixin:
         )
         return self.head_object(policy, mount, destination_key, verify_encryption=True)
 
-    async def acopy_object(self, policy: Any, mount: Any, source_key: str, destination_key: str) -> StorageObject:
-        return await asyncio.to_thread(self.copy_object, policy, mount, source_key, destination_key)
+    def _copy_without_overwrite(self, policy: Any, mount: Any, source_key: str, destination_key: str,
+                                expected_source_identity: dict[str, str | int] | None = None) -> StorageObject:
+        self._require_unversioned(policy)
+        client = self._client_for(policy)
+        bucket = self._bucket(policy)
+        target = self._key(policy, mount, destination_key)
+        source_path = self._key(policy, mount, source_key)
+        if source_path == target:
+            raise ValueError("COS protected copy requires a different destination")
+        source = self.inspect_copy_source(policy, mount, source_key)
+        require_source_identity(source, expected_source_identity)
+        copy_source = {"Bucket": bucket, "Key": source_path, "Region": self._region(policy)}
+        if source.size <= 5 * 1024 * 1024 * 1024:
+            attributes = source.write_args()
+            # COS copies the metadata headers itself in Copy mode.
+            attributes = {key: value for key, value in attributes.items() if key in {
+                "StorageClass", "ServerSideEncryption", "SSEKMSKeyId", "SSEKMSContext",
+            }}
+            client.copy_object(
+                Bucket=bucket, Key=target, CopySource=copy_source,
+                CopySourceIfMatch=source.etag,
+                **source.acl_args(),
+                Metadata={"x-cos-forbid-overwrite": "true"},
+                **attributes,
+            )
+            self._finish_protected_copy(client, bucket, source_path, target, source)
+            return self.head_object(policy, mount, destination_key)
+
+        part_size = max(16 * 1024 * 1024, ceil(source.size / self.capabilities.max_parts))
+        if part_size > self.capabilities.max_part_size:
+            raise ValueError("COS source is too large for multipart copy")
+        upload = self.create_multipart_upload(
+            policy, mount, destination_key, total_size=source.size,
+            _copy_snapshot=source,
+        )
+        parts: list[MultipartPart] = []
+        try:
+            for index, start in enumerate(range(0, source.size, part_size), start=1):
+                end = min(start + part_size, source.size) - 1
+                result = client.upload_part_copy(
+                    Bucket=bucket, Key=target, PartNumber=index, UploadId=upload.upload_id,
+                    CopySource=copy_source, CopySourceRange=f"bytes={start}-{end}",
+                    CopySourceIfMatch=source.etag,
+                )
+                etag = str(result.get("ETag") or "")
+                if not etag:
+                    raise RuntimeError("COS did not return a copied part ETag")
+                parts.append(MultipartPart(part_number=index, etag=etag, size=end - start + 1))
+            if read_copy_snapshot(client, bucket, source_path) != source:
+                raise RuntimeError("COS source changed during the protected copy")
+            result = self.complete_multipart_upload(
+                policy, mount, upload, parts, no_overwrite=True, _verify_encryption=False,
+            )
+            self._finish_protected_copy(client, bucket, source_path, target, source)
+            return result
+        except BaseException:
+            with suppress(Exception):
+                self.abort_multipart_upload(policy, mount, upload)
+            raise
+
+    def inspect_copy_source(self, policy: Any, mount: Any, source_key: str) -> CopySnapshot:
+        source = read_copy_snapshot(self._client_for(policy), self._bucket(policy), self._key(policy, mount, source_key))
+        source.acl_args()
+        if source.size > 5 * 1024 * 1024 * 1024:
+            if source.content_md5:
+                raise ValueError("COS multipart copy cannot preserve the source Content-MD5")
+            if max(16 * 1024 * 1024, ceil(source.size / self.capabilities.max_parts)) > self.capabilities.max_part_size:
+                raise ValueError("COS source is too large for multipart copy")
+        return source
+
+    def object_key_exists(self, policy: Any, mount: Any, object_key: str, *, directory_marker: bool = False) -> bool:
+        key = self._key(policy, mount, object_key)
+        if directory_marker:
+            key = self._validate_physical_key(key.rstrip("/") + "/")
+        return exact_key_exists(lambda: self._client_for(policy).get_symlink(
+            Bucket=self._bucket(policy), SymlinkName=key))
+
+    @staticmethod
+    def _finish_protected_copy(client: Any, bucket: str, source_path: str, target: str, source: CopySnapshot) -> None:
+        copied = read_copy_snapshot(client, bucket, target)
+        if copied.preserved_attributes() != source.preserved_attributes():
+            raise RuntimeError("COS copied object attributes differ from the source")
+        if source.crc64 and source.crc64 != copied.crc64:
+            raise RuntimeError("COS copied object checksum differs from the source")
+        if source.content_md5 and source.content_md5 != copied.content_md5:
+            raise RuntimeError("COS copied object Content-MD5 differs from the source")
+        if read_copy_snapshot(client, bucket, source_path) != source:
+            raise RuntimeError("COS source changed during the protected copy")
+
+    async def acopy_object(
+        self, policy: Any, mount: Any, source_key: str, destination_key: str, *,
+        no_overwrite: bool = False,
+        expected_source_identity: dict[str, str | int] | None = None,
+    ) -> StorageObject:
+        return await asyncio.to_thread(
+            self.copy_object, policy, mount, source_key, destination_key, no_overwrite=no_overwrite,
+            expected_source_identity=expected_source_identity,
+        )

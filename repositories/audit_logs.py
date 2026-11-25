@@ -36,6 +36,20 @@ class AuditLogRepository:
         await self.session.flush()
         return log
 
+    async def list_events(
+        self, *, action: str | None = None, actor_id: int | None = None,
+        before_id: int | None = None, limit: int = 100,
+    ) -> list[AuditLog]:
+        stmt = select(AuditLog)
+        if action:
+            stmt = stmt.where(AuditLog.action == action)
+        if actor_id is not None:
+            stmt = stmt.where(AuditLog.actor_id == actor_id)
+        if before_id is not None:
+            stmt = stmt.where(AuditLog.id < before_id)
+        result = await self.session.scalars(stmt.order_by(AuditLog.id.desc()).limit(limit))
+        return list(result)
+
     async def list_login_events(
         self,
         *,

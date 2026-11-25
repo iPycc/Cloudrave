@@ -27,6 +27,7 @@ class SharedNode(CloudraveSchema):
     name: str
     type: str
     size: int
+    preview_version: str | None = None
 
 
 class SharedRead(CloudraveSchema):
@@ -38,6 +39,8 @@ class SharedRead(CloudraveSchema):
     owner_avatar: str | None = None
     available: bool
     unavailable_reason: str | None = None
+    expires_at: datetime | None = None
+    max_downloads: int | None = None
     roots: list[SharedNode] = Field(default_factory=list)
     detail_url: str
     nodes_url: str

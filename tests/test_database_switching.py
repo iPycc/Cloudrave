@@ -178,6 +178,72 @@ async def test_maintenance_gate_blocks_writes_but_keeps_reads() -> None:
     assert response.json()["error"] == "database_migration_in_progress"
 
 
+def test_completed_migration_blocks_writes_until_activation(tmp_path: Path) -> None:
+    manager = DatabaseMigrationManager(tmp_path)
+    job = MigrationJob(
+        id="55555555-5555-5555-5555-555555555555",
+        source_backend="sqlite",
+        target_backend="mysql",
+        data_choice="source",
+    )
+    manager._ready_for_restart(job)
+
+    assert manager.begin_business_write() is False
+    restarted = DatabaseMigrationManager(tmp_path)
+    assert restarted.begin_business_write() is False
+    restarted.mark_runtime_ready(restarted.config_for("mysql"))
+    assert restarted.begin_business_write() is True
+    restarted.end_business_write()
+
+
+@pytest.mark.asyncio
+async def test_ready_migration_keeps_background_writers_stopped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
+
+    class Worker:
+        async def stop(self) -> None:
+            events.append("stop")
+
+        def start(self) -> None:
+            events.append("start")
+
+    class Engine:
+        async def dispose(self) -> None:
+            pass
+
+    manager = DatabaseMigrationManager(tmp_path)
+    manager.maintenance = True
+    manager.state.status = "migrating"
+    job = MigrationJob(
+        id="66666666-6666-6666-6666-666666666666",
+        source_backend="sqlite",
+        target_backend="mysql",
+        data_choice="target",
+    )
+
+    async def inspect_engine(_engine, backend, **_kwargs):
+        events.append("inspect")
+        return DatabaseConnectionRead(reachable=True, backend=backend)
+
+    monkeypatch.setattr(database_service, "make_async_engine", lambda _config: Engine())
+    monkeypatch.setattr(manager, "inspect_engine", inspect_engine)
+    worker = Worker()
+    dep = type("Dep", (), {
+        "mount_health_worker": worker,
+        "upload_cleanup_worker": worker,
+        "gc_worker": worker,
+        "derived_worker": worker,
+        "engine": Engine(),
+    })()
+
+    await manager._run_job(dep, job)
+
+    assert events[:4] == ["stop"] * 4
+    assert "start" not in events
+    assert manager.state.status == "activation_pending"
+    assert manager.begin_business_write() is False
+
+
 @pytest.mark.asyncio
 async def test_sqlite_copy_verifies_rows_and_writes_instance_marker(tmp_path: Path) -> None:
     config = _config(tmp_path)

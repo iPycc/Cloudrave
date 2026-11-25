@@ -11,12 +11,14 @@ from models.enums import NodeType
 from models.tables import User
 from repositories.nodes import _unique_name
 from services.explorer.archive import ArchiveService
+from services.explorer.path_write import new_file_path, put_new_file, put_new_folder
 from services.explorer.preview import build_local_preview_response
 from services.explorer.proxy import remote_response
 from services.explorer.shared import SharedService
-from services.explorer.source import FileSourceService
+from services.explorer.share import require_share_preview
+from services.explorer.write_policy import StorageWritePolicy
+from services.explorer.source import FileSourceService, download_probe_response
 from store.call import call_adapter
-from store.key import managed_key
 
 
 class SharedIo:
@@ -26,7 +28,8 @@ class SharedIo:
         self.archive = archive
 
     async def preview(self, request: Request, actor: User, mount_id: int, node_id: int):
-        _share, node = await self.shared.resolve_node(actor, mount_id, node_id)
+        share, node = await self.shared.resolve_node(actor, mount_id, node_id)
+        require_share_preview(share)
         if node.type != NodeType.FILE:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Folders cannot be previewed")
         node, mount, policy = await self.source.resolve_shared(node.id)
@@ -54,8 +57,11 @@ class SharedIo:
         if node.type == NodeType.FILE:
             resolved = await self.source.resolve_shared(node.id)
             if request.method == "HEAD":
+                if share.max_downloads is not None:
+                    return download_probe_response(node.name, "cloudrave")
                 return await self.source.probe_response(*resolved)
-            response = await self.source.response(*resolved, request=request)
+            response = await self.source.response(*resolved, request=request,
+                                                  relay=share.max_downloads is not None)
         else:
             if request.method == "HEAD":
                 return await self.archive.probe_response([node], filename=node.name)
@@ -71,15 +77,11 @@ class SharedIo:
         target_mount_id: int,
         target_parent_id: int | None,
     ):
-        _share, source_node = await self.shared.resolve_node(actor, mount_id, node_id)
-        target_mount = await self.source.mounts.get_by_id(target_mount_id)
-        if target_mount is None or target_mount.owner_id != actor.id or not target_mount.is_enabled:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target mount not found")
-        if bool((target_mount.extra or {}).get("read_only")):
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Target mount is read-only")
-        target_policy = await self.source.policies.get_by_id(target_mount.policy_id)
-        if target_policy is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target storage policy not found")
+        share, source_node = await self.shared.resolve_node(actor, mount_id, node_id)
+        writes = StorageWritePolicy(self.source.nodes.session)
+        target_mount, target_policy = await writes.check(actor, target_mount_id)
+        size = await self._subtree_size(source_node, set())
+        await writes.check(actor, target_mount_id, size)
         if target_parent_id is None:
             parent = await self.source.nodes.ensure_mount_root(
                 owner_id=actor.id,
@@ -93,9 +95,22 @@ class SharedIo:
                 or parent.owner_id != actor.id
                 or parent.mount_id != target_mount.id
                 or parent.type != NodeType.FOLDER
+                or parent.deleted_at is not None
             ):
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target folder not found")
+        await self.shared.source.record_download(share)
         return await self._copy_shared_node(actor, source_node, target_mount, target_policy, parent.id)
+
+    async def _subtree_size(self, node, visited: set[int]) -> int:
+        if node.id in visited:
+            raise HTTPException(status_code=409, detail="Invalid shared folder tree")
+        visited.add(node.id)
+        if node.type == NodeType.FILE:
+            return node.size
+        total = 0
+        for child in await self.source.nodes.list_children(node.mount_id, node.id):
+            total += await self._subtree_size(child, visited)
+        return total
 
     async def _copy_shared_node(self, actor: User, source_node, target_mount, target_policy, target_parent_id: int):
         existing = await self.source.nodes.get_child_names(target_mount.id, target_parent_id)
@@ -107,6 +122,7 @@ class SharedIo:
                 parent_id=target_parent_id,
                 name=name,
             )
+            await put_new_folder(self.source.nodes, self.source.storage_manager, target_policy, target_mount, created)
             for child in await self.source.nodes.list_children(source_node.mount_id, source_node.id):
                 await self._copy_shared_node(actor, child, target_mount, target_policy, created.id)
             return created
@@ -114,19 +130,17 @@ class SharedIo:
         resolved_node, source_mount, source_policy = await self.source.resolve_shared(source_node.id)
         source_adapter = self.source.storage_manager.get_adapter(source_policy)
         target_adapter = self.source.storage_manager.get_adapter(target_policy)
-        object_key = managed_key(
-            actor.id,
-            name,
-            style=str((target_mount.extra or {}).get("object_key_style", "readable")),
+        file_path = await new_file_path(
+            self.source.nodes, self.source.objects, target_adapter, target_policy, target_mount, target_parent_id, name,
         )
+        object_key = file_path.key
         stream = await call_adapter(source_adapter, "open_object", source_policy, source_mount, resolved_node.blob_path)
         with closing(stream):
-            stored = await call_adapter(
+            stored = await put_new_file(
                 target_adapter,
-                "put_object",
                 target_policy,
                 target_mount,
-                object_key,
+                file_path,
                 stream,
                 mime_type=mimetypes.guess_type(name)[0] or "application/octet-stream",
                 metadata={"origin": "shared_save"},
@@ -139,17 +153,22 @@ class SharedIo:
             blob_path=object_key,
             size=source_node.size,
         )
+        extra = {
+            "origin": "shared_save",
+            "etag": getattr(stored, "etag", None),
+            "version_id": getattr(stored, "version_id", None),
+        }
+        if file_path.blob_id is not None:
+            extra["path_blob_id"] = file_path.blob_id
         await self.source.objects.create_or_update(
             node_id=created.id,
             policy_id=target_policy.id,
             blob_path=object_key,
-            physical_id=target_adapter.physical_id(target_policy, target_mount, object_key),
+            physical_id=file_path.physical_id or await call_adapter(
+                target_adapter, "physical_id", target_policy, target_mount, object_key,
+            ),
             revive_physical=True,
             content_type=mimetypes.guess_type(name)[0] or "application/octet-stream",
-            extra={
-                "origin": "shared_save",
-                "etag": getattr(stored, "etag", None),
-                "version_id": getattr(stored, "version_id", None),
-            },
+            extra=extra,
         )
         return created

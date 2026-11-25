@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import Field, field_validator
@@ -57,6 +58,22 @@ class UserMountRead(CloudraveSchema):
     mount: BucketMountRead
 
 
+UploadCorsStatus = Literal["ready", "same_origin", "read_only", "blocked", "missing_etag", "unavailable"]
+
+
+class UploadCorsRead(CloudraveSchema):
+    status: UploadCorsStatus
+
+
+class MountHealthRead(CloudraveSchema):
+    status: Literal["healthy", "reauthorization_required", "failed"]
+    detail: str
+    message: str
+    code: str | None = None
+    checked_at: datetime
+    capabilities: dict[str, bool] = Field(default_factory=dict)
+
+
 class UserMountDeletePreview(CloudraveSchema):
     mount_id: int
     mount_name: str
@@ -75,3 +92,17 @@ class UserMountDeleteResult(CloudraveSchema):
     message: str
     deleted_objects: int = 0
     policy_deleted: bool = False
+
+
+class OssDomainRequest(CloudraveSchema):
+    action: Literal["list", "token", "bind", "unbind", "check"] = "list"
+    domain: str = Field(default="", max_length=255)
+
+    @field_validator("domain")
+    @classmethod
+    def normalize_domain(cls, value: str) -> str:
+        if not value.strip():
+            return ""
+        from store.oss.download import domain_url
+
+        return domain_url(value)

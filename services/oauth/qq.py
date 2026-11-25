@@ -158,6 +158,11 @@ class QQOAuthSettingsService:
         app_id = payload.app_id.strip()
         encrypted_secret = str(current.get("app_key") or "")
         if payload.app_key is not None and payload.app_key.strip():
+            if not self._valid_app_key(payload.app_key.strip()):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail="App Key 包含无效字符，请复制 QQ 互联提供的完整密钥，不要包含审核状态、空格或省略号",
+                )
             encrypted_secret = self._fernet.encrypt(
                 payload.app_key.strip().encode("utf-8")
             ).decode("utf-8")
@@ -204,10 +209,16 @@ class QQOAuthSettingsService:
         return bool(
             raw.get("enabled")
             and str(raw.get("app_id") or "").strip()
-            and self._decrypt_secret(raw)
+            and self._valid_app_key(self._decrypt_secret(raw))
             and self.callback_url
             and is_secure_context_url(self.site_url)
         )
+
+    @staticmethod
+    def _valid_app_key(value: str) -> bool:
+        return bool(value) and value.isascii() and not any(
+            char.isspace() for char in value
+        ) and "..." not in value
 
     def _decrypt_secret(self, raw: dict[str, object]) -> str:
         return self._decrypt_value(str(raw.get("app_key") or ""))
@@ -257,6 +268,10 @@ class QQOAuthClient:
                 token_response.raise_for_status()
                 token_payload = token_response.json()
                 if not isinstance(token_payload, dict) or token_payload.get("error"):
+                    if isinstance(token_payload, dict):
+                        error_code = str(token_payload.get("error", ""))
+                        if error_code.isascii() and error_code.isdigit():
+                            raise QQOAuthProtocolError(f"QQ token request rejected (code={error_code[:12]})")
                     raise QQOAuthProtocolError("QQ returned an invalid token response")
                 access_token = str(token_payload.get("access_token") or "").strip()
                 if not access_token:

@@ -5,12 +5,14 @@ from __future__ import annotations
 import re
 import mimetypes
 import unicodedata
+from base64 import b64encode
 from typing import Any
 from pathlib import PurePath
 from urllib.parse import quote
 
 
-_META_NAME = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
+_META_NAME = re.compile(r"[a-z0-9-]+")
+FILE_NAME_UTF8_METADATA = "cloudrave-file-name-utf8-b64"
 
 
 def encryption_args(policy: Any) -> dict[str, str]:
@@ -42,13 +44,19 @@ def signed_encryption_headers(policy: Any) -> dict[str, str]:
 def metadata_headers(values: dict[str, str] | None) -> dict[str, str]:
     result: dict[str, str] = {}
     for raw_name, raw_value in (values or {}).items():
-        name = str(raw_name).strip().lower()
+        name = str(raw_name).strip().lower().replace("_", "-")
         value = str(raw_value)
         if not name or not _META_NAME.fullmatch(name):
             raise ValueError(f"invalid COS metadata name: {raw_name!r}")
         if "\r" in value or "\n" in value:
             raise ValueError("COS metadata values cannot contain newlines")
-        result[f"x-cos-meta-{name}"] = value
+        if name == "file-name" and not value.isascii():
+            name = FILE_NAME_UTF8_METADATA
+            value = b64encode(value.encode("utf-8")).decode("ascii")
+        header = f"x-cos-meta-{name}"
+        if header in result:
+            raise ValueError("COS metadata names collide after normalization")
+        result[header] = value
     return result
 
 

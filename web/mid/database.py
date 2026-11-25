@@ -23,6 +23,8 @@ class DatabaseMaintenanceMiddleware(BaseHTTPMiddleware):
                     status_code=503,
                     content={
                         "error": "database_migration_in_progress",
+                        "code": "database_migration_in_progress",
+                        "message": "数据库迁移进行中，写入操作已暂时暂停",
                         "detail": "数据库迁移进行中，写入操作已暂时暂停",
                     },
                     headers={"Retry-After": "5"},

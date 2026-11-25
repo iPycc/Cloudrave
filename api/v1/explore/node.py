@@ -9,6 +9,7 @@ from fastapi.responses import Response
 
 from web.mid.auth import get_current_user
 from models.tables import User
+from services.explorer.idempotency import execute_once
 from schemas.common import HealthResponse
 from schemas.mount import BucketMountRead
 from schemas.node import (
@@ -26,6 +27,7 @@ from schemas.node import (
     NodeSearchResult,
     NodeSort,
 )
+from schemas.task import PathBatchQueued, PathChangeQueued
 from services.user.storage import UserStorageProvisionService
 from api.v1.explore.dep import node_service
 
@@ -184,17 +186,21 @@ async def create_file(
         return await service.create_file(request, current_user, payload)
 
 
-@router.patch("/node/{node_id}", response_model=NodeRead)
+@router.patch("/node/{node_id}", response_model=NodeRead | PathChangeQueued, responses={202: {"model": PathChangeQueued}})
 async def rename_node(
     node_id: int,
     request: Request,
+    response: Response,
     payload: NodeRenameRequest = Body(...),
     current_user: User = Depends(get_current_user),
-) -> NodeRead:
+) -> NodeRead | PathChangeQueued:
     dep = request.app.state.dep
     async with dep.session_scope() as session:
         service = node_service(dep, session)
-        return await service.rename_node(request, current_user, node_id, payload)
+        result = await service.rename_node(request, current_user, node_id, payload)
+        if isinstance(result, PathChangeQueued):
+            response.status_code = 202
+        return result
 
 
 @router.delete("/node", response_model=dict[str, object])
@@ -206,31 +212,40 @@ async def delete_nodes(
     dep = request.app.state.dep
     async with dep.session_scope() as session:
         service = node_service(dep, session)
-        return await service.delete_nodes(request, current_user, payload)
+        return await execute_once(session, request, current_user, "node.delete", payload,
+                                  lambda: service.delete_nodes(request, current_user, payload))
 
 
-@router.post("/node/move", response_model=list[NodeRead])
+@router.post("/node/move", response_model=list[NodeRead] | PathBatchQueued, responses={202: {"model": PathBatchQueued}})
 async def move_nodes(
     request: Request,
+    response: Response,
     payload: NodeMoveRequest = Body(...),
     current_user: User = Depends(get_current_user),
-) -> list[NodeRead]:
+) -> list[NodeRead] | PathBatchQueued:
     dep = request.app.state.dep
     async with dep.session_scope() as session:
         service = node_service(dep, session)
-        return await service.move_nodes(request, current_user, payload)
+        result = await service.move_nodes(request, current_user, payload)
+        if isinstance(result, PathBatchQueued):
+            response.status_code = 202
+        return result
 
 
-@router.post("/node/copy", response_model=list[NodeRead])
+@router.post("/node/copy", response_model=list[NodeRead] | PathBatchQueued, responses={202: {"model": PathBatchQueued}})
 async def copy_nodes(
     request: Request,
+    response: Response,
     payload: NodeCopyRequest = Body(...),
     current_user: User = Depends(get_current_user),
-) -> list[NodeRead]:
+) -> list[NodeRead] | PathBatchQueued:
     dep = request.app.state.dep
     async with dep.session_scope() as session:
         service = node_service(dep, session)
-        return await service.copy_nodes(request, current_user, payload)
+        result = await service.copy_nodes(request, current_user, payload)
+        if isinstance(result, PathBatchQueued):
+            response.status_code = 202
+        return result
 
 
 @router.get("/node/{node_id}/activity", response_model=list[NodeActivityRead])

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime
-from pathlib import PurePath
+from pathlib import PurePath, PurePosixPath
+from string import Formatter
 from typing import Any
 from uuid import uuid4
 
@@ -21,18 +22,87 @@ def managed_key(
     *,
     now: datetime | None = None,
     style: str = "readable",
+    directory: str = "",
+    template: str | None = None,
 ) -> str:
     _ = owner_id, now or datetime.now(UTC)
     suffix = PurePath(filename).suffix.lower()
     if len(suffix) > 16 or not re.fullmatch(r"\.[a-z0-9]+", suffix):
         suffix = ""
+    safe_name = PurePath(filename).name.replace("/", "_").replace("\\", "_")
     blob_id = uuid4().hex
-    if style == "opaque":
-        object_name = f"{blob_id}{suffix}"
-    else:
-        safe_name = PurePath(filename).name.replace("/", "_").replace("\\", "_")
-        object_name = f"{blob_id}-{safe_name}"
-    return join_object_key(MANAGED_PREFIX, object_name)
+    if template is None:
+        object_name = f"{blob_id}{suffix}" if style == "opaque" else f"{blob_id}-{safe_name}"
+        return join_object_key(MANAGED_PREFIX, object_name)
+    return format_object_key(template, directory=directory, filename=safe_name, blob_id=blob_id)
+
+
+def format_object_key(template: str, *, directory: str, filename: str, blob_id: str) -> str:
+    """Render a mount-relative object key from validated path components."""
+
+    if not template or "\\" in template or template.startswith("/") or template.endswith("/"):
+        raise ValueError("Invalid object key template")
+    directory_parts = directory.split("/") if directory else []
+    if any(not part or part in {".", ".."} or "\\" in part or "\x00" in part for part in directory_parts):
+        raise ValueError("Invalid directory path")
+    if not filename or filename in {".", ".."} or "/" in filename or "\\" in filename:
+        raise ValueError("Invalid file name")
+    path = PurePosixPath(filename)
+    values = {"filename": filename, "stem": path.stem, "ext": path.suffix, "blob_id": blob_id}
+    parts: list[str] = []
+    fields: set[str] = set()
+    for segment in template.split("/"):
+        if segment == "{dir}":
+            if "dir" in fields:
+                raise ValueError("Template may contain the directory variable only once")
+            fields.add("dir")
+            parts.extend(directory_parts)
+            continue
+        if not segment:
+            raise ValueError("Empty template segment")
+        fragments: list[str] = []
+        try:
+            for literal, field, specification, conversion in Formatter().parse(segment):
+                fragments.append(literal)
+                if field is not None:
+                    if field not in values or specification or conversion:
+                        raise ValueError("Unknown or invalid template variable")
+                    if "dir" not in fields:
+                        raise ValueError("File name variables must follow the directory variable")
+                    fields.add(field)
+                    fragments.append(values[field])
+        except ValueError as exc:
+            raise ValueError("Invalid object key template") from exc
+        part = "".join(fragments)
+        if not part or part in {".", ".."} or "/" in part or "\\" in part or "\x00" in part:
+            raise ValueError("Invalid object key segment")
+        parts.append(part)
+    if "dir" not in fields or not fields.intersection({"filename", "stem", "blob_id"}):
+        raise ValueError("Template must contain a directory and a file name variable")
+    result = "/".join(parts)
+    if not result or len(result.encode("utf-8")) > 1024:
+        raise ValueError("Object key exceeds the storage limit")
+    if result == LEGACY_MANAGED_PREFIX or result.startswith(f"{LEGACY_MANAGED_PREFIX}/"):
+        raise ValueError("Object key uses a reserved prefix")
+    return result
+
+
+def format_directory_key(template: str, directory: str) -> str:
+    """Render the physical prefix corresponding to a non-root virtual directory."""
+
+    format_object_key(template, directory="sample", filename="sample.txt", blob_id="0" * 32)
+    if not directory or any(not part or part in {".", ".."} or "\\" in part or "\x00" in part
+                            for part in directory.split("/")):
+        raise ValueError("Invalid directory path")
+    prefix: list[str] = []
+    for segment in template.split("/"):
+        if segment == "{dir}":
+            break
+        prefix.append("".join(literal for literal, _, _, _ in Formatter().parse(segment)))
+    result = "/".join([*prefix, *directory.split("/")])
+    if len(result.encode("utf-8")) > 1024 or result == LEGACY_MANAGED_PREFIX or result.startswith(f"{LEGACY_MANAGED_PREFIX}/"):
+        raise ValueError("Invalid directory marker key")
+    return result
 
 
 def is_managed_key(value: str) -> bool:
@@ -48,7 +118,8 @@ def clean_prefix(value: str | None) -> str:
 
     if not value or not value.strip("/\\ "):
         return ""
-    return normalize_object_key(value)
+    # Keep the historical trimming behavior for configured mount prefixes.
+    return normalize_object_key(value.strip())
 
 
 def mount_prefix(policy: Any, mount: Any) -> str:
@@ -80,6 +151,14 @@ def physical_key(policy: Any, mount: Any, object_key: str) -> str:
     return f"{prefix}/{logical}"
 
 
+def validate_physical_key(key: str, *, max_bytes: int, provider: str) -> str:
+    """Validate the complete provider key, including the configured mount prefix."""
+
+    if not key or "\x00" in key or len(key.encode("utf-8")) > max_bytes:
+        raise ValueError(f"{provider} object key exceeds the provider limit or contains NUL")
+    return key
+
+
 def physical_list_prefix(policy: Any, mount: Any, prefix: str = "") -> str:
     mounted = mount_prefix(policy, mount)
     if not prefix:
@@ -91,7 +170,9 @@ def physical_list_prefix(policy: Any, mount: Any, prefix: str = "") -> str:
 
 
 def logical_key(policy: Any, mount: Any, key: str) -> str:
-    normalized = normalize_object_key(key)
+    # Listing must retain the exact provider key. Invalid virtual path segments
+    # are reported as import conflicts instead of being silently normalized.
+    normalized = str(key)
     prefix = mount_prefix(policy, mount)
     if not prefix:
         return normalized

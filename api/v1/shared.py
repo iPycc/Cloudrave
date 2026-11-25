@@ -13,7 +13,7 @@ from schemas.preview import PreviewManifestRead
 from schemas.shared import SharedCreate, SharedNode, SharedRead, SharedSaveRequest, SharedSummaryRead, SharedOwnerRead
 from services.explorer.download import DownloadFileService
 from services.explorer.preview import PreviewService, relative_preview_url
-from services.explorer.share import ShareService
+from services.explorer.share import ShareService, require_share_preview
 from services.explorer.archive import ArchiveService
 from services.explorer.shared import SharedService
 from services.explorer.shared_io import SharedIo
@@ -158,11 +158,12 @@ async def preview_shared_mount_manifest(
     current_user: User = Depends(get_current_user),
 ) -> PreviewManifestRead:
     async with request.app.state.dep.session_scope() as session:
-        _share, node = await _service(request, session).resolve_node(
+        share, node = await _service(request, session).resolve_node(
             current_user,
             mount_id,
             node_id,
         )
+        require_share_preview(share)
         if node.type.value == "folder":
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -195,11 +196,12 @@ async def preview_shared_mount_archive_entry(
     current_user: User = Depends(get_current_user),
 ):
     async with request.app.state.dep.session_scope() as session:
-        _share, node = await _service(request, session).resolve_node(
+        share, node = await _service(request, session).resolve_node(
             current_user,
             mount_id,
             node_id,
         )
+        require_share_preview(share)
         if node.type.value == "folder":
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,

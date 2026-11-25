@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -11,6 +12,7 @@ from fastapi import HTTPException, Request, UploadFile, status
 from fastapi.responses import FileResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from models.tables import PasskeyCeremony, PasskeyCredential, User
 from repositories.audit_logs import AuditLogRepository
@@ -33,6 +35,29 @@ from core.cfg import CloudraveConfig
 
 
 ALLOWED_AVATAR_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+MAX_AVATAR_BYTES = 5 * 1024 * 1024
+MAX_AVATAR_PIXELS = 16 * 1024 * 1024
+
+
+async def _avatar_payload(file: UploadFile) -> bytes:
+    content = bytearray()
+    while chunk := await file.read(min(64 * 1024, MAX_AVATAR_BYTES + 1 - len(content))):
+        content.extend(chunk)
+        if len(content) > MAX_AVATAR_BYTES:
+            raise HTTPException(status_code=413, detail="Avatar exceeds 5 MB")
+    try:
+        with Image.open(BytesIO(content)) as image:
+            if image.format not in {"PNG", "JPEG", "GIF", "WEBP"}:
+                raise ValueError("Unsupported image format")
+            if image.width * image.height > MAX_AVATAR_PIXELS:
+                raise ValueError("Avatar dimensions are too large")
+            image = ImageOps.exif_transpose(image).convert("RGBA")
+            image.thumbnail((512, 512))
+            output = BytesIO()
+            image.save(output, format="WEBP", quality=85)
+            return output.getvalue()
+    except (OSError, ValueError, UnidentifiedImageError, Image.DecompressionBombError) as exc:
+        raise HTTPException(status_code=422, detail="Invalid avatar image") from exc
 
 
 class UserProfileService:
@@ -97,24 +122,25 @@ class UserProfileService:
         if suffix not in ALLOWED_AVATAR_EXTENSIONS:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="不支持的头像文件类型")
 
+        content = await _avatar_payload(file)
+
         avatar_root = self.config.root_dir / "data" / "avatar" / user.uid
         avatar_root.mkdir(parents=True, exist_ok=True)
         avatar_root_resolved = avatar_root.resolve()
 
-        if user.avatar_path:
-            previous_path = (self.config.root_dir / "data" / user.avatar_path).resolve()
-            if previous_path.exists() and avatar_root_resolved in previous_path.parents:
-                previous_path.unlink()
-
-        next_name = f"{uuid4().hex}{suffix}"
+        previous_avatar = user.avatar_path
+        next_name = f"{uuid4().hex}.webp"
         next_path = (avatar_root / next_name).resolve()
         if avatar_root_resolved not in next_path.parents:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="头像路径无效")
 
-        content = await file.read()
         next_path.write_bytes(content)
 
         user = await self.users.update_avatar_path(user, f"avatar/{user.uid}/{next_name}")
+        if previous_avatar:
+            previous_path = (self.config.root_dir / "data" / previous_avatar).resolve()
+            if previous_path.exists() and avatar_root_resolved in previous_path.parents:
+                previous_path.unlink()
         await self.audits.create(
             actor_id=user.id,
             action="avatar_upload",

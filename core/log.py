@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from datetime import datetime
 from enum import StrEnum
@@ -86,7 +87,11 @@ class CloudraveFormatter(logging.Formatter):
             rendered = f"{rendered}\n{self.formatException(record.exc_info)}"
         if record.stack_info:
             rendered = f"{rendered}\n{self.formatStack(record.stack_info)}"
-        return rendered
+        return re.sub(
+            r"(?i)([?&](?:client_?secret|access_?token|refresh_?token|code)=)[^\s&#\"']*",
+            r"\1[REDACTED]",
+            rendered,
+        )
 
     def _source(self, record: logging.LogRecord) -> str:
         path = Path(record.pathname)

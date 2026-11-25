@@ -15,13 +15,14 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.enums import NodeType
+from models.enums import NodeStatus, NodeType
 from models.tables import BucketMount, Node, StoragePolicy, User
 from repositories.audit_logs import AuditLogRepository
 from repositories.mounts import BucketMountRepository
-from repositories.nodes import NodeRepository
+from repositories.nodes import NodeRepository, _unique_name
 from repositories.objects import ObjectRepository
 from repositories.policies import StoragePolicyRepository
+from repositories.uploads import UploadRepository
 from schemas.mount import BucketMountRead, mount_read
 from schemas.node import (
     FileCreateRequest,
@@ -36,12 +37,15 @@ from schemas.node import (
     NodeRenameRequest,
     NodeSearchResult,
 )
+from schemas.task import PathBatchQueued, PathChangeQueued
+from services.admin.path_plan import queue_path_operation
 from services.explorer.archive import ArchiveDownloadService
 from services.explorer.access import MountAccessPolicy
+from services.explorer.path_write import new_file_path, object_path_template, put_new_file, put_new_folder
+from services.explorer.write_policy import StorageWritePolicy, ensure_capacity
 from services.explorer.gc import ObjectGc
 from services.user.response import build_avatar_url
 from store.call import call_adapter
-from store.key import managed_key
 from store.manager import StorageManager
 from core.log import LogOperation, LogOutcome
 from security.capabilities import Capability, require_capability
@@ -277,7 +281,10 @@ class FileExplorerService:
         )
 
     async def create_folder(self, request: Request, actor: User, payload: FolderCreateRequest) -> NodeRead:
-        mount, _policy = await self._require_mount_write(actor, payload.mount_id)
+        mount, policy = await self._require_mount_write(actor, payload.mount_id)
+        use_marker = (getattr(mount, "extra", None) or {}).get("object_key_template") is not None
+        if use_marker:
+            mount, policy = await self.mount_access.write(actor, payload.mount_id, lock=True)
         parent = None
         if payload.parent_id is not None:
             parent = await self.nodes.get_by_id(payload.parent_id)
@@ -303,6 +310,8 @@ class FileExplorerService:
                         parent_id=parent_id,
                         name=folder_name,
                     )
+                    if use_marker:
+                        await put_new_folder(self.nodes, self.storage_manager, policy, mount, node)
                 break
             except IntegrityError:
                 continue
@@ -335,7 +344,7 @@ class FileExplorerService:
 
     async def create_file(self, request: Request, actor: User, payload: FileCreateRequest) -> NodeRead:
         require_capability(actor, Capability.FILE_EDIT)
-        mount, policy = await self._require_mount_write(actor, payload.mount_id)
+        mount, policy = await self.mount_access.write(actor, payload.mount_id, lock=True)
         parent = await self._resolve_parent_folder(mount, payload.parent_id)
         requested_name = payload.name.strip()
         if "/" in requested_name or "\\" in requested_name or requested_name in {".", ".."}:
@@ -359,18 +368,16 @@ class FileExplorerService:
                 counter += 1
             file_name = f"{base} ({counter}){suffix}"
 
-        object_key = managed_key(
-            actor.id,
-            file_name,
-            style=str((mount.extra or {}).get("object_key_style", "readable")),
-        )
         content_type = "text/markdown; charset=utf-8" if extension in {".md", ".markdown"} else "text/plain; charset=utf-8"
         adapter = self.storage_manager.get_adapter(policy)
+        file_path = await new_file_path(self.nodes, self.objects, adapter, policy, mount, parent.id, file_name)
+        object_key = file_path.key
 
         object_written = False
 
         async def cleanup_object() -> None:
-            if not object_written:
+            # A user-chosen path could be replaced externally after the write.
+            if not object_written or file_path.blob_id is not None:
                 return
             try:
                 await call_adapter(adapter, "delete_object", policy, mount, object_key, hard_delete=True)
@@ -378,12 +385,11 @@ class FileExplorerService:
                 LOGGER.exception("Failed to clean up object after text file creation failed", extra={"object_key": object_key})
 
         try:
-            await call_adapter(
+            stored = await put_new_file(
                 adapter,
-                "put_object",
                 policy,
                 mount,
-                object_key,
+                file_path,
                 b"",
                 mime_type=content_type,
             )
@@ -396,15 +402,18 @@ class FileExplorerService:
                 blob_path=object_key,
                 size=0,
             )
+            extra = {"origin": "managed_create"}
+            if file_path.blob_id is not None:
+                extra.update(path_blob_id=file_path.blob_id, etag=stored.etag)
             await self.objects.create_or_update(
                 node_id=node.id,
                 policy_id=policy.id,
                 blob_path=object_key,
-                physical_id=adapter.physical_id(policy, mount, object_key),
+                physical_id=file_path.physical_id or await call_adapter(adapter, "physical_id", policy, mount, object_key),
                 revive_physical=True,
                 checksum=hashlib.sha256(b"").hexdigest(),
                 content_type=content_type,
-                extra={"origin": "managed_create"},
+                extra=extra,
             )
             await self.audits.create(
                 actor_id=actor.id,
@@ -434,9 +443,25 @@ class FileExplorerService:
         )
         return NodeRead.model_validate(node)
 
-    async def rename_node(self, request: Request, actor: User, node_id: int, payload: NodeRenameRequest) -> NodeRead:
+    async def rename_node(
+        self, request: Request, actor: User, node_id: int, payload: NodeRenameRequest,
+    ) -> NodeRead | PathChangeQueued:
         node = await self._require_node_access(actor, node_id)
-        await self._require_mount_write(actor, node.mount_id)
+        mount, policy = await self._require_mount_write(actor, node.mount_id)
+        if object_path_template(policy, mount) is not None:
+            mount, policy = await self.mount_access.write(actor, node.mount_id, lock=True)
+            template = object_path_template(policy, mount)
+            if template is not None:
+                node = await self.nodes.get_by_id_for_update(node_id)
+                if node is None or node.deleted_at is not None:
+                    raise HTTPException(status_code=404, detail="File node not found")
+                if node.name == payload.name:
+                    return NodeRead.model_validate(node)
+                sibling = await self.nodes.get_child_any(mount.id, node.parent_id, payload.name)
+                if sibling is not None and sibling.id != node.id:
+                    raise HTTPException(status_code=409, detail="目标位置已存在同名文件或文件夹")
+                task = await queue_path_operation(self.session, mount, policy, node, template, rename_to=payload.name)
+                return PathChangeQueued(task_id=task.id)
         updated = await self.nodes.rename(node, payload.name)
         await self.audits.create(
             actor_id=actor.id,
@@ -451,8 +476,11 @@ class FileExplorerService:
 
     async def delete_nodes(self, request: Request, actor: User, payload: NodeDeleteRequest) -> dict[str, list[int] | list[NodeRead]]:
         nodes = [await self._require_node_access(actor, node_id) for node_id in payload.node_ids]
-        for mount_id in {node.mount_id for node in nodes}:
-            await self._require_mount_write(actor, mount_id)
+        for mount_id in sorted({node.mount_id for node in nodes}):
+            if payload.hard_delete:
+                await self.mount_access.write(actor, mount_id, lock=True)
+            else:
+                await self._require_mount_write(actor, mount_id)
         if payload.hard_delete:
             all_ids = await self.nodes.collect_descendant_ids(payload.node_ids)
             gc = ObjectGc(
@@ -462,7 +490,7 @@ class FileExplorerService:
                 objects=self.objects,
                 storage_manager=self.storage_manager,
             )
-            task_ids = await gc.stage(all_ids)
+            await gc.stage(all_ids)
             await self.objects.delete_by_node_ids(all_ids)
             await self.nodes.hard_delete(payload.node_ids)
             await self.audits.create(
@@ -487,9 +515,6 @@ class FileExplorerService:
                     "actor": actor.email,
                 },
             )
-            await self.session.commit()
-            await gc.run(task_ids)
-            await self.session.commit()
             return {"deleted_node_ids": all_ids}
 
         deleted = await self.nodes.soft_delete(payload.node_ids)
@@ -516,15 +541,18 @@ class FileExplorerService:
         )
         return {"nodes": [NodeRead.model_validate(node) for node in deleted]}
 
-    async def move_nodes(self, request: Request, actor: User, payload: NodeMoveRequest) -> list[NodeRead]:
+    async def move_nodes(self, request: Request, actor: User, payload: NodeMoveRequest) -> list[NodeRead] | PathBatchQueued:
         nodes = [await self._require_node_access(actor, node_id) for node_id in payload.node_ids]
         if not nodes:
             return []
         mount_id = nodes[0].mount_id
-        mount, policy = await self._require_mount_write(actor, mount_id)
+        mount, policy = await self.mount_access.write(actor, mount_id, lock=True)
         if any(node.mount_id != mount_id for node in nodes):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="All moved nodes must belong to one mount")
+        if any(node.deleted_at is not None or node.status != NodeStatus.ACTIVE for node in nodes):
+            raise HTTPException(status_code=404, detail="找不到要移动的条目")
 
+        template = object_path_template(policy, mount)
         target_parent_id = payload.target_parent_id
         if target_parent_id is None:
             target = await self.nodes.ensure_mount_root(owner_id=mount.owner_id, mount_id=mount.id, name=mount.name)
@@ -533,6 +561,35 @@ class FileExplorerService:
             target = await self.nodes.get_by_id(target_parent_id)
             if target is None or target.mount_id != mount_id or target.type != NodeType.FOLDER:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target folder not found")
+        if target.deleted_at is not None or target.status != NodeStatus.ACTIVE:
+            raise HTTPException(status_code=404, detail="找不到目标文件夹")
+
+        if template is not None:
+            task_ids = []
+            names = {child.name: child for child in await self.nodes.list_children(mount_id, target_parent_id, include_deleted=True)}
+            for node_id in dict.fromkeys(payload.node_ids):
+                node = await self.nodes.get_by_id_for_update(node_id)
+                if node is None or node.deleted_at is not None or node.status != NodeStatus.ACTIVE:
+                    raise HTTPException(status_code=404, detail="找不到要移动的条目")
+                if node.parent_id == target_parent_id:
+                    continue
+                existing = names.get(node.name)
+                if existing is not None:
+                    if payload.on_conflict == "error":
+                        raise self._move_conflict(node, existing, replace_allowed=False)
+                    if payload.on_conflict == "skip":
+                        continue
+                    if payload.on_conflict == "replace":
+                        raise HTTPException(status_code=409, detail="当前存储的路径映射不支持覆盖移动")
+                new_name = _unique_name(node.name, set(names)) if existing is not None else node.name
+                if len(new_name) > 255:
+                    raise HTTPException(status_code=422, detail="移动后的文件名过长，请缩短原文件名后重试")
+                names[new_name] = node
+                task = await queue_path_operation(self.session, mount, policy, node, template,
+                                                  rename_to=new_name if new_name != node.name else None,
+                                                  move_to=target_parent_id)
+                task_ids.append(task.id)
+            return PathBatchQueued(task_ids=task_ids) if task_ids else []
 
         # Prevent moving a folder into its own subtree
         moved_ids = {node.id for node in nodes}
@@ -547,7 +604,37 @@ class FileExplorerService:
                         detail="Cannot move a folder into its own subtree",
                     )
 
-        moved = await self.nodes.move_nodes(nodes, target_parent_id)
+        destinations = {child.name: child for child in await self.nodes.list_children(mount_id, target_parent_id, include_deleted=True)}
+        to_move: list[Node] = []
+        to_replace: list[Node] = []
+        for node in {node.id: node for node in nodes}.values():
+            if node.parent_id == target_parent_id:
+                continue
+            existing = destinations.get(node.name)
+            if existing is not None:
+                if payload.on_conflict == "error":
+                    raise self._move_conflict(node, existing, replace_allowed=True)
+                if payload.on_conflict == "skip":
+                    continue
+                if payload.on_conflict == "replace":
+                    if existing.id in moved_ids:
+                        raise HTTPException(status_code=409, detail="所选条目中有重名文件，无法同时覆盖")
+                    to_replace.append(existing)
+                    destinations.pop(node.name)
+            to_move.append(node)
+            destinations[node.name] = node
+
+        if to_replace:
+            replaced_ids = await self.nodes.collect_descendant_ids([node.id for node in to_replace])
+            if moved_ids.intersection(replaced_ids):
+                raise HTTPException(status_code=409, detail="不能覆盖包含待移动条目的文件夹")
+            gc = ObjectGc(mounts=self.mounts, nodes=self.nodes, policies=self.policies,
+                          objects=self.objects, storage_manager=self.storage_manager)
+            await gc.stage(replaced_ids)
+            await self.objects.delete_by_node_ids(replaced_ids)
+            await self.nodes.hard_delete([node.id for node in to_replace])
+
+        moved = await self.nodes.move_nodes(to_move, target_parent_id)
         await self.audits.create(
             actor_id=actor.id,
             action="node.move",
@@ -559,7 +646,16 @@ class FileExplorerService:
         )
         return [NodeRead.model_validate(node) for node in moved]
 
-    async def copy_nodes(self, request: Request, actor: User, payload: NodeCopyRequest) -> list[NodeRead]:
+    @staticmethod
+    def _move_conflict(source: Node, existing: Node, *, replace_allowed: bool) -> HTTPException:
+        return HTTPException(status_code=409, detail={
+            "kind": "move_conflict",
+            "source": NodeRead.model_validate(source).model_dump(mode="json"),
+            "existing": NodeRead.model_validate(existing).model_dump(mode="json"),
+            "replace_allowed": replace_allowed,
+        })
+
+    async def copy_nodes(self, request: Request, actor: User, payload: NodeCopyRequest) -> list[NodeRead] | PathBatchQueued:
         require_capability(actor, Capability.FILE_COPY)
         nodes = [await self._require_node_access(actor, node_id) for node_id in payload.node_ids]
         if not nodes:
@@ -568,6 +664,11 @@ class FileExplorerService:
         mount, policy = await self._require_mount_write(actor, mount_id)
         if any(node.mount_id != mount_id for node in nodes):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="All copied nodes must belong to one mount")
+
+        template = object_path_template(policy, mount)
+        if template is not None:
+            mount, policy = await self.mount_access.write(actor, mount_id, lock=True)
+            template = object_path_template(policy, mount)
 
         target_parent_id = payload.target_parent_id
         if target_parent_id is None:
@@ -578,8 +679,38 @@ class FileExplorerService:
             if target is None or target.mount_id != mount_id or target.type != NodeType.FOLDER:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target folder not found")
 
+        if template is not None:
+            if target.deleted_at is not None or target.status != NodeStatus.ACTIVE:
+                raise HTTPException(status_code=404, detail="找不到目标文件夹")
+            sources = []
+            for node_id in dict.fromkeys(payload.node_ids):
+                node = await self.nodes.get_by_id_for_update(node_id)
+                if node is None or node.deleted_at is not None or node.status != NodeStatus.ACTIVE:
+                    raise HTTPException(status_code=404, detail="找不到要复制的条目")
+                sources.append(node)
+            await ensure_capacity(mount, sum(node.size for node in sources), nodes=self.nodes, uploads=UploadRepository(self.session))
+            children = await self.nodes.list_children(mount_id, target_parent_id, include_deleted=True)
+            names = {child.name for child in children}
+            task_ids = []
+            for node in sources:
+                name = _unique_name(node.name, names)
+                if len(name) > 255:
+                    raise HTTPException(status_code=422, detail="副本文件名过长，请缩短原文件名后重试")
+                names.add(name)
+                task = await queue_path_operation(
+                    self.session, mount, policy, node, template, copy_to=target_parent_id, copy_name=name,
+                )
+                task_ids.append(task.id)
+            return PathBatchQueued(task_ids=task_ids)
+
         copied: list[NodeRead] = []
         id_map: dict[int, int] = {}
+        copy_size = 0
+        for root in nodes:
+            descendants = await self.nodes.collect_descendant_ids([root.id])
+            copy_size += sum(item.size for item in await self.nodes.list_by_ids(descendants)
+                             if item.type == NodeType.FILE)
+        await StorageWritePolicy(self.session).check(actor, mount_id, copy_size)
         source_ids = await self.nodes.collect_descendant_ids([node.id for node in nodes])
         source_object_ids = [node.id for node in await self.nodes.list_by_ids(source_ids) if node.type == NodeType.FILE and node.blob_path]
         source_objects = {obj.node_id: obj for obj in await self.objects.get_by_node_ids(source_object_ids)}
@@ -599,7 +730,7 @@ class FileExplorerService:
                 blob_path=source_obj.blob_path,
                 physical_id=(
                     source_obj.physical_id
-                    or adapter.physical_id(policy, mount, source_obj.blob_path)
+                    or await call_adapter(adapter, "physical_id", policy, mount, source_obj.blob_path)
                 ),
                 checksum=source_obj.checksum,
                 content_type=source_obj.content_type,

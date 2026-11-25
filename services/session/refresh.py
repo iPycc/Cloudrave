@@ -84,11 +84,15 @@ class RefreshTokenService:
             session_id=session_record.id,
             token_version=next_version,
         )
-        await self.sessions.rotate_refresh_token(
+        rotated = await self.sessions.rotate_refresh_token(
             session_record.id,
+            expected_hash=expected_hash,
+            expected_version=session_record.token_version,
             refresh_token_hash=self.token_service.hash_refresh_token(bundle.refresh_token),
             refresh_expires_at=bundle.refresh_expires_at,
         )
+        if not rotated:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token already rotated")
         await self.audits.create(
             actor_id=user.id,
             action="refresh",

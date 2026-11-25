@@ -92,6 +92,11 @@ class BucketMountRead(BucketMountBase):
     driver_kind: str = ""
     driver_capabilities: list[str] = Field(default_factory=list)
 
+    @field_validator("sync_status", mode="before")
+    @classmethod
+    def normalize_sync_status(cls, value: str) -> str:
+        return {"complete": "completed", "error": "failed"}.get(value, value)
+
 
 class MountUsageRead(CloudraveSchema):
     mount_id: int
@@ -128,6 +133,7 @@ def mount_read(mount, policy=None, storage_manager=None) -> BucketMountRead:
     extra = dict(result.extra)
     extra.setdefault("provider_label", result.provider_label)
     driver_id = provider_id(policy.provider)
+    carrier_drive = driver_id in {"drive_139", "drive_189", "drive_wo"}
     compatibility_types = {
         "local_fs": "local",
         "tencent_cos": "tencent",
@@ -143,7 +149,12 @@ def mount_read(mount, policy=None, storage_manager=None) -> BucketMountRead:
     extra["multipart_threshold_mb"] = policy.multipart_threshold_mb
     extra["part_size_mb"] = policy.part_size_mb
     extra["presign_ttl_seconds"] = policy.presign_ttl_seconds
-    extra["cors_status"] = "healthy" if policy.cors_auto_configured else "warning"
+    if driver_id == "local_fs":
+        extra["cors_status"] = "not-required"
+    elif carrier_drive:
+        extra["cors_status"] = "provider-managed"
+    else:
+        extra["cors_status"] = "healthy" if policy.cors_auto_configured else "warning"
     for key in (
         "concurrency",
         "server_side_encryption",
@@ -151,6 +162,9 @@ def mount_read(mount, policy=None, storage_manager=None) -> BucketMountRead:
         "scheme",
         "accelerate",
         "path_style",
+        "download_domain_type",
+        "download_domain",
+        "download_cdn_auth",
     ):
         if key in policy_extra:
             extra[key] = policy_extra[key]
@@ -168,6 +182,6 @@ def mount_read(mount, policy=None, storage_manager=None) -> BucketMountRead:
             "driver_kind": definition.kind,
             "driver_capabilities": list(adapter.capabilities.names()) if adapter else [],
         })
-        if driver_id in {"drive_139", "drive_189", "drive_wo"}:
+        if carrier_drive:
             extra["requires_reauthorization"] = storage_manager.remote_auth.status(policy)
     return result.model_copy(update={"extra": extra, **metadata})

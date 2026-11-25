@@ -20,6 +20,10 @@ class RemoteAuthenticationError(RemoteProtocolError):
     pass
 
 
+class RemoteUploadUnconfirmedError(RemoteProtocolError):
+    """The carrier had no completed object for this upload."""
+
+
 def require_mapping(value: Any, context: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise RemoteProtocolError(f"{context} returned an invalid response")

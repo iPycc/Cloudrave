@@ -5,7 +5,7 @@ from __future__ import annotations
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.tables import Node, ObjectRecord
+from models.tables import Node, ObjectRecord, PathMigrationJob, PathMigrationRecord, PathPlanEntry
 from repositories.blobs import BlobRepository
 
 
@@ -23,6 +23,23 @@ class ObjectRepository:
             return []
         result = await self.session.scalars(select(ObjectRecord).where(ObjectRecord.node_id.in_(node_ids)))
         return list(result)
+
+    async def list_physical_in_mount(
+        self, mount_id: int, policy_id: int, physical_id: str, blob_path: str,
+    ) -> list[ObjectRecord]:
+        statement = (
+            select(ObjectRecord)
+            .join(Node, Node.id == ObjectRecord.node_id)
+            .where(
+                Node.mount_id == mount_id,
+                or_(
+                    ObjectRecord.physical_id == physical_id,
+                    (ObjectRecord.physical_id.is_(None) & (ObjectRecord.policy_id == policy_id)
+                     & (ObjectRecord.blob_path == blob_path)),
+                ),
+            )
+        )
+        return list(await self.session.scalars(statement))
 
     async def get_by_checksum(
         self,
@@ -160,8 +177,53 @@ class ObjectRepository:
         return {value for value in rows if value}
 
     async def has_physical_reference(self, physical_id: str) -> bool:
-        statement = select(ObjectRecord.id).where(ObjectRecord.physical_id == physical_id).limit(1)
+        # A locking read observes the latest committed reference on MySQL's
+        # REPEATABLE READ, after the caller has locked the blob identity.
+        statement = select(ObjectRecord.id).where(ObjectRecord.physical_id == physical_id).limit(1).with_for_update()
         return await self.session.scalar(statement) is not None
+
+    async def has_migration_reservation(self, physical_id: str) -> bool:
+        statement = select(PathMigrationRecord.id).where(
+            PathMigrationRecord.target_physical_id == physical_id,
+            PathMigrationRecord.status.in_(("reserved", "copying", "copied", "uncertain")),
+        ).limit(1).with_for_update()
+        return await self.session.scalar(statement) is not None
+
+    async def migrated_targets(self, identities: set[str]) -> set[str]:
+        if not identities:
+            return set()
+        return set(await self.session.scalars(select(PathMigrationRecord.target_physical_id).where(
+            PathMigrationRecord.target_physical_id.in_(identities),
+            PathMigrationRecord.status.in_(("applied", "duplicated")),
+        ).distinct()))
+
+    async def retained_migration_source(self, physical_id: str, mount_id: int | None = None) -> PathPlanEntry | None:
+        query = select(PathPlanEntry).join(PathMigrationRecord, PathMigrationRecord.plan_entry_id == PathPlanEntry.id).where(
+            PathMigrationRecord.source_physical_id == physical_id, PathMigrationRecord.status == "applied",
+            PathPlanEntry.kind == "file",
+        )
+        if mount_id is not None:
+            query = query.join(PathMigrationJob, PathMigrationJob.id == PathMigrationRecord.job_id).where(
+                PathMigrationJob.mount_id == mount_id,
+            )
+        return await self.session.scalar(query.order_by(PathMigrationRecord.id.desc()).limit(1))
+
+    async def has_migration_marker(self, mount_id: int, target_hash: str, *, node_id: int | None = None) -> bool:
+        query = select(PathMigrationRecord.id).join(
+            PathPlanEntry, PathPlanEntry.id == PathMigrationRecord.plan_entry_id,
+        ).join(PathMigrationJob, PathMigrationJob.id == PathMigrationRecord.job_id).where(
+            PathMigrationJob.mount_id == mount_id, PathPlanEntry.kind == "folder",
+        )
+        if node_id is not None:
+            query = query.where(PathPlanEntry.node_id == node_id, PathPlanEntry.target_hash == target_hash,
+                                PathMigrationRecord.status == "applied")
+        else:
+            query = query.where(or_(
+                (PathPlanEntry.target_hash == target_hash)
+                & PathMigrationRecord.status.in_(("copying", "copied", "uncertain", "applied", "duplicated")),
+                (PathMigrationRecord.source_physical_id == target_hash) & (PathMigrationRecord.status == "applied"),
+            ))
+        return await self.session.scalar(query.limit(1)) is not None
 
     async def list_missing_physical_page(
         self,
@@ -214,6 +276,10 @@ class ObjectRepository:
             .where(Node.mount_id == mount_id, ObjectRecord.id > after_id)
             .order_by(ObjectRecord.id.asc())
             .limit(limit)
+            # Finalization checks timestamps before marking a source missing.
+            # Lock both rows until that decision commits so a concurrent file
+            # operation cannot be silently overwritten between read and write.
+            .with_for_update()
         )
         return list(rows.tuples())
 

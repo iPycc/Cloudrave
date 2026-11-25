@@ -25,7 +25,9 @@ from security.jwt import TokenService
 from security.password import PasswordService
 from store.manager import StorageManager
 from services.explorer.gc_job import GcWorker
+from services.explorer.derived_job import DerivedWorker
 from services.explorer.upload_cleanup_job import UploadCleanupWorker
+from services.user.mount_health_job import MountHealthWorker
 from core.cfg import CloudraveConfig
 from db.base import create_schema, make_async_engine, make_session_factory, session_scope, write_schema_sql
 from core.log import LogOperation, LogOutcome, get_logger
@@ -43,7 +45,9 @@ class Dep:
         self.token_service = TokenService(config.auth)
         self.storage_manager = StorageManager(config=config, local_root=config.local_upload_root_path)
         self.gc_worker = GcWorker(self.session_factory, self.storage_manager)
+        self.derived_worker = DerivedWorker(self)
         self.upload_cleanup_worker = UploadCleanupWorker(self.session_factory, self.storage_manager)
+        self.mount_health_worker = MountHealthWorker(self)
 
     @property
     def share_signing_key(self) -> bytes:
@@ -135,7 +139,9 @@ class Dep:
             if cleaned:
                 LOGGER.info("Retried %s pending physical object cleanup task(s).", cleaned)
         self.gc_worker.start()
+        self.derived_worker.start()
         self.upload_cleanup_worker.start()
+        self.mount_health_worker.start()
 
         if len(self.config.auth.jwt_secret.strip()) < 32:
             LOGGER.warning(
@@ -156,8 +162,10 @@ class Dep:
                 LOGGER.info("Initial administrator bootstrap marker created.")
 
     async def disconnect(self) -> None:
+        await self.mount_health_worker.stop()
         await self.upload_cleanup_worker.stop()
         await self.gc_worker.stop()
+        await self.derived_worker.stop()
         await self.engine.dispose()
 
     @asynccontextmanager
